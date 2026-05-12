@@ -1,0 +1,199 @@
+---
+name: opengeni
+description: >-
+  Use when working in, operating, extending, integrating, documenting, or debugging OpenGeni: the session-based agent service with an API, durable event log, Temporal worker, sandboxed OpenAI Agents SDK runtime, file/object storage, MCP tools, scheduled tasks, and self-hosted local stack. Trigger this skill for questions about OpenGeni architecture, client-side API integration, sessions/events, worker orchestration, sandbox backends, file uploads, tools/MCP, scheduling, storage, GitHub integration, configuration, deployment, or how to keep agents using OpenGeni correctly as the repo evolves.
+---
+
+# OpenGeni
+
+## Overview
+
+Use this skill as an orientation layer, not as frozen API documentation. OpenGeni evolves through the codebase, so code wins over this skill whenever they differ.
+
+OpenGeni is a self-hostable agent service. Public clients talk to an API. The API persists sessions and events, accepts user/control events, exposes replay/SSE streams, handles uploads, and talks to Temporal. A worker runs OpenAI Agents SDK turns inside a configured sandbox backend. Postgres is durable state, NATS is live fanout, object storage holds uploaded file bytes, Temporal coordinates work and schedules, and MCP servers provide pluggable tools.
+
+Canonical source repo: `https://github.com/Cloudgeni-ai/opengeni`. This skill may be installed outside that repo, which is normal. If the current workspace is not OpenGeni, first determine whether the user wants client integration against a deployed OpenGeni service, source-level changes, deployment help, or conceptual explanation. For source-level exactness, inspect or fetch the repo; for client integration, ask for or infer the deployed API base URL and inspect the running API/client config where possible.
+
+## Start With Repository Discovery
+
+Always inspect the current repo before making claims or changes. Use fast searches and prefer contracts/types/routes over README prose when exact behavior matters.
+
+Useful first pass:
+
+```bash
+rg --files -g '!*node_modules*' -g '!*.lockb'
+rg -n "app\\.(get|post|patch|delete|all)\\(|/v1/|SessionEvent|ResourceRef|ToolRef|SandboxBackend|workflow|activity|OPENGENI_|mcp|schedule|upload|objectStorage|NATS|Temporal" \
+  -g '!*node_modules*' -g '!*.lockb'
+```
+
+Then open the smallest source files that answer the question:
+
+- API routes: `apps/api/src/routes/`, plus `apps/api/src/app.ts` and `apps/api/src/index.ts`.
+- Public shapes: `packages/contracts/src/index.ts`.
+- Config/env: `packages/config/src/index.ts`, `.env.example`, `README.md`, `AGENTS.md`.
+- Database/state: `packages/db/src/schema.ts`, `packages/db/src/index.ts`, `packages/db/drizzle/`.
+- Event bus/SSE: `packages/events/src/index.ts`, `apps/api/src/http/sse.ts`.
+- Worker/orchestration: `apps/worker/src/workflows/`, `apps/worker/src/activities/`.
+- Runtime/sandbox/tools: `packages/runtime/src/index.ts`.
+- Files/object storage: `apps/api/src/routes/files.ts`, `packages/storage/src/index.ts`.
+- Documents/retrieval: `apps/api/src/routes/documents.ts`, `packages/documents/src/index.ts`, `apps/api/src/mcp/`.
+- GitHub integration: `apps/api/src/routes/github.ts`, `packages/github/src/index.ts`.
+- Web usage examples: `apps/web/src/api.ts`, `apps/web/src/types.ts`, relevant UI components.
+
+If paths have moved, find concepts by symbol name, not by old paths:
+
+```bash
+rg -n "CreateSessionRequest|ClientSessionEvent|sessionWorkflow|runAgentSegment|createSandboxClient|buildManifest|createObjectStorage|build.*McpServer|getSettings"
+```
+
+## Client Integration Mode
+
+When the user is building an external client, SaaS integration, SDK wrapper, or UI on top of OpenGeni, read `references/client-integration.md`. Treat OpenGeni as a service boundary: the client creates sessions, streams/replays events, sends follow-up/control events, uploads files, selects resources/tools, and displays approvals/status. Do not require the client to know worker, Temporal, NATS, or sandbox internals except as concepts for status and product behavior.
+
+## Mental Model
+
+Keep these concepts straight while working:
+
+- **Session**: durable user-facing work container. It owns status, resources, selected tools, model/sandbox settings, event cursor, and active turn.
+- **Turn**: one queued/running unit of agent work inside a session. Follow-ups and scheduled task firings become turns.
+- **Event log**: append-only session timeline with per-session sequence numbers. It supports replay, SSE reconnect, UI timeline projection, and auditing.
+- **SSE/NATS split**: Postgres is replay/source of truth. NATS is live fanout. If live events are missed, API should backfill from Postgres by sequence.
+- **Temporal**: orchestration, signals, timers, schedules, and worker dispatch. Token streams/tool output should not be pushed through workflow history unless the code intentionally changes that design.
+- **Worker activity**: side-effect boundary where the OpenAI Agents SDK actually runs. Treat model/tool/sandbox/cloud calls as side-effectful.
+- **Sandbox**: pluggable execution environment behind the OpenAI Agents SDK sandbox interface. OpenGeni should describe the contract and selected backend, not pretend the backend is hard-coded.
+- **Resources**: external context mounted or made available to a run, commonly repositories and uploaded files.
+- **Tools**: currently MCP-first. Tool refs select configured MCP servers. Built-ins are defaults, not limits.
+- **Object storage**: stores uploaded bytes. Database stores metadata/object keys. Sandbox file access is normally via manifest/mount/injection based on current runtime code.
+- **Scheduled task**: persisted schedule plus agent config that dispatches one or more session turns through Temporal scheduling.
+
+## Workflow For Architecture Or Documentation Tasks
+
+When asked to explain OpenGeni, create a current picture from code:
+
+1. Read `AGENTS.md` and `README.md` for operator intent and warnings.
+2. Read contracts for names and public shapes.
+3. Read API routes for current endpoints and behavior.
+4. Read DB schema and event append/list code for durable state and ordering.
+5. Read worker workflows/activities for orchestration and side effects.
+6. Read runtime code for Agents SDK, sandbox, MCP, manifests, resume, and model provider behavior.
+7. Read config parsing for environment variables and pluggability.
+8. Mark every claim as shipped, configurable, delegated to a backend/provider, or roadmap/not shipped.
+
+Do not rely on this skill for exact route lists, env var lists, event types, model names, or backend names. Re-discover those from contracts/config/routes every time exactness matters.
+
+## Workflow For Code Changes
+
+Before editing, identify which layer owns the behavior:
+
+- Public API or validation: routes, domain helpers, contracts, tests.
+- Persistence: DB schema, migrations, mapping functions, integration tests.
+- Event semantics: append helpers, event bus, SSE replay, frontend timeline handling.
+- Orchestration: Temporal workflow/signal/activity code and workflow tests.
+- Agent runtime: runtime package, worker activity, OpenAI Agents SDK integration tests.
+- Sandbox resources: resource validation, manifest building, object storage, sandbox environment.
+- MCP tools: config parsing, runtime tool preparation, API MCP servers.
+- Scheduling: scheduled task contracts/routes/domain helpers, Temporal schedule mapping, dispatch activity.
+- UI: `apps/web` API helpers/types/components.
+
+After edits, run the smallest relevant verification first, then broader checks if behavior crosses boundaries. Common checks are:
+
+```bash
+bun run typecheck
+bun test
+bun run test:integration
+```
+
+Use the full local stack only when the task requires real Temporal/NATS/Postgres/sandbox behavior:
+
+```bash
+bun run dev
+```
+
+## File Upload And Sandbox Discovery
+
+When working on file flows, trace the full path end to end:
+
+1. Upload creation route and contract.
+2. Object storage key, presigned PUT/GET, TTLs, size/checksum validation.
+3. File metadata rows and statuses.
+4. Resource validation when attaching a file to a session or scheduled task.
+5. Runtime manifest/mount/injection code.
+6. User-facing prompt text that tells the agent where files are available.
+7. Any result/artifact flow, if present in current code.
+
+Do not claim a generic artifact system, write-back path, or live mid-session remount behavior unless current code proves it.
+
+## Sandbox Backend Discovery
+
+When asked about sandbox pluggability or adding a backend:
+
+1. Find the current `SandboxBackend` contract.
+2. Find config for backend-specific settings.
+3. Find the runtime function that constructs the sandbox client.
+4. Find manifest/resource construction.
+5. Find resume/session-state handling.
+6. Find environment/secret injection and any sandbox lifecycle hook logic.
+7. Check tests for backend expectations.
+
+Describe the backend contract in terms of the OpenAI Agents SDK sandbox client/session capabilities used by OpenGeni. Add a new backend by extending contracts/config, wiring a compatible SDK sandbox client, supporting manifests/resources/resume as needed, and adding tests.
+
+For sandbox configuration work, read `references/sandbox-configuration.md`. Use it when configuring Docker/Modal/local/none, deciding which environment variables enter the sandbox, debugging resource mounts, explaining sandbox preparation profiles and lifecycle hooks, adding a sandbox backend, or checking what claims are safe for docs/marketing.
+
+## Tools And MCP Discovery
+
+When asked about tools, distinguish:
+
+- MCP tool providers selected by session/turn/scheduled-task config.
+- First-party MCP servers exposed by the API.
+- Built-in SDK sandbox capabilities such as shell/files/skills.
+- Tools available inside the sandbox image, such as CLIs.
+
+Find current MCP behavior in config parsing, tool validation, runtime `prepareTools`, and API MCP server builders. Treat first-party document/file/scheduled-task tools as swappable defaults. If a user wants enterprise search, repo tools, web tools, or custom systems, point OpenGeni at a different MCP server if current config supports it.
+
+## Scheduling Discovery
+
+When asked about queueing or scheduling:
+
+1. Inspect turn queue state and claim logic.
+2. Inspect Temporal schedules and overlap policy mapping.
+3. Inspect scheduled task run records and dispatch behavior.
+4. Inspect REST and MCP surfaces.
+5. Check whether retries, dead letters, quotas, or backpressure are implemented before claiming them.
+
+Prefer precise language: "DB-backed per-session queued turns" is different from "global queue service"; "Temporal schedule overlap policy" is different from "complete scheduling platform."
+
+## Safe Claims
+
+Use careful wording:
+
+- "OpenGeni is self-hostable" if the repo still includes local/deployable API, worker, DB, NATS, Temporal, and object storage config.
+- "Session-based public API" if routes/contracts still expose sessions/events/turns.
+- "Durable replayable event log" if session events are still stored and replayed by sequence.
+- "Temporal coordinates work" if workflows/activities remain present.
+- "Agents SDK runs in worker activities" if runtime calls remain in worker activity code.
+- "Sandbox backend is pluggable" if backend selection and SDK client wiring remain configurable.
+- "MCP tools are pluggable" if MCP server config and tool refs remain.
+
+Avoid absolute claims until verified in current code:
+
+- Auth, tenancy, RBAC, API keys.
+- Webhooks and outbound event delivery.
+- Exactly-once public API idempotency.
+- Dead-letter queues or automatic retries.
+- Network policy/egress controls.
+- Artifact storage/write-back.
+- Any specific cloud/deployment target beyond configured dependencies.
+- Any exact model/backend/tool list.
+
+## Keeping This Skill Current
+
+Update this skill in the same change whenever the repo changes any of these:
+
+- Core architecture: API/worker/runtime/storage/event-bus boundaries.
+- Terminology: session, turn, event, resource, tool, schedule, sandbox, activity.
+- Public workflow: how to create sessions, stream events, upload files, attach resources, approve/interrupt, schedule tasks.
+- Pluggability model: sandbox backend contract, MCP tool config, model provider config, object storage, GitHub integration.
+- Source layout: if important files move or names change.
+- Important "do not claim" guardrails.
+
+Keep the skill stable and discovery-oriented. Do not copy long API references, full env lists, or large technical briefs into `SKILL.md`; instruct future agents how to find current details in code. If exact details become too large but repeatedly useful, add a focused `references/` file and link it from this skill.

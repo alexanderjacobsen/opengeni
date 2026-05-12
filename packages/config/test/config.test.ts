@@ -1,0 +1,247 @@
+import { describe, expect, test } from "bun:test";
+import {
+  collectGitIdentityEnvironment,
+  collectSandboxEnvironment,
+  configuredAllowedModels,
+  configuredAllowedReasoningEfforts,
+  getSettings,
+  parseMcpServers,
+  sandboxEnvironmentVariableNames,
+  sandboxLifecycleHookIds,
+} from "../src";
+
+describe("sandbox preparation profiles", () => {
+  test("defaults to no sandbox environment exposure or lifecycle hooks", () => {
+    const settings = withEnv({}, () => getSettings());
+    expect(settings.sandboxPreparationProfiles).toBe("none");
+    expect(sandboxEnvironmentVariableNames(settings)).toEqual([]);
+    expect(sandboxLifecycleHookIds(settings)).toEqual([]);
+  });
+
+  test("collects profile and allowlist environment values", () => {
+    const settings = withEnv({}, () => getSettings());
+    const env = {
+      ARM_CLIENT_ID: "arm-client",
+      GITHUB_TOKEN: "github-token",
+      GIT_AUTHOR_NAME: "Local Author",
+      CUSTOM_PROVIDER_TOKEN: "custom",
+    };
+    const names = sandboxEnvironmentVariableNames({
+      ...settings,
+      sandboxPreparationProfiles: "azure,github",
+      sandboxEnvAllowlist: "CUSTOM_PROVIDER_TOKEN",
+    });
+    expect(names).toContain("ARM_CLIENT_ID");
+    expect(names).toContain("GITHUB_TOKEN");
+    expect(names).toContain("GIT_AUTHOR_NAME");
+    expect(names).toContain("CUSTOM_PROVIDER_TOKEN");
+    expect(sandboxLifecycleHookIds({
+      ...settings,
+      sandboxPreparationProfiles: "azure,github",
+    })).toEqual(["azure-cli-login"]);
+    expect(collectSandboxEnvironment({
+      ...settings,
+      sandboxPreparationProfiles: "azure,github",
+      sandboxEnvAllowlist: "CUSTOM_PROVIDER_TOKEN",
+    }, env)).toEqual({
+      ARM_CLIENT_ID: "arm-client",
+      GITHUB_TOKEN: "github-token",
+      GIT_AUTHOR_NAME: "Local Author",
+      CUSTOM_PROVIDER_TOKEN: "custom",
+    });
+  });
+
+  test("rejects combining none with other profiles", () => {
+    const settings = withEnv({}, () => getSettings());
+    expect(() => sandboxEnvironmentVariableNames({
+      ...settings,
+      sandboxPreparationProfiles: "none,github",
+    })).toThrow("cannot combine none");
+  });
+
+  test("ignores old sandbox env configuration names", () => {
+    const settings = withEnv({
+      OPENGENI_SANDBOX_ENV_PROFILES: "azure,github",
+      OPENGENI_SANDBOX_ENV_EXTRA_VARS: "CUSTOM_PROVIDER_TOKEN",
+      OPENGENI_SANDBOX_ENV_VARS: "GH_TOKEN",
+    }, () => getSettings());
+    expect(settings.sandboxPreparationProfiles).toBe("none");
+    expect(sandboxEnvironmentVariableNames(settings)).toEqual([]);
+    expect(sandboxLifecycleHookIds(settings)).toEqual([]);
+  });
+
+  test("returns client model and reasoning options with current defaults included", () => {
+    const settings = {
+      ...withEnv({}, () => getSettings()),
+      openaiModel: "custom-model",
+      openaiAllowedModels: "gpt-5.5",
+      openaiReasoningEffort: "xhigh" as const,
+      openaiAllowedReasoningEfforts: "low,medium,high",
+    };
+    expect(configuredAllowedModels(settings)).toEqual(["custom-model", "gpt-5.5"]);
+    expect(configuredAllowedReasoningEfforts(settings)).toEqual(["xhigh", "low", "medium", "high"]);
+  });
+
+  test("collects git identity settings for sandbox pass-through", () => {
+    const settings = withEnv({
+      OPENGENI_GIT_AUTHOR_NAME: "OpenGeni Agent",
+      OPENGENI_GIT_AUTHOR_EMAIL: "infra@example.com",
+    }, () => getSettings());
+    expect(collectGitIdentityEnvironment(settings)).toEqual({
+      GIT_AUTHOR_NAME: "OpenGeni Agent",
+      GIT_AUTHOR_EMAIL: "infra@example.com",
+      GIT_COMMITTER_NAME: "OpenGeni Agent",
+      GIT_COMMITTER_EMAIL: "infra@example.com",
+    });
+  });
+
+  test("does not collect ambient host git identity by default", () => {
+    const settings = withEnv({
+      GIT_AUTHOR_NAME: "Host Author",
+      GIT_AUTHOR_EMAIL: "host@example.com",
+      GIT_COMMITTER_NAME: "Host Committer",
+      GIT_COMMITTER_EMAIL: "committer@example.com",
+    }, () => getSettings());
+    expect(collectGitIdentityEnvironment(settings)).toEqual({});
+    expect(collectSandboxEnvironment(settings, {
+      GIT_AUTHOR_NAME: "Host Author",
+      GIT_AUTHOR_EMAIL: "host@example.com",
+    })).toEqual({});
+  });
+
+  test("passes ambient git identity only through the github preparation profile", () => {
+    const settings = withEnv({}, () => getSettings());
+    expect(collectSandboxEnvironment({
+      ...settings,
+      sandboxPreparationProfiles: "github",
+    }, {
+      GIT_AUTHOR_NAME: "Host Author",
+      GIT_AUTHOR_EMAIL: "host@example.com",
+      GIT_COMMITTER_NAME: "Host Committer",
+      GIT_COMMITTER_EMAIL: "committer@example.com",
+    })).toEqual({
+      GIT_AUTHOR_NAME: "Host Author",
+      GIT_AUTHOR_EMAIL: "host@example.com",
+      GIT_COMMITTER_NAME: "Host Committer",
+      GIT_COMMITTER_EMAIL: "committer@example.com",
+    });
+  });
+
+  test("parses MCP server registry JSON", () => {
+    const parsed = parseMcpServers('[{"id":"docs","name":"Document Search","url":"http://127.0.0.1:8787/mcp","allowedTools":["search_documents"]}]');
+    const settings = {
+      ...withEnv({}, () => getSettings()),
+      mcpServers: parsed as ReturnType<typeof getSettings>["mcpServers"],
+    };
+    expect(settings.mcpServers[0]?.id).toBe("docs");
+    expect(settings.mcpServers[0]?.allowedTools).toEqual(["search_documents"]);
+  });
+
+  test("registers built-in MCP profiles by default", () => {
+    const settings = withEnv({}, () => getSettings());
+    expect(settings.mcpServers.find((server) => server.id === "opengeni")).toMatchObject({
+      name: "OpenGeni",
+      url: `http://127.0.0.1:${settings.apiPort}/v1/mcp`,
+    });
+    expect(settings.mcpServers.find((server) => server.id === "files")).toMatchObject({
+      name: "Files",
+      url: `http://127.0.0.1:${settings.apiPort}/v1/mcp`,
+      allowedTools: ["files_get_download_url"],
+    });
+    expect(settings.mcpServers.find((server) => server.id === "docs")).toMatchObject({
+      name: "Document Search",
+      url: `http://127.0.0.1:${settings.apiPort}/v1/mcp/docs`,
+      allowedTools: ["search_documents", "fetch_document_chunk", "list_document_bases"],
+    });
+  });
+
+  test("does not duplicate a custom files MCP profile", () => {
+    withEnv({
+      OPENGENI_MCP_SERVERS: '[{"id":"files","name":"Custom Files","url":"http://127.0.0.1:8787/mcp","allowedTools":["custom_download"]}]',
+    }, () => {
+      const settings = getSettings();
+      const ids = settings.mcpServers.map((server) => server.id);
+      expect(ids.filter((id) => id === "files")).toHaveLength(1);
+      expect(settings.mcpServers.find((server) => server.id === "files")).toMatchObject({
+        name: "Custom Files",
+        url: "http://127.0.0.1:8787/mcp",
+        allowedTools: ["custom_download"],
+      });
+    });
+  });
+
+  test("ignores pre-OpenGeni environment variable names", () => {
+    withEnv({
+      INFRA_AGENT_SERVICE_NAME: "legacy-service",
+      INFRA_AGENT_DATABASE_URL: "postgres://legacy:legacy@127.0.0.1:5432/legacy",
+      INFRA_AGENT_OBJECT_STORAGE_BUCKET: "legacy-files",
+    }, () => {
+      const settings = getSettings();
+
+      expect(settings.serviceName).toBe("opengeni");
+      expect(settings.databaseUrl).toBe("postgres://opengeni:opengeni@127.0.0.1:5432/opengeni");
+      expect(settings.objectStorageBucket).toBe("opengeni-files");
+    });
+  });
+
+  test("rejects non-array MCP server registry JSON", () => {
+    expect(() => parseMcpServers('{"id":"docs"}')).toThrow("must be a JSON array");
+  });
+
+  test("parses object storage settings and rejects incomplete credentials", () => {
+    withEnv({
+      OPENGENI_OBJECT_STORAGE_ENDPOINT: "http://127.0.0.1:9000",
+      OPENGENI_OBJECT_STORAGE_ACCESS_KEY_ID: "minioadmin",
+      OPENGENI_OBJECT_STORAGE_SECRET_ACCESS_KEY: "minioadmin",
+    }, () => {
+      const settings = getSettings();
+      expect(settings.objectStorageEndpoint).toBe("http://127.0.0.1:9000");
+      expect(settings.objectStorageBucket).toBe("opengeni-files");
+      expect(settings.objectStorageForcePathStyle).toBe(true);
+    });
+
+    withEnv({
+      OPENGENI_OBJECT_STORAGE_ENDPOINT: "http://127.0.0.1:9000",
+      OPENGENI_OBJECT_STORAGE_ACCESS_KEY_ID: "minioadmin",
+    }, () => {
+      expect(() => getSettings()).toThrow("both be set or both omitted");
+    });
+  });
+
+  test("parses document indexing settings", () => {
+    withEnv({
+      OPENGENI_DOCUMENT_CHUNK_SIZE: "2000",
+      OPENGENI_DOCUMENT_CHUNK_OVERLAP: "200",
+      OPENGENI_DOCUMENT_EMBEDDING_PROVIDER: "deterministic",
+      OPENGENI_DOCUMENT_EMBEDDING_MODEL: "local-test",
+      OPENGENI_DOCUMENT_EMBEDDING_DIMENSIONS: "3072",
+    }, () => {
+      const settings = getSettings();
+      expect(settings.documentParser).toBe("liteparse");
+      expect(settings.documentChunkSize).toBe(2000);
+      expect(settings.documentChunkOverlap).toBe(200);
+      expect(settings.documentEmbeddingProvider).toBe("deterministic");
+      expect(settings.documentEmbeddingModel).toBe("local-test");
+      expect(settings.documentEmbeddingDimensions).toBe(3072);
+    });
+  });
+
+  test("rejects invalid document chunk overlap", () => {
+    withEnv({
+      OPENGENI_DOCUMENT_CHUNK_SIZE: "100",
+      OPENGENI_DOCUMENT_CHUNK_OVERLAP: "100",
+    }, () => {
+      expect(() => getSettings()).toThrow("must be smaller");
+    });
+  });
+});
+
+function withEnv<T>(env: NodeJS.ProcessEnv, fn: () => T): T {
+  const original = process.env;
+  process.env = { ...env };
+  try {
+    return fn();
+  } finally {
+    process.env = original;
+  }
+}

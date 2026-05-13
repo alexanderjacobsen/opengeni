@@ -36,6 +36,7 @@ The final state must support:
 - Keep provider-specific infrastructure separated from the provider-neutral Kubernetes app layer. Cloud modules may vary, but the OpenGeni workload contract must stay stable.
 - Keep infra/deployment docs and skills maintainable: short source-of-truth docs, clear operator commands, explicit provider differences, no obsolete evidence dumps in primary docs, and no overclaiming beyond verified behavior.
 - Use official upstream charts/operators for production platform services whenever mature options exist. The OpenGeni Helm chart owns OpenGeni API, web, worker, migrations, and OpenGeni-specific integration resources; it must not become a bespoke replacement for NATS, Temporal, Postgres, secret-sync, TLS, or observability operators.
+- Treat OpenGeni-owned Postgres, Temporal, NATS, and MinIO templates as disposable verification fixtures only. They are acceptable for deterministic local development, CI, preview environments, and cloud smoke tests, but they are not lightweight production alternatives and must never be presented as the production-grade path for an open-source operator.
 
 ## Required Capabilities
 
@@ -84,7 +85,7 @@ OpenGeni should not build a bespoke platform controller before the deployment co
 
 - **Provider-neutral app layer:** Helm chart plus conformance/preflight scripts define the OpenGeni workload contract.
 - **Provider-specific substrate layer:** Terraform/OpenTofu roots or modules create cloud primitives and produce non-secret Helm values.
-- **Official dependency layer:** production NATS, Temporal, Postgres, secret sync, ingress/TLS, and observability must be installed or referenced through official upstream charts/operators or managed services. OpenGeni-owned dependency templates are only disposable conformance fixtures for local development, CI, previews, and cloud smoke tests; they must stay off the documented production path and should be easy to replace with upstream charts/operators.
+- **Official dependency layer:** production NATS, Temporal, Postgres, secret sync, ingress/TLS, and observability must be installed or referenced through official upstream charts/operators or managed services. OpenGeni-owned dependency templates are disposable conformance fixtures for local development, CI, previews, and cloud smoke tests only. They are not production dependencies, should not carry production tuning promises, and must remain easy to remove in favor of upstream charts/operators or managed services.
 - **GitOps/preview layer:** generated Helm values and immutable images are deployable by GitHub Actions, Argo CD ApplicationSets, Flux, or a manual Helm command.
 - **Observability layer:** OpenTelemetry is the stable contract. A cluster may export to a self-hosted LGTM-compatible stack or to Azure Monitor, Amazon Managed Service for Prometheus/Grafana/CloudWatch/X-Ray-compatible endpoints, Google Managed Service for Prometheus/Cloud Trace/Cloud Logging-compatible endpoints, or another OTLP backend.
 - **Secret layer:** local smoke may use Kubernetes Secrets; production should use External Secrets Operator or cloud-native workload identity with the provider secret store.

@@ -112,3 +112,5 @@ When working on production deployment, Azure/AWS/GCP deployment, Helm, Terraform
 Track every Azure resource created for deployment verification in `docs/azure-resource-ledger.md` before or immediately after creation. Do not commit Azure secrets, kubeconfigs, Terraform state, local tfvars, generated credentials, or private endpoints that are not intentionally documented examples.
 
 Track every AWS resource created for deployment verification in `docs/aws-resource-ledger.md` before or immediately after creation. Track every GCP resource created for deployment verification in `docs/gcp-resource-ledger.md` before or immediately after creation. Do not commit AWS/GCP secrets, kubeconfigs, Terraform state, local tfvars, generated credentials, service-account keys, or private endpoints that are not intentionally documented examples.
+
+Use official upstream charts/operators or managed services for production platform services. OpenGeni's chart should own OpenGeni API, web, worker, migrations, and integration resources. Built-in Postgres, Temporal, NATS, and MinIO templates are disposable conformance fixtures for local, CI, preview, and smoke verification only.

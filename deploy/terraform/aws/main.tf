@@ -6,11 +6,14 @@ locals {
   })
 
   cluster_name = "${var.name_prefix}-eks"
-  repository_names = toset([
-    "opengeni-api",
-    "opengeni-worker",
-    "opengeni-web",
-  ])
+  repository_names = {
+    api    = "${var.name_prefix}/opengeni-api"
+    worker = "${var.name_prefix}/opengeni-worker"
+    web    = "${var.name_prefix}/opengeni-web"
+  }
+  oidc_issuer_url     = aws_eks_cluster.this.identity[0].oidc[0].issuer
+  oidc_provider_host  = replace(local.oidc_issuer_url, "https://", "")
+  runtime_bucket_arns = var.object_storage.mode == "managed" ? [aws_s3_bucket.files[0].arn] : ["arn:aws:s3:::${var.object_storage.bucket}"]
 }
 
 data "aws_caller_identity" "current" {}
@@ -154,9 +157,121 @@ resource "aws_eks_node_group" "system" {
   ]
 }
 
+resource "aws_eks_addon" "ebs_csi" {
+  cluster_name                = aws_eks_cluster.this.name
+  addon_name                  = "aws-ebs-csi-driver"
+  resolve_conflicts_on_create = "OVERWRITE"
+  resolve_conflicts_on_update = "OVERWRITE"
+  service_account_role_arn    = aws_iam_role.ebs_csi.arn
+  tags                        = local.tags
+
+  depends_on = [
+    aws_eks_node_group.system,
+    aws_iam_role_policy_attachment.ebs_csi,
+  ]
+}
+
+data "tls_certificate" "eks_oidc" {
+  url = local.oidc_issuer_url
+}
+
+resource "aws_iam_openid_connect_provider" "eks" {
+  url             = local.oidc_issuer_url
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = [data.tls_certificate.eks_oidc.certificates[0].sha1_fingerprint]
+  tags            = local.tags
+}
+
+data "aws_iam_policy_document" "ebs_csi_assume_role" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.eks.arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${local.oidc_provider_host}:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${local.oidc_provider_host}:sub"
+      values   = ["system:serviceaccount:kube-system:ebs-csi-controller-sa"]
+    }
+  }
+}
+
+resource "aws_iam_role" "ebs_csi" {
+  name               = "${var.name_prefix}-ebs-csi"
+  assume_role_policy = data.aws_iam_policy_document.ebs_csi_assume_role.json
+  tags               = local.tags
+}
+
+resource "aws_iam_role_policy_attachment" "ebs_csi" {
+  role       = aws_iam_role.ebs_csi.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
+}
+
+data "aws_iam_policy_document" "runtime_assume_role" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.eks.arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${local.oidc_provider_host}:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${local.oidc_provider_host}:sub"
+      values   = ["system:serviceaccount:${var.kubernetes_workload_identity.namespace}:${var.kubernetes_workload_identity.service_account}"]
+    }
+  }
+}
+
+resource "aws_iam_role" "runtime" {
+  name               = "${var.name_prefix}-runtime"
+  assume_role_policy = data.aws_iam_policy_document.runtime_assume_role.json
+  tags               = local.tags
+}
+
+data "aws_iam_policy_document" "runtime" {
+  statement {
+    sid = "OpenGeniObjectStorage"
+    actions = [
+      "s3:DeleteObject",
+      "s3:GetObject",
+      "s3:PutObject",
+    ]
+    resources = [for arn in local.runtime_bucket_arns : "${arn}/*"]
+  }
+
+  statement {
+    sid       = "OpenGeniObjectStorageList"
+    actions   = ["s3:ListBucket"]
+    resources = local.runtime_bucket_arns
+  }
+}
+
+resource "aws_iam_role_policy" "runtime" {
+  name   = "${var.name_prefix}-runtime"
+  role   = aws_iam_role.runtime.id
+  policy = data.aws_iam_policy_document.runtime.json
+}
+
 resource "aws_ecr_repository" "workloads" {
   for_each             = local.repository_names
-  name                 = each.key
+  name                 = each.value
   image_tag_mutability = "IMMUTABLE"
   force_delete         = var.ecr_force_delete
   tags                 = local.tags

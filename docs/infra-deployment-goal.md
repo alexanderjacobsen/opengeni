@@ -35,6 +35,7 @@ The final state must support:
 - Keep all generated artifacts reproducible from source-controlled templates or scripts.
 - Keep provider-specific infrastructure separated from the provider-neutral Kubernetes app layer. Cloud modules may vary, but the OpenGeni workload contract must stay stable.
 - Keep infra/deployment docs and skills maintainable: short source-of-truth docs, clear operator commands, explicit provider differences, no obsolete evidence dumps in primary docs, and no overclaiming beyond verified behavior.
+- Use official upstream charts/operators for production platform services whenever mature options exist. The OpenGeni Helm chart owns OpenGeni API, web, worker, migrations, and OpenGeni-specific integration resources; it must not become a bespoke replacement for NATS, Temporal, Postgres, secret-sync, TLS, or observability operators.
 
 ## Required Capabilities
 
@@ -44,6 +45,13 @@ The deployment foundation must describe and verify these primitives:
 - Postgres with pgvector for sessions, event log, documents, and indexes.
 - Temporal endpoint, namespace, task queue, and worker connectivity.
 - NATS endpoint for live fanout, with durable replay still backed by Postgres.
+- Official upstream dependency integrations for production/self-hosted platform services:
+  - NATS through the official NATS Helm chart or an existing managed/customer NATS endpoint.
+  - Temporal through Temporal Cloud, an existing customer endpoint, or the official Temporal Helm chart connected to external persistence.
+  - Postgres through managed cloud Postgres, an existing customer database, or a production-grade Postgres operator such as CloudNativePG for in-cluster self-hosting.
+  - Secrets through External Secrets Operator, cloud-native secret stores, Vault, or equivalent operator-managed delivery.
+  - TLS through cert-manager, cloud load balancer integrations, or an existing ingress/TLS stack.
+  - Observability through OpenTelemetry Collector/Operator, Prometheus Operator CRDs, and documented managed-cloud/LGTM-compatible backends.
 - S3-compatible object storage for local/self-contained modes and explicitly implemented provider adapters for production object stores: Azure Blob, AWS S3, and Google Cloud Storage.
 - Secret delivery from Kubernetes Secrets for local smoke, and External Secrets Operator-compatible wiring for Azure Key Vault, AWS Secrets Manager/Parameter Store, GCP Secret Manager, or Vault.
 - Ingress/TLS with long-lived SSE support and safe timeouts.
@@ -76,6 +84,7 @@ OpenGeni should not build a bespoke platform controller before the deployment co
 
 - **Provider-neutral app layer:** Helm chart plus conformance/preflight scripts define the OpenGeni workload contract.
 - **Provider-specific substrate layer:** Terraform/OpenTofu roots or modules create cloud primitives and produce non-secret Helm values.
+- **Official dependency layer:** production NATS, Temporal, Postgres, secret sync, ingress/TLS, and observability must be installed or referenced through official upstream charts/operators or managed services. OpenGeni-owned dependency templates are only disposable conformance fixtures for local development, CI, previews, and cloud smoke tests; they must stay off the documented production path and should be easy to replace with upstream charts/operators.
 - **GitOps/preview layer:** generated Helm values and immutable images are deployable by GitHub Actions, Argo CD ApplicationSets, Flux, or a manual Helm command.
 - **Observability layer:** OpenTelemetry is the stable contract. A cluster may export to a self-hosted LGTM-compatible stack or to Azure Monitor, Amazon Managed Service for Prometheus/Grafana/CloudWatch/X-Ray-compatible endpoints, Google Managed Service for Prometheus/Cloud Trace/Cloud Logging-compatible endpoints, or another OTLP backend.
 - **Secret layer:** local smoke may use Kubernetes Secrets; production should use External Secrets Operator or cloud-native workload identity with the provider secret store.
@@ -329,6 +338,11 @@ The final change is ready to push and open a PR only when:
 - Rebuilt and repushed the AKS worker image with Modal/Azure Blob materialization support, deployed Helm revision 22, and verified worker readiness at `opengenicodex8092acr.azurecr.io/opengeni-worker:local-amd64-modal-azure-materialization@sha256:9ef2c21fcf679bde85aabf1f53e1db1c41256363e7e89fdfd019526734abfc16`.
 - Re-verified public Azure TLS conformance after the revision 22 worker rollout: `NODE_EXTRA_CA_CERTS=/tmp/opengeni-aks-ingress.crt bun run deployment:conformance -- --base-url https://opengeni.4.175.162.38.sslip.io --timeout-seconds 240 --skip-observability --json` passed API health, live session run, event replay, SSE replay, manual scheduled-task dispatch, and Azure Blob upload/download with session `be952e87-6bd0-4494-ab7c-7247f5f8e940`, scheduled task `6af60d39-5a0f-4a9b-9115-196a8ec6fda9`, scheduled session `9158d46d-6b7a-4e93-9f7a-6ecab85abf06`, and file `f60b9b36-27c5-4b95-a8a3-24efe640988f`.
 - Deleted temporary managed Postgres server `opengeni-codex-8092-pg-ne` after proof and removed `/tmp/opengeni-managed-pg.env`; active AKS/ACR/Key Vault/Azure Storage resources are intentionally retained for continued deployed verification and have cleanup commands in `docs/azure-resource-ledger.md`.
+- Re-ran AWS Terraform after switching to the AWS SSO admin profile and created the AWS reference substrate in account `066730217701/us-east-1`: EKS cluster `opengeni-codex-8092-eks`, managed node group `system`, ECR repositories, S3 bucket `opengenicodex8092-files-20260513121826757000000002`, Secrets Manager secret `opengeni-codex-8092/runtime`, VPC/subnets/IGW/route table, EKS OIDC provider, OpenGeni runtime IRSA role, and EBS CSI add-on IRSA role.
+- Fixed the AWS Terraform root so ECR repositories are scoped under `name_prefix`, OpenGeni workloads receive least-privilege S3 access through IRSA, and the EKS `aws-ebs-csi-driver` managed add-on uses its own IRSA role instead of relying on node instance role credentials.
+- Pushed AWS image tag `aws-smoke-a20c666-202605131420` for API, worker, and web to ECR and recorded digests in `docs/aws-resource-ledger.md`.
+- Installed the `opengeni-aws` Helm release on EKS with in-cluster Postgres, Temporal, NATS, OpenTelemetry Collector, native AWS S3 object storage, IRSA, and no MinIO. The first install exposed a missing EBS CSI configuration; after applying the Terraform-owned EBS CSI IRSA fix, the Postgres PVC bound to EBS volume `vol-06be118aafcc80f0b` and all workloads became available.
+- Verified EKS S3 conformance: `bun run deployment:conformance -- --base-url http://127.0.0.1:48080 --timeout-seconds 180 --json` passed API health, Prometheus metrics, live session run, event replay, SSE replay, scheduled task dispatch, and S3 upload/download; session `776ad678-5baa-4cf8-8697-5d28a61f0e94`, scheduled-task session `acdbaaa0-4a29-446d-93bd-811ace45cc8a`, file `1244dce4-2956-47e4-a3de-77e85efd424e`.
 - Hardened the live Azure Blob storage account to match the Terraform reference: nested public blob access disabled, blob versioning enabled, and seven-day blob/container delete retention enabled.
 - Patched Azure Terraform to model private Azure Blob access, AKS node-pool upgrade settings, and optional AKS Microsoft Defender workspace wiring. Existing Azure resources were imported into temporary uncommitted state under `/tmp`; `terraform plan` in bootstrap mode returned no changes, and complete mode with explicit external Postgres/Temporal hosts produced output-only changes and no Azure resource changes.
 - Re-ran the preferred AKS kubelet `AcrPull` role assignment with the current Azure principal and an isolated local service-principal login; both failed with `AuthorizationFailed` for `Microsoft.Authorization/roleAssignments/write`, so the documented operator action remains required for the preferred long-lived image-pull path.

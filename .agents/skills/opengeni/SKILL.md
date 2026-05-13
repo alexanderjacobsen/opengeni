@@ -112,6 +112,8 @@ bun run dev
 
 For infrastructure and deployment work, keep `docs/infra-deployment-goal.md` current and keep operator-facing docs compact. Long evidence belongs in ledgers or audit notes, not in primary how-to docs.
 
+For production Kubernetes, use official upstream charts/operators or managed services for platform dependencies. OpenGeni's chart should own OpenGeni workloads and integration resources; built-in Postgres, Temporal, NATS, or MinIO templates are disposable conformance fixtures only and must not be described as the production path.
+
 ## File Upload And Sandbox Discovery
 
 When working on file flows, trace the full path end to end:

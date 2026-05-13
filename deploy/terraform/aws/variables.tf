@@ -77,6 +77,15 @@ variable "ecr_force_delete" {
   default     = false
 }
 
+variable "kubernetes_workload_identity" {
+  description = "Kubernetes service account allowed to assume the AWS runtime IAM role through IRSA."
+  type = object({
+    namespace       = optional(string, "opengeni")
+    service_account = optional(string, "opengeni")
+  })
+  default = {}
+}
+
 variable "postgres" {
   description = "Postgres mode. Use managed for RDS PostgreSQL or external to connect an existing compatible server."
   type = object({

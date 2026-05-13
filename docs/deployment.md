@@ -160,7 +160,18 @@ bun run deployment:conformance -- \
 
 The chart defaults API, worker, and web deployments to zero-surge rolling updates (`maxSurge: 0`, `maxUnavailable: 1`) so one-node smoke clusters do not need spare node capacity during upgrades. Increase surge settings in larger production clusters if you want faster replacement and have capacity headroom.
 
-The in-cluster Postgres, Temporal, and MinIO templates are intended for demos, local Kubernetes, previews, and smoke tests. Production operators should use provider-native object storage through the runtime secret.
+The in-cluster Postgres, Temporal, NATS, and MinIO templates are disposable conformance fixtures for local Kubernetes, CI, previews, and cloud smoke tests. They are not the production distribution of those systems. Production operators should use managed services, existing customer endpoints, or official upstream charts/operators, and provider-native object storage through the runtime secret.
+
+Production self-hosted platform dependencies should use mature upstream projects rather than OpenGeni-owned replicas of those systems:
+
+- NATS: official NATS Helm chart, or an existing managed/customer NATS endpoint.
+- Temporal: Temporal Cloud, an existing customer endpoint, or the official Temporal Helm chart connected to external persistence.
+- Postgres: managed cloud Postgres, an existing customer database, or a production PostgreSQL operator such as CloudNativePG.
+- Secrets: External Secrets Operator with Azure Key Vault, AWS Secrets Manager, GCP Secret Manager, Vault, or an equivalent store.
+- TLS: cert-manager, cloud load balancer certificate integration, or an existing ingress/TLS stack.
+- Observability: OpenTelemetry Collector/Operator plus Prometheus Operator-compatible resources, exported to a self-hosted LGTM-compatible stack or a managed cloud backend.
+
+The OpenGeni Helm chart owns OpenGeni API, web, worker, migrations, and integration resources such as `ServiceMonitor`, `PrometheusRule`, `ExternalSecret`, and workload NetworkPolicies. It must not become a replacement chart for NATS, Temporal, Postgres, cert-manager, or the observability platform.
 
 The secret must provide runtime values such as:
 

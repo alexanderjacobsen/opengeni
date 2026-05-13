@@ -3,7 +3,7 @@
 This root creates a cleanup-friendly AWS substrate for the Helm chart:
 
 - EKS cluster and managed node group.
-- ECR repositories for API, worker, and web images.
+- ECR repositories scoped under `name_prefix` for API, worker, and web images.
 - S3 bucket for `OPENGENI_OBJECT_STORAGE_BACKEND=aws-s3`.
 - AWS Secrets Manager runtime secret placeholder.
 - Optional RDS PostgreSQL when `postgres.mode = "managed"`.

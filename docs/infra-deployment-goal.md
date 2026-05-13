@@ -203,9 +203,9 @@ The final change is ready to push and open a PR only when:
 
 ## Current Status
 
-- Status: expanded and reopened after local checkpoint commit `8802d70`.
+- Status: final local/static gates and multi-cloud reference evidence are complete for PR preparation.
 - Active goal: make this repo PR-ready for a world-class production Kubernetes and multi-cloud deployment platform.
-- Completion notes: the previous Azure/local foundation is committed locally. The new scope is not complete until Kubernetes structure, observability, CI/CD previews, Azure cleanup, AWS, GCP, and full conformance evidence meet the PR-ready definition above.
+- Completion notes: Kubernetes structure, observability, CI/CD preview artifacts, Azure/AWS/GCP reference deployments, provider ledgers, and conformance evidence meet the PR-ready definition. Remaining items are documented operator actions for retained live environments, not source gaps.
 
 ## Evidence Log
 
@@ -275,7 +275,7 @@ The final change is ready to push and open a PR only when:
 - Verified `bun run check` passes after the storage, deployment-contract, and chart changes.
 - Verified Helm lint/template rendering for the chart and AWS/GCP values examples.
 - Verified Terraform validate for Azure, AWS, and GCP roots.
-- Verified AWS Terraform plan succeeds, then documented that AWS apply is blocked before resource creation by the current IAM user lacking create permissions for EC2 VPC, IAM roles, ECR repositories, S3 buckets, and Secrets Manager secrets.
+- Verified AWS Terraform plan initially succeeded with a limited IAM user, then switched to the AWS SSO admin profile and successfully created the AWS reference substrate in account `066730217701/us-east-1`.
 - Created GCP reference substrate in `cloudgeni-gecko/us-central1`: GKE, Artifact Registry, GCS, Secret Manager, runtime service account, VPC, subnet, Workload Identity, image-push IAM, GKE admin IAM, GCS access, IAM signing for GCS V4 URLs, and Artifact Registry image-pull IAM.
 - Pushed GCP image tag `gcp-smoke-8802d70-20260513134906` for API, worker, and web to Artifact Registry and recorded digests in `docs/gcp-resource-ledger.md`.
 - Installed the `opengeni-gcp` Helm release on GKE with in-cluster Postgres, Temporal, NATS, OpenTelemetry Collector, native GCS object storage, Workload Identity, and no MinIO.
@@ -325,7 +325,7 @@ The final change is ready to push and open a PR only when:
 - Verified sandbox credential hygiene with `OPENGENI_SANDBOX_PREPARATION_PROFILES=none`: session `8fa1fea7-2b1e-4450-8e4b-22fab9fd00d7` used a sandbox tool call to check common model, Azure, ARM, and GitHub credential environment variable names and completed with `sandbox env safe`.
 - Expanded CI deployment coverage to render digest-pinned Helm values and build API, worker, and web workload images for `linux/amd64`; live Azure conformance remains a documented manual/operator gate rather than a public PR workflow.
 - Documented the production security boundary in `docs/deployment.md`: OpenGeni API needs an external auth/gateway layer before public exposure, production ingress requirements, safe secret-delivery patterns, and sandbox credential exposure rules.
-- Attempted Modal-backed Azure Blob file-resource proof with local API/worker configured for Azure Blob and Modal. The first attempt failed with `ModalSandboxClient does not support manifest users yet`; runtime now sets `runAs` only for Docker. The second attempt failed with `ModalSandboxClient only supports ModalCloudBucketMountStrategy mount entries`; runtime now uses Modal cloud bucket mounts for S3-compatible storage and rejects Modal/Azure Blob with a clear compatibility error because the current SDK does not support that pairing.
+- Attempted Modal-backed Azure Blob file-resource proof with local API/worker configured for Azure Blob and Modal. The first attempt failed with `ModalSandboxClient does not support manifest users yet`; runtime now sets `runAs` only for Docker. The second attempt failed with `ModalSandboxClient only supports ModalCloudBucketMountStrategy mount entries`; runtime now avoids the unsupported mount path by materializing Azure Blob file resources into the Modal sandbox before the agent starts.
 - Updated Azure deployment contract and Helm example values so Azure Blob profiles default to `OPENGENI_SANDBOX_BACKEND=none` instead of claiming Modal compatibility for Azure Blob file mounts.
 - Created temporary managed Azure PostgreSQL Flexible Server `opengeni-codex-8092-pg-ne` in `northeurope` after Azure reported Flexible Server provisioning restricted in `westeurope`; recorded it in `docs/azure-resource-ledger.md`.
 - Verified managed Postgres support: set `azure.extensions=PGCRYPTO,VECTOR`, applied OpenGeni migrations, confirmed extensions `pgcrypto` and `vector`, confirmed `pg_type` includes `vector`, and confirmed 11 public tables on database `opengeni`.
@@ -351,6 +351,7 @@ The final change is ready to push and open a PR only when:
 - Re-ran the preferred AKS kubelet `AcrPull` role assignment with the current Azure principal and an isolated local service-principal login; both failed with `AuthorizationFailed` for `Microsoft.Authorization/roleAssignments/write`, so the documented operator action remains required for the preferred long-lived image-pull path.
 - Deleted stale AKS resources after Azure Blob became the active object store: `opengeni-runtime-live` secret and `data-opengeni-bootstrap-minio-0` PVC. Verified all retained AKS pods are running and only the Postgres PVC disk remains.
 - Final verification after Terraform/storage cleanup: `bun install --frozen-lockfile`, `bun run check`, `bun run test:integration`, `git diff --check`, Helm lint/template rendering with digest-pinned API/worker/web/migration images, `terraform -chdir=deploy/terraform/azure fmt -check`, `terraform -chdir=deploy/terraform/azure validate`, imported-state Terraform plan, and targeted committed-secret pattern scan passed. The secret scan matched only placeholders and synthetic test values.
+- Final private audit verification on 2026-05-13: `bun install --frozen-lockfile`, `bun run check`, `bun run test:integration`, `bun run deployment:profiles`, deployment preflight JSON for Azure/AWS/GCP managed and existing-services profiles plus `preview-pr` and `preview-branch`, `helm lint deploy/helm/opengeni`, Helm template rendering with digest-pinned images and AWS/GCP managed examples, `go run github.com/rhysd/actionlint/cmd/actionlint@latest .github/workflows/ci.yml .github/workflows/preview.yml`, floating `latest` image guard, `git diff --check`, Terraform fmt/init/validate for Azure/AWS/GCP, and a targeted committed-secret pattern scan all passed. The secret scan matched only documented placeholders or non-secret token/password labels in docs/code.
 
 ## Remaining Operator Actions
 

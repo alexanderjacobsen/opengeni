@@ -771,6 +771,9 @@ function objectStorageFileMount(settings: Settings, prefix: string): any {
       mountStrategy: inContainerMountStrategy({ pattern: { type: "rclone", mode: "fuse" } }),
     });
   }
+  if (settings.objectStorageBackend === "aws-s3" || settings.objectStorageBackend === "gcs") {
+    throw new Error(`${settings.objectStorageBackend} file resources require pre-signed download materialization`);
+  }
   const config = s3CompatibleMountConfig(settings);
   return s3Mount({
     bucket: config.bucket,

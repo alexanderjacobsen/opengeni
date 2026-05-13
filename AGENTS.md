@@ -65,7 +65,7 @@ Default URLs:
 
 `bun run dev` may auto-select alternate Docker Compose host ports when defaults are already in use; it wires those selected ports into the API and worker environment for that run.
 
-MinIO is the local S3-compatible object storage default for Docker Compose and optional self-contained Kubernetes smoke tests. Production Azure deployments should use `OPENGENI_OBJECT_STORAGE_BACKEND=azure-blob` with Azure Blob credentials instead of deploying MinIO manually.
+MinIO is the local S3-compatible object storage default for Docker Compose and optional self-contained Kubernetes smoke tests. Production deployments should use provider-native storage instead of deploying MinIO manually: `azure-blob` for Azure Blob, `aws-s3` for AWS S3, and `gcs` for Google Cloud Storage.
 
 ## Architecture Notes
 
@@ -92,7 +92,7 @@ Explicit `OPENGENI_GIT_*` settings can set sandbox git author/committer identity
 
 Do not expect model provider credentials to automatically appear in the sandbox unless explicitly allowed.
 
-The API and sandbox file-resource object-storage boundary supports `s3-compatible` and `azure-blob`. Azure Blob-backed deployments use native Azure Blob manifest mounts for attached files.
+The API and sandbox file-resource object-storage boundary supports `s3-compatible`, `azure-blob`, `aws-s3`, and `gcs`. Azure Blob-backed Docker/local sandboxes use native Azure Blob manifest mounts. Modal Azure Blob, AWS S3, and GCS file resources use short-lived signed download materialization.
 
 ## Verification
 
@@ -107,6 +107,8 @@ End-to-end agent runs require the full stack plus valid model and sandbox creden
 
 ## Deployment Work Notes
 
-When working on production deployment, Azure deployment, Helm, Terraform, conformance checks, or cloud-provider-agnostic infrastructure, read and keep `docs/infra-deployment-goal.md` current. Treat it as the source of truth for the active infrastructure end goal.
+When working on production deployment, Azure/AWS/GCP deployment, Helm, Terraform, conformance checks, preview environments, observability, or cloud-provider-agnostic infrastructure, read and keep `docs/infra-deployment-goal.md` current. Treat it as the source of truth for the active infrastructure end goal.
 
 Track every Azure resource created for deployment verification in `docs/azure-resource-ledger.md` before or immediately after creation. Do not commit Azure secrets, kubeconfigs, Terraform state, local tfvars, generated credentials, or private endpoints that are not intentionally documented examples.
+
+Track every AWS resource created for deployment verification in `docs/aws-resource-ledger.md` before or immediately after creation. Track every GCP resource created for deployment verification in `docs/gcp-resource-ledger.md` before or immediately after creation. Do not commit AWS/GCP secrets, kubeconfigs, Terraform state, local tfvars, generated credentials, service-account keys, or private endpoints that are not intentionally documented examples.

@@ -1,0 +1,27 @@
+name_prefix      = "opengeni-codex-8092"
+region           = "us-east-1"
+deployment_phase = "bootstrap"
+ecr_force_delete = true
+
+tags = {
+  environment = "verification"
+  cleanup     = "delete-after-validation"
+}
+
+postgres = {
+  mode = "external"
+  # existing_host = "postgres.example.com"
+}
+
+temporal = {
+  mode = "external"
+  # existing_host = "temporal.example.com:7233"
+  namespace  = "default"
+  task_queue = "opengeni-runs-ts"
+}
+
+object_storage = {
+  mode          = "managed"
+  bucket        = "opengeni-files"
+  force_destroy = true
+}

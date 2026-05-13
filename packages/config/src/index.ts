@@ -96,7 +96,7 @@ const SettingsSchema = z.object({
   sandboxEnvAllowlist: z.string().default(""),
   objectStorageEndpoint: z.string().url().optional(),
   objectStorageSandboxEndpoint: z.string().url().optional(),
-  objectStorageBackend: z.enum(["s3-compatible", "azure-blob"]).default("s3-compatible"),
+  objectStorageBackend: z.enum(["s3-compatible", "aws-s3", "azure-blob", "gcs"]).default("s3-compatible"),
   objectStorageBucket: z.string().min(1).default("opengeni-files"),
   objectStorageRegion: z.string().min(1).default("us-east-1"),
   objectStorageS3Provider: z.string().min(1).default("Minio"),
@@ -107,6 +107,10 @@ const SettingsSchema = z.object({
   objectStorageAzureAccountName: z.string().optional(),
   objectStorageAzureAccountKey: z.string().optional(),
   objectStorageAzureEndpoint: z.string().url().optional(),
+  objectStorageGcsProjectId: z.string().optional(),
+  objectStorageGcsCredentialsJson: z.string().optional(),
+  objectStorageGcsKeyFilename: z.string().optional(),
+  objectStorageGcsApiEndpoint: z.string().url().optional(),
   documentParser: z.string().min(1).default("liteparse"),
   documentChunkSize: z.coerce.number().int().positive().default(1200),
   documentChunkOverlap: z.coerce.number().int().nonnegative().default(160),
@@ -204,6 +208,10 @@ export function getSettings(): Settings {
     objectStorageAzureAccountName: optional("OPENGENI_OBJECT_STORAGE_AZURE_ACCOUNT_NAME"),
     objectStorageAzureAccountKey: optional("OPENGENI_OBJECT_STORAGE_AZURE_ACCOUNT_KEY"),
     objectStorageAzureEndpoint: optional("OPENGENI_OBJECT_STORAGE_AZURE_ENDPOINT"),
+    objectStorageGcsProjectId: optional("OPENGENI_OBJECT_STORAGE_GCS_PROJECT_ID"),
+    objectStorageGcsCredentialsJson: optional("OPENGENI_OBJECT_STORAGE_GCS_CREDENTIALS_JSON"),
+    objectStorageGcsKeyFilename: optional("OPENGENI_OBJECT_STORAGE_GCS_KEY_FILENAME"),
+    objectStorageGcsApiEndpoint: optional("OPENGENI_OBJECT_STORAGE_GCS_API_ENDPOINT"),
     documentParser: optional("OPENGENI_DOCUMENT_PARSER"),
     documentChunkSize: optional("OPENGENI_DOCUMENT_CHUNK_SIZE"),
     documentChunkOverlap: optional("OPENGENI_DOCUMENT_CHUNK_OVERLAP"),
@@ -416,21 +424,40 @@ function validateSettings(settings: Settings): void {
   if (Boolean(settings.modalTokenId) !== Boolean(settings.modalTokenSecret)) {
     throw new Error("OPENGENI_MODAL_TOKEN_ID and OPENGENI_MODAL_TOKEN_SECRET must both be set or both omitted");
   }
-  if (settings.objectStorageBackend === "s3-compatible") {
+  if (settings.objectStorageBackend === "s3-compatible" || settings.objectStorageBackend === "aws-s3") {
     if (Boolean(settings.objectStorageAccessKeyId) !== Boolean(settings.objectStorageSecretAccessKey)) {
       throw new Error("OPENGENI_OBJECT_STORAGE_ACCESS_KEY_ID and OPENGENI_OBJECT_STORAGE_SECRET_ACCESS_KEY must both be set or both omitted");
     }
-    if ((settings.objectStorageEndpoint || settings.objectStorageSandboxEndpoint) && (!settings.objectStorageAccessKeyId || !settings.objectStorageSecretAccessKey)) {
+    if (settings.objectStorageBackend === "s3-compatible" && (settings.objectStorageEndpoint || settings.objectStorageSandboxEndpoint) && (!settings.objectStorageAccessKeyId || !settings.objectStorageSecretAccessKey)) {
       throw new Error("S3-compatible object storage endpoints require OPENGENI_OBJECT_STORAGE_ACCESS_KEY_ID and OPENGENI_OBJECT_STORAGE_SECRET_ACCESS_KEY");
     }
-  } else {
+    if (settings.objectStorageAzureConnectionString || settings.objectStorageAzureAccountName || settings.objectStorageAzureAccountKey || settings.objectStorageAzureEndpoint) {
+      throw new Error("S3 object storage uses OPENGENI_OBJECT_STORAGE_* S3 settings, not OPENGENI_OBJECT_STORAGE_AZURE_* settings");
+    }
+    if (settings.objectStorageGcsProjectId || settings.objectStorageGcsCredentialsJson || settings.objectStorageGcsKeyFilename || settings.objectStorageGcsApiEndpoint) {
+      throw new Error("S3 object storage uses OPENGENI_OBJECT_STORAGE_* S3 settings, not OPENGENI_OBJECT_STORAGE_GCS_* settings");
+    }
+  } else if (settings.objectStorageBackend === "azure-blob") {
     if (settings.objectStorageEndpoint || settings.objectStorageSandboxEndpoint || settings.objectStorageAccessKeyId || settings.objectStorageSecretAccessKey) {
       throw new Error("Azure Blob storage uses OPENGENI_OBJECT_STORAGE_AZURE_* settings, not S3-compatible object storage settings");
+    }
+    if (settings.objectStorageGcsProjectId || settings.objectStorageGcsCredentialsJson || settings.objectStorageGcsKeyFilename || settings.objectStorageGcsApiEndpoint) {
+      throw new Error("Azure Blob storage uses OPENGENI_OBJECT_STORAGE_AZURE_* settings, not OPENGENI_OBJECT_STORAGE_GCS_* settings");
     }
     const hasConnectionString = Boolean(settings.objectStorageAzureConnectionString);
     const hasSharedKey = Boolean(settings.objectStorageAzureAccountName) && Boolean(settings.objectStorageAzureAccountKey);
     if (!hasConnectionString && !hasSharedKey) {
       throw new Error("Azure Blob storage requires OPENGENI_OBJECT_STORAGE_AZURE_CONNECTION_STRING or OPENGENI_OBJECT_STORAGE_AZURE_ACCOUNT_NAME plus OPENGENI_OBJECT_STORAGE_AZURE_ACCOUNT_KEY");
+    }
+  } else {
+    if (settings.objectStorageEndpoint || settings.objectStorageSandboxEndpoint || settings.objectStorageAccessKeyId || settings.objectStorageSecretAccessKey) {
+      throw new Error("GCS object storage uses OPENGENI_OBJECT_STORAGE_GCS_* settings, not S3-compatible object storage settings");
+    }
+    if (settings.objectStorageAzureConnectionString || settings.objectStorageAzureAccountName || settings.objectStorageAzureAccountKey || settings.objectStorageAzureEndpoint) {
+      throw new Error("GCS object storage uses OPENGENI_OBJECT_STORAGE_GCS_* settings, not OPENGENI_OBJECT_STORAGE_AZURE_* settings");
+    }
+    if (settings.objectStorageGcsCredentialsJson) {
+      parseGcsCredentialsJson(settings.objectStorageGcsCredentialsJson);
     }
   }
   if (settings.documentChunkOverlap >= settings.documentChunkSize) {
@@ -469,6 +496,15 @@ function uniqueEnvNames(raw: string[], fieldName: string): string[] {
 
 function uniqueValues(raw: string[]): string[] {
   return [...new Set(raw.filter(Boolean))];
+}
+
+function parseGcsCredentialsJson(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`OPENGENI_OBJECT_STORAGE_GCS_CREDENTIALS_JSON must be valid JSON: ${message}`);
+  }
 }
 
 function delay(ms: number): Promise<void> {

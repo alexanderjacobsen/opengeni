@@ -1,0 +1,48 @@
+project_id       = "opengeni-project"
+name_prefix      = "opengeni-codex-8092"
+region           = "us-central1"
+zone             = "us-central1-a"
+deployment_phase = "bootstrap"
+
+gke = {
+  deletion_protection = false
+  node_count          = 1
+  min_node_count      = 1
+  max_node_count      = 2
+}
+
+labels = {
+  environment = "verification"
+  cleanup     = "delete-after-validation"
+}
+
+artifact_registry_writer_members = [
+  "serviceAccount:cloudgeni-platform-sa@cloudgeni-gecko.iam.gserviceaccount.com",
+]
+
+gke_admin_members = [
+  "serviceAccount:terraform-plan-readonly-temp@cloudgeni-gecko.iam.gserviceaccount.com",
+]
+
+kubernetes_workload_identity = {
+  namespace       = "opengeni-gcp"
+  service_account = "opengeni-gcp"
+}
+
+postgres = {
+  mode = "external"
+  # existing_host = "postgres.example.com"
+}
+
+temporal = {
+  mode = "external"
+  # existing_host = "temporal.example.com:7233"
+  namespace  = "default"
+  task_queue = "opengeni-runs-ts"
+}
+
+object_storage = {
+  mode          = "managed"
+  bucket        = "opengeni-files"
+  force_destroy = true
+}

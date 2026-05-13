@@ -6,6 +6,12 @@ export const DeploymentProfileId = z.enum([
   "kubernetes-external",
   "azure-managed",
   "azure-existing-services",
+  "aws-managed",
+  "aws-existing-services",
+  "gcp-managed",
+  "gcp-existing-services",
+  "preview-pr",
+  "preview-branch",
   "self-contained-kubernetes",
 ]);
 export type DeploymentProfileId = z.infer<typeof DeploymentProfileId>;
@@ -19,7 +25,7 @@ export type RuntimePlatform = z.infer<typeof RuntimePlatform>;
 export const DependencyMode = z.enum(["managed", "external", "inCluster", "disabled"]);
 export type DependencyMode = z.infer<typeof DependencyMode>;
 
-export const StorageApi = z.enum(["s3-compatible", "azure-blob"]);
+export const StorageApi = z.enum(["s3-compatible", "aws-s3", "azure-blob", "gcs"]);
 export type StorageApi = z.infer<typeof StorageApi>;
 
 export const SandboxBackend = z.enum(["docker", "modal", "local", "none"]);
@@ -31,13 +37,18 @@ export const SecretDeliveryMode = z.enum([
   "externalSecrets",
   "vault",
   "azureKeyVault",
+  "awsSecretsManager",
+  "gcpSecretManager",
 ]);
 export type SecretDeliveryMode = z.infer<typeof SecretDeliveryMode>;
 
 export const ObservabilityBackend = z.enum([
   "none",
   "otel",
+  "grafanaLgtm",
   "azureMonitor",
+  "awsManaged",
+  "gcpManaged",
   "prometheusGrafana",
   "datadog",
   "honeycomb",
@@ -186,6 +197,27 @@ export const DeploymentContract = z.object({
       message: "Azure profiles require runtime.cloud=azure",
     });
   }
+  if (contract.profile.startsWith("aws") && contract.runtime.cloud !== "aws") {
+    ctx.addIssue({
+      code: "custom",
+      path: ["runtime", "cloud"],
+      message: "AWS profiles require runtime.cloud=aws",
+    });
+  }
+  if (contract.profile.startsWith("gcp") && contract.runtime.cloud !== "gcp") {
+    ctx.addIssue({
+      code: "custom",
+      path: ["runtime", "cloud"],
+      message: "GCP profiles require runtime.cloud=gcp",
+    });
+  }
+  if (contract.profile.startsWith("preview") && contract.runtime.platform !== "kubernetes") {
+    ctx.addIssue({
+      code: "custom",
+      path: ["runtime", "platform"],
+      message: "Preview profiles require Kubernetes runtime",
+    });
+  }
   requireModeReference(ctx, ["database"], contract.database.mode, contract.database.external, contract.database.managed);
   requireModeReference(ctx, ["temporal"], contract.temporal.mode, contract.temporal.external, contract.temporal.managed);
   requireModeReference(ctx, ["objectStorage"], contract.objectStorage.mode, contract.objectStorage.external, contract.objectStorage.managed);
@@ -201,6 +233,20 @@ export const DeploymentContract = z.object({
       code: "custom",
       path: ["objectStorage", "api"],
       message: "azure-blob storage is only valid for Azure managed/reference deployments",
+    });
+  }
+  if (contract.objectStorage.api === "aws-s3" && !["aws", "generic"].includes(contract.runtime.cloud)) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["objectStorage", "api"],
+      message: "aws-s3 storage is only valid for AWS or generic Kubernetes deployments",
+    });
+  }
+  if (contract.objectStorage.api === "gcs" && !["gcp", "generic"].includes(contract.runtime.cloud)) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["objectStorage", "api"],
+      message: "gcs storage is only valid for GCP or generic Kubernetes deployments",
     });
   }
 });
@@ -334,6 +380,136 @@ export const deploymentProfiles: Record<DeploymentProfileId, DeploymentContract>
     observability: { backend: "azureMonitor", requireTraces: true, requireMetrics: true, requireStructuredLogs: true },
     sandbox: { backend: "none", preparationProfiles: ["none"], envAllowlist: [] },
   }),
+  "aws-managed": parseDeploymentContract({
+    profile: "aws-managed",
+    runtime: { platform: "kubernetes", cloud: "aws", namespace: "opengeni", releaseName: "opengeni" },
+    database: {
+      mode: "managed",
+      engine: "postgres",
+      pgvectorRequired: true,
+      managed: { provider: "aws", notes: "Amazon RDS PostgreSQL with pgvector compatibility verified." },
+    },
+    temporal: {
+      mode: "inCluster",
+      namespace: "default",
+      taskQueue: "opengeni-runs-ts",
+    },
+    nats: { mode: "inCluster" },
+    objectStorage: {
+      mode: "managed",
+      api: "aws-s3",
+      bucket: "opengeni-files",
+      managed: { provider: "aws", notes: "Amazon S3 bucket for production file storage." },
+    },
+    secrets: { mode: "awsSecretsManager" },
+    ingress: { enabled: true, tls: true, sseTimeoutSeconds: 3600 },
+    observability: { backend: "awsManaged", requireTraces: true, requireMetrics: true, requireStructuredLogs: true },
+    sandbox: { backend: "none", preparationProfiles: ["none"], envAllowlist: [] },
+  }),
+  "aws-existing-services": parseDeploymentContract({
+    profile: "aws-existing-services",
+    runtime: { platform: "kubernetes", cloud: "aws", namespace: "opengeni", releaseName: "opengeni" },
+    database: {
+      mode: "external",
+      engine: "postgres",
+      pgvectorRequired: true,
+      external: { secretRef: { name: "opengeni-database", key: "OPENGENI_DATABASE_URL" } },
+    },
+    temporal: {
+      mode: "external",
+      namespace: "default",
+      taskQueue: "opengeni-runs-ts",
+      external: { secretRef: { name: "opengeni-temporal" } },
+    },
+    nats: { mode: "inCluster" },
+    objectStorage: {
+      mode: "external",
+      api: "aws-s3",
+      bucket: "opengeni-files",
+      external: { secretRef: { name: "opengeni-object-storage" } },
+    },
+    secrets: { mode: "awsSecretsManager" },
+    ingress: { enabled: true, tls: true, sseTimeoutSeconds: 3600 },
+    observability: { backend: "awsManaged", requireTraces: true, requireMetrics: true, requireStructuredLogs: true },
+    sandbox: { backend: "none", preparationProfiles: ["none"], envAllowlist: [] },
+  }),
+  "gcp-managed": parseDeploymentContract({
+    profile: "gcp-managed",
+    runtime: { platform: "kubernetes", cloud: "gcp", namespace: "opengeni", releaseName: "opengeni" },
+    database: {
+      mode: "managed",
+      engine: "postgres",
+      pgvectorRequired: true,
+      managed: { provider: "gcp", notes: "Cloud SQL for PostgreSQL with pgvector compatibility verified." },
+    },
+    temporal: {
+      mode: "inCluster",
+      namespace: "default",
+      taskQueue: "opengeni-runs-ts",
+    },
+    nats: { mode: "inCluster" },
+    objectStorage: {
+      mode: "managed",
+      api: "gcs",
+      bucket: "opengeni-files",
+      managed: { provider: "gcp", notes: "Google Cloud Storage bucket for production file storage." },
+    },
+    secrets: { mode: "gcpSecretManager" },
+    ingress: { enabled: true, tls: true, sseTimeoutSeconds: 3600 },
+    observability: { backend: "gcpManaged", requireTraces: true, requireMetrics: true, requireStructuredLogs: true },
+    sandbox: { backend: "none", preparationProfiles: ["none"], envAllowlist: [] },
+  }),
+  "gcp-existing-services": parseDeploymentContract({
+    profile: "gcp-existing-services",
+    runtime: { platform: "kubernetes", cloud: "gcp", namespace: "opengeni", releaseName: "opengeni" },
+    database: {
+      mode: "external",
+      engine: "postgres",
+      pgvectorRequired: true,
+      external: { secretRef: { name: "opengeni-database", key: "OPENGENI_DATABASE_URL" } },
+    },
+    temporal: {
+      mode: "external",
+      namespace: "default",
+      taskQueue: "opengeni-runs-ts",
+      external: { secretRef: { name: "opengeni-temporal" } },
+    },
+    nats: { mode: "inCluster" },
+    objectStorage: {
+      mode: "external",
+      api: "gcs",
+      bucket: "opengeni-files",
+      external: { secretRef: { name: "opengeni-object-storage" } },
+    },
+    secrets: { mode: "gcpSecretManager" },
+    ingress: { enabled: true, tls: true, sseTimeoutSeconds: 3600 },
+    observability: { backend: "gcpManaged", requireTraces: true, requireMetrics: true, requireStructuredLogs: true },
+    sandbox: { backend: "none", preparationProfiles: ["none"], envAllowlist: [] },
+  }),
+  "preview-pr": parseDeploymentContract({
+    profile: "preview-pr",
+    runtime: { platform: "kubernetes", cloud: "generic", namespace: "opengeni-preview-pr", releaseName: "opengeni-preview" },
+    database: { mode: "inCluster", engine: "postgres", pgvectorRequired: true },
+    temporal: { mode: "inCluster", namespace: "default", taskQueue: "opengeni-runs-ts" },
+    nats: { mode: "inCluster" },
+    objectStorage: { mode: "inCluster", api: "s3-compatible", bucket: "opengeni-files" },
+    secrets: { mode: "externalSecrets" },
+    ingress: { enabled: true, tls: true, sseTimeoutSeconds: 3600 },
+    observability: { backend: "otel", requireTraces: true, requireMetrics: true, requireStructuredLogs: true },
+    sandbox: { backend: "none", preparationProfiles: ["none"], envAllowlist: [] },
+  }),
+  "preview-branch": parseDeploymentContract({
+    profile: "preview-branch",
+    runtime: { platform: "kubernetes", cloud: "generic", namespace: "opengeni-preview-branch", releaseName: "opengeni-preview" },
+    database: { mode: "inCluster", engine: "postgres", pgvectorRequired: true },
+    temporal: { mode: "inCluster", namespace: "default", taskQueue: "opengeni-runs-ts" },
+    nats: { mode: "inCluster" },
+    objectStorage: { mode: "inCluster", api: "s3-compatible", bucket: "opengeni-files" },
+    secrets: { mode: "externalSecrets" },
+    ingress: { enabled: true, tls: true, sseTimeoutSeconds: 3600 },
+    observability: { backend: "otel", requireTraces: true, requireMetrics: true, requireStructuredLogs: true },
+    sandbox: { backend: "none", preparationProfiles: ["none"], envAllowlist: [] },
+  }),
   "self-contained-kubernetes": parseDeploymentContract({
     profile: "self-contained-kubernetes",
     runtime: { platform: "kubernetes", cloud: "generic", namespace: "opengeni", releaseName: "opengeni" },
@@ -405,8 +581,12 @@ export function requiredRuntimeEnvVars(contract: DeploymentContract): string[] {
         "OPENGENI_OBJECT_STORAGE_S3_PROVIDER",
         "OPENGENI_OBJECT_STORAGE_SECRET_ACCESS_KEY",
       );
-    } else {
+    } else if (contract.objectStorage.api === "aws-s3") {
+      vars.push("OPENGENI_OBJECT_STORAGE_REGION");
+    } else if (contract.objectStorage.api === "azure-blob") {
       vars.push("OPENGENI_OBJECT_STORAGE_AZURE_CONNECTION_STRING");
+    } else {
+      vars.push("OPENGENI_OBJECT_STORAGE_GCS_PROJECT_ID");
     }
   }
   if (contract.runtime.platform === "kubernetes") {

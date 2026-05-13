@@ -144,3 +144,29 @@ app.kubernetes.io/instance: {{ .Release.Name }}
       key: {{ .Values.minio.auth.secretKeyKey }}
 {{- end }}
 {{- end -}}
+
+{{- define "opengeni.topologySpreadConstraints" -}}
+{{- $root := .root -}}
+{{- $component := .component -}}
+{{- $values := .values -}}
+{{- if $values.topologySpreadConstraints.enabled }}
+- maxSkew: {{ $values.topologySpreadConstraints.maxSkew }}
+  topologyKey: {{ $values.topologySpreadConstraints.topologyKey | quote }}
+  whenUnsatisfiable: {{ $values.topologySpreadConstraints.whenUnsatisfiable }}
+  labelSelector:
+    matchLabels:
+      {{- include "opengeni.selectorLabels" $root | nindent 6 }}
+      app.kubernetes.io/component: {{ $component }}
+{{- end }}
+{{- end -}}
+
+{{- define "opengeni.httpProbe" -}}
+{{- $probe := .probe -}}
+httpGet:
+  path: {{ $probe.path | quote }}
+  port: http
+initialDelaySeconds: {{ $probe.initialDelaySeconds | default 0 }}
+periodSeconds: {{ $probe.periodSeconds | default 10 }}
+timeoutSeconds: {{ $probe.timeoutSeconds | default 1 }}
+failureThreshold: {{ $probe.failureThreshold | default 3 }}
+{{- end -}}

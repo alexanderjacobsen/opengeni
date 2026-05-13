@@ -51,8 +51,14 @@ Current profiles:
 - `local-compose`: existing Docker Compose development stack.
 - `local-kubernetes`: local Kubernetes cluster running the Helm chart with in-cluster dependencies.
 - `kubernetes-external`: Kubernetes workloads connected to existing customer services.
-- `azure-managed`: Azure reference deployment with managed Azure substrate where currently supported.
+- `azure-managed`: AKS plus Azure-managed substrate where supported.
 - `azure-existing-services`: Azure Kubernetes workloads connected to existing Postgres, Temporal, and object storage.
+- `aws-managed`: EKS plus AWS-managed substrate where supported.
+- `aws-existing-services`: EKS workloads connected to existing Postgres, Temporal, and object storage.
+- `gcp-managed`: GKE plus GCP-managed substrate where supported.
+- `gcp-existing-services`: GKE workloads connected to existing Postgres, Temporal, and object storage.
+- `preview-pr`: same-repo pull-request preview environment.
+- `preview-branch`: manually requested branch preview environment.
 - `self-contained-kubernetes`: Kubernetes-hosted dependencies for demos or air-gapped evaluation.
 
 ## Local Docker Compose
@@ -154,7 +160,7 @@ bun run deployment:conformance -- \
 
 The chart defaults API, worker, and web deployments to zero-surge rolling updates (`maxSurge: 0`, `maxUnavailable: 1`) so one-node smoke clusters do not need spare node capacity during upgrades. Increase surge settings in larger production clusters if you want faster replacement and have capacity headroom.
 
-The in-cluster Postgres, Temporal, and MinIO templates are intended for demos, local Kubernetes, and smoke tests. Production Azure operators should use Azure Blob or another explicitly configured external file adapter through the runtime secret.
+The in-cluster Postgres, Temporal, and MinIO templates are intended for demos, local Kubernetes, previews, and smoke tests. Production operators should use provider-native object storage through the runtime secret.
 
 The secret must provide runtime values such as:
 
@@ -163,19 +169,22 @@ The secret must provide runtime values such as:
 - `OPENGENI_NATS_URL` when not using in-cluster NATS
 - `OPENGENI_STARTUP_DEPENDENCY_RETRY_*` when dependencies need longer startup windows
 - `OPENGENI_OPENAI_API_KEY` or Azure OpenAI equivalents
-- `OPENGENI_OBJECT_STORAGE_BACKEND=s3-compatible` plus endpoint/access-key settings, or `OPENGENI_OBJECT_STORAGE_BACKEND=azure-blob` plus Azure Blob connection string/account-key settings
+- `OPENGENI_OBJECT_STORAGE_BACKEND=s3-compatible` plus endpoint/access-key settings for local/self-contained modes
+- `OPENGENI_OBJECT_STORAGE_BACKEND=azure-blob` plus Azure Blob connection string/account-key settings
+- `OPENGENI_OBJECT_STORAGE_BACKEND=aws-s3` plus `OPENGENI_OBJECT_STORAGE_REGION`; prefer IRSA/EKS Pod Identity over static keys
+- `OPENGENI_OBJECT_STORAGE_BACKEND=gcs` plus `OPENGENI_OBJECT_STORAGE_GCS_PROJECT_ID`; prefer GKE Workload Identity over service-account JSON
 - sandbox backend credentials when required
 
 Do not commit real secret values.
 
-OpenGeni's storage package intentionally exposes a small provider-neutral boundary instead of calling S3 or Azure Blob directly from routes. The current shipped backends are `s3-compatible` and `azure-blob`; sandbox file resources are emitted as native storage mounts when the sandbox backend supports them, or materialized through the sandbox file API when a backend cannot mount that provider directly. Additional providers should be added behind the same boundary, or bridged through a library such as `files-sdk` if that becomes the lowest-maintenance adapter layer.
+OpenGeni's storage package intentionally exposes a small provider-neutral boundary instead of calling provider SDKs directly from routes. The current shipped backends are `s3-compatible`, `azure-blob`, `aws-s3`, and `gcs`; sandbox file resources are emitted as native storage mounts when the sandbox backend supports them, or materialized through short-lived signed downloads when a backend cannot mount that provider directly. Additional providers should be added behind the same boundary, or bridged through a library such as `files-sdk` if that becomes the lowest-maintenance adapter layer.
 
 Sandbox file mount support is also backend-specific:
 
-| Sandbox backend | S3-compatible storage | Azure Blob storage |
-| --- | --- | --- |
-| Docker/local in-container sandboxes | Supported through rclone-based in-container mounts. | Supported through rclone-based in-container mounts. |
-| Modal | Supported through the SDK's Modal cloud bucket mount strategy. | Supported by reading attached file resources server-side and materializing them into the Modal sandbox before the agent starts. This is not a live Azure Blob mount; large-file policy should be enforced at the upload/product layer. |
+| Sandbox backend | S3-compatible | Azure Blob | AWS S3 | GCS |
+| --- | --- | --- | --- | --- |
+| Docker/local in-container sandboxes | rclone mount | rclone mount | signed download materialization | signed download materialization |
+| Modal | SDK cloud bucket mount | signed download materialization | signed download materialization | signed download materialization |
 
 ## Security Boundary
 
@@ -311,6 +320,58 @@ terraform -chdir=deploy/terraform/azure plan
 ```
 
 After apply, update the ledger with exact resources and cleanup commands.
+
+## AWS Reference
+
+The AWS Terraform root lives at `deploy/terraform/aws`.
+
+It supports EKS, ECR, S3, AWS Secrets Manager, optional RDS PostgreSQL, and existing Postgres/Temporal endpoints. Use `deploy/helm/opengeni/values.aws-managed.example.yaml` as the non-secret Helm values shape.
+
+Before applying anything in AWS:
+
+1. Add planned resources to `docs/aws-resource-ledger.md`.
+2. Keep secrets in local env files, AWS Secrets Manager, or uncommitted Terraform variables.
+3. Run:
+
+```bash
+terraform -chdir=deploy/terraform/aws init -backend=false
+terraform -chdir=deploy/terraform/aws validate
+terraform -chdir=deploy/terraform/aws plan
+```
+
+After apply, update the ledger with exact resources and cleanup commands.
+
+## GCP Reference
+
+The GCP Terraform root lives at `deploy/terraform/gcp`.
+
+It supports GKE, Artifact Registry, GCS, Secret Manager, workload identity, optional Cloud SQL PostgreSQL, and existing Postgres/Temporal endpoints. Use `deploy/helm/opengeni/values.gcp-managed.example.yaml` as the non-secret Helm values shape.
+
+Before applying anything in GCP:
+
+1. Add planned resources to `docs/gcp-resource-ledger.md`.
+2. Keep secrets in local env files, Secret Manager, or uncommitted Terraform variables.
+3. Run:
+
+```bash
+terraform -chdir=deploy/terraform/gcp init -backend=false
+terraform -chdir=deploy/terraform/gcp validate
+terraform -chdir=deploy/terraform/gcp plan
+```
+
+After apply, update the ledger with exact resources and cleanup commands.
+
+## Previews
+
+`.github/workflows/preview.yml` defines same-repo PR previews and manual branch previews. It is intentionally secret-gated:
+
+- Forked PRs do not deploy.
+- `OPENGENI_PREVIEW_KUBE_CONFIG_B64` points at the preview cluster.
+- `OPENGENI_PREVIEW_REGISTRY` plus registry credentials select where images are pushed.
+- `OPENGENI_PREVIEW_RUNTIME_ENV_B64` becomes the per-preview runtime secret.
+- PR close or manual `teardown=true` uninstalls the Helm release and deletes the namespace.
+
+The preview workflow builds immutable run-tagged API, worker, and web images, deploys isolated in-cluster dependencies, and runs deployment conformance before the preview is considered healthy.
 
 ## Conformance
 

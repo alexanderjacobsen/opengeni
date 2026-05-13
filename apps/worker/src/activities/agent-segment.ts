@@ -231,7 +231,7 @@ async function sandboxFileDownloadsForRun(
   objectStorage: ObjectStorage | null,
   resources: ResourceRef[],
 ): Promise<SandboxFileDownload[]> {
-  if (settings.sandboxBackend !== "modal" || settings.objectStorageBackend !== "azure-blob") {
+  if (settings.sandboxBackend === "none" || !requiresSignedFileResourceDownloads(settings)) {
     return [];
   }
   const fileResources = resources.filter((resource): resource is Extract<ResourceRef, { kind: "file" }> => resource.kind === "file");
@@ -239,19 +239,26 @@ async function sandboxFileDownloadsForRun(
     return [];
   }
   if (!objectStorage) {
-    throw new Error("Modal Azure Blob file resources require configured object storage");
+    throw new Error(`${settings.objectStorageBackend} file resources require configured object storage`);
   }
   const downloads: SandboxFileDownload[] = [];
   for (const resource of fileResources) {
     const file = await requireFile(db, resource.fileId);
-    const content = await objectStorage.getFileBytes(file);
+    const url = await objectStorage.createGetUrl({ key: file.objectKey });
     downloads.push({
       fileId: file.id,
       mountPath: resource.mountPath ?? `files/${file.id}`,
       filename: file.safeFilename,
-      content,
+      url: url.url,
+      expiresAt: url.expiresAt,
       sizeBytes: file.sizeBytes,
     });
   }
   return downloads;
+}
+
+function requiresSignedFileResourceDownloads(settings: Settings): boolean {
+  return settings.objectStorageBackend === "aws-s3"
+    || settings.objectStorageBackend === "gcs"
+    || (settings.sandboxBackend === "modal" && settings.objectStorageBackend === "azure-blob");
 }

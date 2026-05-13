@@ -36,6 +36,7 @@ Then open the smallest source files that answer the question:
 - Worker/orchestration: `apps/worker/src/workflows/`, `apps/worker/src/activities/`.
 - Runtime/sandbox/tools: `packages/runtime/src/index.ts`.
 - Files/object storage: `apps/api/src/routes/files.ts`, `packages/storage/src/index.ts`.
+- Deployment goal and operator docs: `docs/infra-deployment-goal.md`, `docs/deployment.md`, `deploy/helm/opengeni`, and `deploy/terraform/`.
 - Documents/retrieval: `apps/api/src/routes/documents.ts`, `packages/documents/src/index.ts`, `apps/api/src/mcp/`.
 - GitHub integration: `apps/api/src/routes/github.ts`, `packages/github/src/index.ts`.
 - Web usage examples: `apps/web/src/api.ts`, `apps/web/src/types.ts`, relevant UI components.
@@ -108,6 +109,8 @@ Use the full local stack only when the task requires real Temporal/NATS/Postgres
 ```bash
 bun run dev
 ```
+
+For infrastructure and deployment work, keep `docs/infra-deployment-goal.md` current and keep operator-facing docs compact. Long evidence belongs in ledgers or audit notes, not in primary how-to docs.
 
 ## File Upload And Sandbox Discovery
 

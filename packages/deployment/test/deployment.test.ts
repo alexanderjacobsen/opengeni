@@ -66,6 +66,37 @@ describe("deployment contract", () => {
     expect(contract.sandbox.backend).toBe("none");
   });
 
+  test("models AWS and GCP managed profiles with native object storage", () => {
+    const aws = deploymentProfiles["aws-managed"];
+    const gcp = deploymentProfiles["gcp-managed"];
+
+    expect(aws.runtime.cloud).toBe("aws");
+    expect(aws.objectStorage.mode).toBe("managed");
+    expect(aws.objectStorage.api).toBe("aws-s3");
+    expect(aws.secrets.mode).toBe("awsSecretsManager");
+    expect(aws.observability.backend).toBe("awsManaged");
+
+    expect(gcp.runtime.cloud).toBe("gcp");
+    expect(gcp.objectStorage.mode).toBe("managed");
+    expect(gcp.objectStorage.api).toBe("gcs");
+    expect(gcp.secrets.mode).toBe("gcpSecretManager");
+    expect(gcp.observability.backend).toBe("gcpManaged");
+  });
+
+  test("models PR and branch previews as isolated Kubernetes environments", () => {
+    const pr = deploymentProfiles["preview-pr"];
+    const branch = deploymentProfiles["preview-branch"];
+
+    expect(pr.runtime.platform).toBe("kubernetes");
+    expect(pr.runtime.namespace).toBe("opengeni-preview-pr");
+    expect(pr.database.mode).toBe("inCluster");
+    expect(pr.objectStorage.api).toBe("s3-compatible");
+    expect(pr.secrets.mode).toBe("externalSecrets");
+
+    expect(branch.runtime.platform).toBe("kubernetes");
+    expect(branch.runtime.namespace).toBe("opengeni-preview-branch");
+  });
+
   test("allows Modal with Azure Blob because runtime materializes file resources into the sandbox", () => {
     const contract = parseDeploymentContract({
       ...deploymentProfiles["azure-managed"],
@@ -83,6 +114,19 @@ describe("deployment contract", () => {
     expect(vars).toContain("OPENGENI_TEMPORAL_HOST");
     expect(vars).toContain("OPENGENI_OBJECT_STORAGE_BACKEND");
     expect(vars).toContain("OPENGENI_OBJECT_STORAGE_AZURE_CONNECTION_STRING");
+  });
+
+  test("lists native cloud storage environment variables without static key assumptions", () => {
+    const awsVars = requiredRuntimeEnvVars(deploymentProfiles["aws-existing-services"]);
+    const gcpVars = requiredRuntimeEnvVars(deploymentProfiles["gcp-existing-services"]);
+
+    expect(awsVars).toContain("OPENGENI_OBJECT_STORAGE_REGION");
+    expect(awsVars).not.toContain("OPENGENI_OBJECT_STORAGE_ACCESS_KEY_ID");
+    expect(awsVars).not.toContain("OPENGENI_OBJECT_STORAGE_ENDPOINT");
+
+    expect(gcpVars).toContain("OPENGENI_OBJECT_STORAGE_GCS_PROJECT_ID");
+    expect(gcpVars).not.toContain("OPENGENI_OBJECT_STORAGE_ACCESS_KEY_ID");
+    expect(gcpVars).not.toContain("OPENGENI_OBJECT_STORAGE_ENDPOINT");
   });
 
   test("does not require generated in-cluster dependency values from local env", () => {

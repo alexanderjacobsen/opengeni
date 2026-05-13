@@ -18,6 +18,7 @@ spec:
     spec:
       restartPolicy: Never
       serviceAccountName: {{ include "opengeni.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

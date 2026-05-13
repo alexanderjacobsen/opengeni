@@ -42,6 +42,29 @@ describe("object storage adapters", () => {
     const get = await storage!.createGetUrl({ key: "files/file-id/original/test.txt" });
     expect(get.url).toContain("sp=r");
   });
+
+  test("creates AWS S3 storage without requiring static credentials", () => {
+    const storage = withEnv({
+      OPENGENI_OBJECT_STORAGE_BACKEND: "aws-s3",
+      OPENGENI_OBJECT_STORAGE_BUCKET: "opengeni-files",
+      OPENGENI_OBJECT_STORAGE_REGION: "us-east-1",
+      OPENGENI_OBJECT_STORAGE_FORCE_PATH_STYLE: "false",
+    }, () => createObjectStorage(getSettings()));
+
+    expect(storage?.backend).toBe("aws-s3");
+    expect(storage?.bucket).toBe("opengeni-files");
+  });
+
+  test("creates GCS storage from provider-neutral settings", () => {
+    const storage = withEnv({
+      OPENGENI_OBJECT_STORAGE_BACKEND: "gcs",
+      OPENGENI_OBJECT_STORAGE_BUCKET: "opengeni-files",
+      OPENGENI_OBJECT_STORAGE_GCS_PROJECT_ID: "opengeni-test",
+    }, () => createObjectStorage(getSettings()));
+
+    expect(storage?.backend).toBe("gcs");
+    expect(storage?.bucket).toBe("opengeni-files");
+  });
 });
 
 function withEnv<T>(env: NodeJS.ProcessEnv, fn: () => T): T {

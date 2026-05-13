@@ -9,9 +9,13 @@ serviceAccount:
   create: true
   name: ""
   annotations: {}
+  automountServiceAccountToken: false
 
 networkPolicy:
   enabled: false
+  egress:
+    enabled: false
+    rules: []
   ingressController:
     namespaceSelector: {}
     podSelector: {}
@@ -38,6 +42,19 @@ secret:
   create: false
   existingSecret: opengeni-runtime
   stringData: {}
+
+externalSecret:
+  enabled: false
+  apiVersion: external-secrets.io/v1
+  refreshInterval: 1h
+  secretStoreRef:
+    name: ""
+    kind: ClusterSecretStore
+  target:
+    creationPolicy: Owner
+    deletionPolicy: Retain
+  data: []
+  dataFrom: []
 
 api:
   enabled: true
@@ -71,9 +88,39 @@ api:
       drop:
         - ALL
   podAnnotations: {}
+  priorityClassName: ""
+  terminationGracePeriodSeconds: 30
+  topologySpreadConstraints:
+    enabled: true
+    maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  probes:
+    readiness:
+      enabled: true
+      path: /healthz
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 3
+    liveness:
+      enabled: true
+      path: /healthz
+      initialDelaySeconds: 20
+      periodSeconds: 20
+      timeoutSeconds: 2
+      failureThreshold: 3
+    startup:
+      enabled: false
+      path: /healthz
+      periodSeconds: 5
+      failureThreshold: 30
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
   service:
     type: ClusterIP
     port: 8000
@@ -114,9 +161,27 @@ worker:
       drop:
         - ALL
   podAnnotations: {}
+  priorityClassName: ""
+  terminationGracePeriodSeconds: 60
+  topologySpreadConstraints:
+    enabled: true
+    maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  probes:
+    liveness:
+      enabled: false
+      exec: []
+      initialDelaySeconds: 30
+      periodSeconds: 30
+      timeoutSeconds: 5
+      failureThreshold: 3
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
   autoscaling:
     enabled: false
     minReplicas: 2
@@ -155,9 +220,39 @@ web:
       drop:
         - ALL
   podAnnotations: {}
+  priorityClassName: ""
+  terminationGracePeriodSeconds: 30
+  topologySpreadConstraints:
+    enabled: true
+    maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
   nodeSelector: {}
   tolerations: []
   affinity: {}
+  probes:
+    readiness:
+      enabled: true
+      path: /
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 3
+    liveness:
+      enabled: true
+      path: /
+      initialDelaySeconds: 20
+      periodSeconds: 20
+      timeoutSeconds: 2
+      failureThreshold: 3
+    startup:
+      enabled: false
+      path: /
+      periodSeconds: 5
+      failureThreshold: 30
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
   service:
     type: ClusterIP
     port: 3000
@@ -320,6 +415,17 @@ observability:
   metrics:
     enabled: true
     path: /metrics
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+    annotations: {}
+  prometheusRule:
+    enabled: false
+    labels: {}
+    annotations: {}
+    rules: []
   otel:
     enabled: false
     endpoint: ""

@@ -148,7 +148,7 @@ The first endpoint is for the host, browser, and API. The sandbox endpoint is fo
 
 `bun run dev` auto-selects alternate Docker Compose host ports when common defaults such as `5432` are already in use, and it rewrites the in-memory runtime URLs for that run. Set `OPENGENI_*_HOST_PORT` values in `.env` when you need fixed local ports.
 
-For Azure production deployments, prefer Azure Blob:
+For production deployments, use the native provider object store instead of running MinIO manually:
 
 ```bash
 OPENGENI_OBJECT_STORAGE_BACKEND=azure-blob
@@ -157,6 +157,8 @@ OPENGENI_OBJECT_STORAGE_AZURE_CONNECTION_STRING=...
 ```
 
 `OPENGENI_OBJECT_STORAGE_BUCKET` maps to the Azure Blob container. The API uses SAS URLs for browser upload/download and server-side reads for document indexing. Docker/local sandboxes mount Azure Blob through rclone; Modal sandboxes receive attached Azure Blob files through sandbox file materialization before the agent starts.
+
+AWS S3 uses `OPENGENI_OBJECT_STORAGE_BACKEND=aws-s3` plus `OPENGENI_OBJECT_STORAGE_REGION`; prefer IRSA/EKS Pod Identity over static keys. GCS uses `OPENGENI_OBJECT_STORAGE_BACKEND=gcs` plus `OPENGENI_OBJECT_STORAGE_GCS_PROJECT_ID`; prefer GKE Workload Identity over service-account JSON. For AWS S3 and GCS file resources, OpenGeni materializes attached files in sandboxes through short-lived signed downloads.
 
 For Modal runs, configure the Modal sandbox variables in `.env.example`.
 

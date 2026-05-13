@@ -1,0 +1,26 @@
+{{- if and .Values.api.enabled .Values.observability.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "opengeni.fullname" . }}-api
+  labels:
+    {{- include "opengeni.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+    {{- with .Values.observability.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.observability.serviceMonitor.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "opengeni.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  endpoints:
+    - port: http
+      path: {{ .Values.observability.metrics.path | quote }}
+      interval: {{ .Values.observability.serviceMonitor.interval | quote }}
+      scrapeTimeout: {{ .Values.observability.serviceMonitor.scrapeTimeout | quote }}
+{{- end }}

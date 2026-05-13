@@ -1,0 +1,37 @@
+{{- if .Values.observability.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "opengeni.fullname" . }}
+  labels:
+    {{- include "opengeni.labels" . | nindent 4 }}
+    {{- with .Values.observability.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.observability.prometheusRule.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  groups:
+    - name: opengeni.rules
+      rules:
+        {{- if .Values.observability.prometheusRule.rules }}
+        {{- toYaml .Values.observability.prometheusRule.rules | nindent 8 }}
+        {{- else }}
+        - alert: OpenGeniApiHighErrorRate
+          expr: sum(rate(opengeni_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(opengeni_http_requests_total[5m])), 1) > 0.05
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: OpenGeni API 5xx error rate is above 5%
+        - alert: OpenGeniApiHighLatency
+          expr: histogram_quantile(0.95, sum(rate(opengeni_http_request_duration_seconds_bucket[5m])) by (le)) > 5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: OpenGeni API p95 request latency is above 5 seconds
+        {{- end }}
+{{- end }}

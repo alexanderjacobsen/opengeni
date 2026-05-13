@@ -4,46 +4,56 @@ This file is the source of truth for the current infrastructure work. Keep it up
 
 ## End Goal
 
-OpenGeni is ready for an open-source pull request that adds a robust, cloud-provider-agnostic deployment foundation and proves it works locally and in an Azure reference environment.
+OpenGeni is ready for an open-source pull request that adds a robust, cloud-provider-agnostic, production-grade deployment platform and proves it works locally and in Azure, AWS, and GCP reference environments.
 
 The final state must support:
 
 - Local full-stack development with the existing Docker Compose path.
 - Local Kubernetes development and conformance through the same Helm chart used for Azure reference verification.
-- Kubernetes as the default workload plane for OpenGeni API, web, worker, migration jobs, telemetry collection, and optional in-cluster services.
-- Azure as the first real reference deployment target.
+- Kubernetes as the default workload plane for OpenGeni API, web, worker, migration jobs, telemetry collection, and optional in-cluster services, with production-grade probes, disruption budgets, topology spread, autoscaling, security contexts, network policies, service accounts, and secrets integration.
+- Azure, AWS, and GCP as real reference deployment targets, each with cleanly separated resource names, tags/labels, ledgers, cleanup commands, and reproducible infrastructure definitions.
 - Existing customer services for Postgres and Temporal, not only newly provisioned resources.
 - Managed, external, and in-cluster modes where the primitive supports those modes.
 - A deterministic deployment contract that agents, docs, Helm, Terraform, and conformance checks can all use.
+- CI/CD for branch and pull-request preview deployments, including automatic PR environments, manual branch previews, deterministic teardown, and conformance smoke checks before a preview is declared healthy.
+- Open, backend-agnostic observability that works the same way locally and across clouds: OpenTelemetry as the instrumentation and transport contract; Prometheus-compatible metrics; structured logs; trace export; optional self-hosted LGTM-style stack; and documented adapters to managed cloud observability backends.
+- Clean, compact, and clear infra/deployment documentation and agent guidance. README, deployment docs, AGENTS notes, skill guidance, and examples must explain the production path without stale caveats, duplicated walls of text, or hidden assumptions.
 - A private iteration flow: do not push a branch, open a PR, publish deployment endpoints, or expose premature work before all gates pass.
 
 ## Non-Negotiable Constraints
 
 - Do not commit secrets, local `.env` files, Azure subscription identifiers that are not necessary examples, generated credentials, kubeconfigs, Terraform state, or customer-specific values.
 - Do not print secret values to logs or final answers.
-- Track every Azure resource created for this work in `docs/azure-resource-ledger.md` before or immediately after creation.
+- Track every cloud resource created for this work in the provider ledger before or immediately after creation:
+  - Azure: `docs/azure-resource-ledger.md`
+  - AWS: `docs/aws-resource-ledger.md`
+  - GCP: `docs/gcp-resource-ledger.md`
 - Prefer least-privilege cloud identities and short-lived credentials.
 - Treat sandbox credential exposure as explicit opt-in through preparation profiles and allowlists.
 - Preserve OpenGeni's runtime architecture: API is the public surface, Postgres is durable truth, NATS is live fanout, Temporal is orchestration, workers own side effects, and sandboxes are isolated execution environments.
 - Support both provisioned and existing Postgres/Temporal deployment modes.
 - Keep all generated artifacts reproducible from source-controlled templates or scripts.
+- Keep provider-specific infrastructure separated from the provider-neutral Kubernetes app layer. Cloud modules may vary, but the OpenGeni workload contract must stay stable.
+- Keep infra/deployment docs and skills maintainable: short source-of-truth docs, clear operator commands, explicit provider differences, no obsolete evidence dumps in primary docs, and no overclaiming beyond verified behavior.
 
 ## Required Capabilities
 
 The deployment foundation must describe and verify these primitives:
 
-- Kubernetes runtime for API, web, worker, migrations, and support workloads.
+- Kubernetes runtime for API, web, worker, migrations, and support workloads with production-grade workload primitives: startup/readiness/liveness probes, PDBs, topology spread, HPA/KEDA-ready scaling hooks, service accounts, optional projected cloud identity annotations, pod/container security contexts, resource presets, and network policies with explicit ingress and egress intent.
 - Postgres with pgvector for sessions, event log, documents, and indexes.
 - Temporal endpoint, namespace, task queue, and worker connectivity.
 - NATS endpoint for live fanout, with durable replay still backed by Postgres.
-- S3-compatible object storage for local/self-contained modes and explicitly implemented provider adapters for production object stores such as Azure Blob.
-- Secret delivery from Kubernetes Secrets, External Secrets, Vault, Azure Key Vault, or equivalent.
+- S3-compatible object storage for local/self-contained modes and explicitly implemented provider adapters for production object stores: Azure Blob, AWS S3, and Google Cloud Storage.
+- Secret delivery from Kubernetes Secrets for local smoke, and External Secrets Operator-compatible wiring for Azure Key Vault, AWS Secrets Manager/Parameter Store, GCP Secret Manager, or Vault.
 - Ingress/TLS with long-lived SSE support and safe timeouts.
-- OpenTelemetry-compatible traces, metrics, and structured logs.
+- OpenTelemetry-compatible traces, metrics, and structured logs, with a documented self-hosted reference using OpenTelemetry Collector plus Prometheus/Grafana/Loki/Tempo/Mimir-compatible components and documented managed-cloud alternatives.
 - Container registry and immutable image tags.
 - Sandbox backend selection and readiness verification.
 - Backup, restore, retention, and cleanup expectations for durable data.
 - Auth/gateway boundary guidance until OpenGeni ships built-in auth, tenancy, RBAC, or API keys.
+- Preview environment lifecycle: namespace/resource naming, image tag selection, Helm values generation, URL/DNS/TLS strategy, smoke/conformance execution, TTL/teardown, and cost controls.
+- Documentation and skill hygiene: concise deployment docs, provider-specific quick starts, minimal AGENTS instructions, and updated OpenGeni skill guidance that points agents to current source files instead of copying stale operational history.
 
 ## Target Profiles
 
@@ -52,7 +62,32 @@ The deployment foundation must describe and verify these primitives:
 - `kubernetes-external`: Kubernetes workloads connected to existing Postgres, Temporal, NATS, object storage, secrets, ingress, and observability.
 - `azure-managed`: Azure reference deployment with managed Azure substrate where practical and OpenGeni workloads on AKS.
 - `azure-existing-services`: AKS workload deployment connected to existing customer Postgres and Temporal.
+- `aws-managed`: AWS reference deployment with EKS, ECR, S3, Secrets Manager integration, and managed Postgres where practical.
+- `aws-existing-services`: EKS workload deployment connected to existing customer Postgres and Temporal.
+- `gcp-managed`: GCP reference deployment with GKE, Artifact Registry, GCS, Secret Manager integration, and managed Postgres where practical.
+- `gcp-existing-services`: GKE workload deployment connected to existing customer Postgres and Temporal.
+- `preview-pr`: automatically created pull-request preview environment.
+- `preview-branch`: manually requested branch preview environment.
 - `self-contained-kubernetes`: optional profile for demos, air-gapped testing, or customers who want in-cluster dependencies.
+
+## Platform Architecture Decision
+
+OpenGeni should not build a bespoke platform controller before the deployment contract is proven. The clean target architecture is:
+
+- **Provider-neutral app layer:** Helm chart plus conformance/preflight scripts define the OpenGeni workload contract.
+- **Provider-specific substrate layer:** Terraform/OpenTofu roots or modules create cloud primitives and produce non-secret Helm values.
+- **GitOps/preview layer:** generated Helm values and immutable images are deployable by GitHub Actions, Argo CD ApplicationSets, Flux, or a manual Helm command.
+- **Observability layer:** OpenTelemetry is the stable contract. A cluster may export to a self-hosted LGTM-compatible stack or to Azure Monitor, Amazon Managed Service for Prometheus/Grafana/CloudWatch/X-Ray-compatible endpoints, Google Managed Service for Prometheus/Cloud Trace/Cloud Logging-compatible endpoints, or another OTLP backend.
+- **Secret layer:** local smoke may use Kubernetes Secrets; production should use External Secrets Operator or cloud-native workload identity with the provider secret store.
+
+Research baseline to keep in mind while iterating:
+
+- OpenTelemetry Operator manages Collectors and workload auto-instrumentation in Kubernetes.
+- Prometheus Operator models scrape targets through `ServiceMonitor` and `PodMonitor`.
+- Grafana LGTM-style stacks combine Loki logs, Grafana dashboards, Tempo traces, and Mimir/Prometheus metrics.
+- External Secrets Operator syncs external secret stores into Kubernetes Secrets and supports major cloud secret managers.
+- Argo CD ApplicationSet pull-request generators can create per-PR environments, but the repo should also support manual Helm/GitHub Actions previews without requiring Argo CD.
+- Crossplane is a future option for Kubernetes-native multi-cloud control planes, but Terraform/OpenTofu roots are the safer first PR path because the repo already uses Terraform and operators can run it without installing a platform control plane.
 
 ## Azure Reference Expectations
 
@@ -69,6 +104,36 @@ The Azure path should be able to create or connect:
 - Azure Monitor or another OpenTelemetry export target.
 - Workload identity or an equivalent secure secret-delivery strategy.
 
+## AWS Reference Expectations
+
+The AWS path should be able to create or connect:
+
+- Resource group equivalent through tags and clean naming.
+- EKS cluster.
+- ECR repositories or customer-provided registry.
+- Amazon RDS PostgreSQL with pgvector-compatible version and extensions verified, or existing compatible Postgres.
+- Temporal endpoint from Temporal Cloud, customer-provided Temporal, or a self-hosted profile.
+- S3 bucket for production file bytes, with optional S3-compatible/MinIO only for local and self-contained smoke deployments.
+- AWS Secrets Manager or External Secrets integration.
+- Ingress controller, DNS/TLS instructions, and SSE-compatible configuration.
+- OTLP export to a self-hosted stack or AWS-managed observability targets.
+- IRSA/EKS Pod Identity or an equivalent secure secret-delivery strategy.
+
+## GCP Reference Expectations
+
+The GCP path should be able to create or connect:
+
+- Project/resource labels and cleanup-friendly naming.
+- GKE cluster.
+- Artifact Registry repositories or customer-provided registry.
+- Cloud SQL for PostgreSQL with pgvector-compatible version and extensions verified, or existing compatible Postgres.
+- Temporal endpoint from Temporal Cloud, customer-provided Temporal, or a self-hosted profile.
+- GCS bucket for production file bytes, with optional S3-compatible/MinIO only for local and self-contained smoke deployments.
+- GCP Secret Manager or External Secrets integration.
+- Ingress controller, DNS/TLS instructions, and SSE-compatible configuration.
+- OTLP export to a self-hosted stack or GCP-managed observability targets.
+- GKE Workload Identity or an equivalent secure secret-delivery strategy.
+
 ## Verification Gates
 
 The work is not complete until all applicable gates pass:
@@ -82,16 +147,17 @@ The work is not complete until all applicable gates pass:
 - local Kubernetes smoke/conformance test through the Helm chart
 - deployment contract schema validation for every target profile
 - Helm lint/template/schema validation
-- Terraform fmt/validate/plan for Azure reference modules
+- Terraform fmt/validate/plan for Azure, AWS, and GCP reference modules
 - preflight against existing Postgres and Temporal modes
-- Azure deployment smoke test
+- Azure, AWS, and GCP deployment smoke tests, unless a provider is explicitly blocked by credentials/quota and the blocker is documented in the provider ledger and audit
 - conformance session run: create session, stream events, replay events, execute worker turn, verify persisted event history
-- object storage upload/read verification from API and sandbox-relevant path; Azure Blob must pass API upload/download conformance without MinIO.
+- object storage upload/read verification from API and sandbox-relevant path; Azure Blob, S3, and GCS must pass API upload/download conformance without MinIO in their managed cloud profiles.
 - sandbox backend readiness test
 - scheduled task verification when Temporal is configured
 - observability verification for logs, metrics, traces, and labels
 - security checks: secret scan, no committed credentials, explicit sandbox env allowlist, network policy review
-- cleanup verification for all temporary Azure resources
+- preview environment create/update/destroy verification for PR and manual branch flows
+- cleanup verification for all temporary Azure, AWS, and GCP resources
 
 ## Conformance Checks
 
@@ -109,24 +175,27 @@ The conformance suite should prove:
 - Sandbox can start, receive the expected environment, and avoid unintended credential exposure.
 - A scripted agent run can complete without live model dependency.
 - Logs, metrics, and traces include enough correlation fields for production debugging.
+- Preview deployments use isolated namespaces, isolated runtime secrets, immutable image references, conformance checks, and teardown commands.
 
 ## PR-Ready Definition
 
 The final change is ready to push and open a PR only when:
 
 - All required gates above pass or have a documented, acceptable reason for being skipped.
-- `docs/azure-resource-ledger.md` is complete and any temporary resources are deleted or intentionally retained.
+- `docs/azure-resource-ledger.md`, `docs/aws-resource-ledger.md`, and `docs/gcp-resource-ledger.md` are complete and any temporary resources are deleted or intentionally retained.
 - README, SECURITY, AGENTS, and deployment docs match the implemented behavior.
-- CI covers the new package/scripts without requiring live Azure credentials.
-- The Azure reference path is reproducible from a clean checkout plus documented credentials.
+- Infra/deployment docs and skills are clean, compact, current, and internally consistent; long evidence logs may stay in audit/ledger files, but operator-facing docs must stay readable.
+- CI covers the new package/scripts without requiring live cloud credentials.
+- Preview deployment workflows are present but safely gated so forks and untrusted PRs cannot access production secrets.
+- The Azure, AWS, and GCP reference paths are reproducible from a clean checkout plus documented credentials.
 - There are no untracked required artifacts.
 - The diff contains no unrelated refactors or generated noise.
 
 ## Current Status
 
-- Status: PR-ready locally; no push or PR has been created.
-- Active goal: make this repo PR-ready for local and Azure deployment foundations.
-- Completion notes: the implementation, docs, local verification, local Kubernetes verification, Azure smoke deployment, and Azure resource ledger are complete. The only live-environment caveat is Azure RBAC: the current principal cannot create the preferred AKS kubelet `AcrPull` role assignment, so the retained smoke deployment uses a tracked, repository-pull-scoped, expiring ACR token until an operator with `Microsoft.Authorization/roleAssignments/write` applies the documented role assignment.
+- Status: expanded and reopened after local checkpoint commit `8802d70`.
+- Active goal: make this repo PR-ready for a world-class production Kubernetes and multi-cloud deployment platform.
+- Completion notes: the previous Azure/local foundation is committed locally. The new scope is not complete until Kubernetes structure, observability, CI/CD previews, Azure cleanup, AWS, GCP, and full conformance evidence meet the PR-ready definition above.
 
 ## Evidence Log
 
@@ -189,6 +258,21 @@ The final change is ready to push and open a PR only when:
 - Applied the zero-surge strategy to the live local Kubernetes and AKS releases.
 - Re-verified local Kubernetes conformance after the Helm strategy upgrade: session `aa8d0346-816d-45b7-b4b8-8c4b5116509a`, file `8cdfac14-54c6-47eb-92e7-dbe1d7ca6b43`.
 - Re-verified AKS Azure Blob conformance after the Helm strategy upgrade: session `e4016466-65dc-41ed-8df3-a54bcf7e56ae`, file `c8993a36-ee63-4fd0-907d-5861d12dc2e6`.
+- Expanded the goal to require clean, compact, current infra/deployment docs and OpenGeni skill guidance, with long evidence kept in ledgers/audit files instead of primary operator docs.
+- Added production Kubernetes hardening primitives for service accounts, External Secrets, ServiceMonitor, PrometheusRule, worker NetworkPolicy, PDBs, workload topology spread, configurable probes, and explicit workload security defaults.
+- Added native AWS S3 and GCS storage adapters plus deployment-contract support for AWS, GCP, PR previews, and manual branch previews.
+- Added AWS and GCP Terraform reference substrate roots and Helm values examples.
+- Verified `bun run check` passes after the storage, deployment-contract, and chart changes.
+- Verified Helm lint/template rendering for the chart and AWS/GCP values examples.
+- Verified Terraform validate for Azure, AWS, and GCP roots.
+- Verified AWS Terraform plan succeeds, then documented that AWS apply is blocked before resource creation by the current IAM user lacking create permissions for EC2 VPC, IAM roles, ECR repositories, S3 buckets, and Secrets Manager secrets.
+- Created GCP reference substrate in `cloudgeni-gecko/us-central1`: GKE, Artifact Registry, GCS, Secret Manager, runtime service account, VPC, subnet, Workload Identity, image-push IAM, GKE admin IAM, GCS access, IAM signing for GCS V4 URLs, and Artifact Registry image-pull IAM.
+- Pushed GCP image tag `gcp-smoke-8802d70-20260513134906` for API, worker, and web to Artifact Registry and recorded digests in `docs/gcp-resource-ledger.md`.
+- Installed the `opengeni-gcp` Helm release on GKE with in-cluster Postgres, Temporal, NATS, OpenTelemetry Collector, native GCS object storage, Workload Identity, and no MinIO.
+- Fixed the GCP Terraform root to grant the runtime service account Artifact Registry reader after GKE image pulls failed with `403 Forbidden`.
+- Verified GKE GCS conformance: `bun run deployment:conformance -- --base-url http://127.0.0.1:38080 --timeout-seconds 180 --json` passed API health, Prometheus metrics, live session run, event replay, SSE replay, scheduled task dispatch, and GCS upload/download; session `dd9f3357-d6ca-4ca8-88b9-211cc002e313`, scheduled-task session `2e3abb43-0117-4c22-8035-1e7997b96dd1`, file `c0d19aba-a262-4b75-a0df-2dee57a65461`.
+- Verified GitHub Actions workflow syntax with YAML parsing and `go run github.com/rhysd/actionlint/cmd/actionlint@latest .github/workflows/ci.yml .github/workflows/preview.yml`.
+- Re-verified `bun install --frozen-lockfile && bun run check` after the GCP live deployment fixes; typecheck, 132 unit tests, and web production build passed.
 - Added configurable API/worker startup dependency retries for NATS and Temporal: `OPENGENI_STARTUP_DEPENDENCY_RETRY_ATTEMPTS`, `OPENGENI_STARTUP_DEPENDENCY_RETRY_INITIAL_DELAY_MS`, and `OPENGENI_STARTUP_DEPENDENCY_RETRY_MAX_DELAY_MS`.
 - Verified startup retry unit coverage and full integration coverage after the change: API 23, DB 5, NATS 2, Temporal workflow 9, and worker activity 12 integration tests passed.
 - Rebuilt and repushed API, worker, and web images after the startup retry change; current ACR digests are API `sha256:52b924e9df2f96725f8dd59557d6532b7cbccab96fc6ebd30cd184062ff67ec1`, worker `sha256:a359999a0f85ce19f4224a9888eb59056e6e864ae5d8adfd5803c6cad3a8bd89`, and web `sha256:7f734e4a49c0fd47c331a414bcd17eddf813dde6cc77452e9a4c8e2118517619`.

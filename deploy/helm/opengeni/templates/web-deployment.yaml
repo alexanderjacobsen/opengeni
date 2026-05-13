@@ -27,6 +27,11 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "opengeni.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      terminationGracePeriodSeconds: {{ .Values.web.terminationGracePeriodSeconds }}
+      {{- if .Values.web.priorityClassName }}
+      priorityClassName: {{ .Values.web.priorityClassName | quote }}
+      {{- end }}
       securityContext:
         {{- toYaml .Values.web.podSecurityContext | nindent 8 }}
       {{- with .Values.global.imagePullSecrets }}
@@ -42,8 +47,24 @@ spec:
           ports:
             - name: http
               containerPort: {{ .Values.web.containerPort }}
+          {{- if .Values.web.probes.startup.enabled }}
+          startupProbe:
+            {{- include "opengeni.httpProbe" (dict "probe" .Values.web.probes.startup) | nindent 12 }}
+          {{- end }}
+          {{- if .Values.web.probes.readiness.enabled }}
+          readinessProbe:
+            {{- include "opengeni.httpProbe" (dict "probe" .Values.web.probes.readiness) | nindent 12 }}
+          {{- end }}
+          {{- if .Values.web.probes.liveness.enabled }}
+          livenessProbe:
+            {{- include "opengeni.httpProbe" (dict "probe" .Values.web.probes.liveness) | nindent 12 }}
+          {{- end }}
           resources:
             {{- toYaml .Values.web.resources | nindent 12 }}
+      {{- if .Values.web.topologySpreadConstraints.enabled }}
+      topologySpreadConstraints:
+        {{- include "opengeni.topologySpreadConstraints" (dict "root" . "component" "web" "values" .Values.web) | nindent 8 }}
+      {{- end }}
       {{- with .Values.web.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

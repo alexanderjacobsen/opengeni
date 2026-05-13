@@ -27,6 +27,11 @@ spec:
       {{- end }}
     spec:
       serviceAccountName: {{ include "opengeni.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
+      {{- if .Values.worker.priorityClassName }}
+      priorityClassName: {{ .Values.worker.priorityClassName | quote }}
+      {{- end }}
       securityContext:
         {{- toYaml .Values.worker.podSecurityContext | nindent 8 }}
       {{- with .Values.global.imagePullSecrets }}
@@ -48,8 +53,24 @@ spec:
           env:
             {{- include "opengeni.generatedRuntimeEnv" . | nindent 12 }}
           {{- end }}
+          {{- if .Values.worker.probes.liveness.enabled }}
+          livenessProbe:
+            {{- if .Values.worker.probes.liveness.exec }}
+            exec:
+              command:
+                {{- toYaml .Values.worker.probes.liveness.exec | nindent 16 }}
+            {{- end }}
+            initialDelaySeconds: {{ .Values.worker.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.worker.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.worker.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.worker.probes.liveness.failureThreshold }}
+          {{- end }}
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
+      {{- if .Values.worker.topologySpreadConstraints.enabled }}
+      topologySpreadConstraints:
+        {{- include "opengeni.topologySpreadConstraints" (dict "root" . "component" "worker" "values" .Values.worker) | nindent 8 }}
+      {{- end }}
       {{- with .Values.worker.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

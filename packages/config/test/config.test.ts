@@ -304,6 +304,47 @@ describe("sandbox preparation profiles", () => {
     });
   });
 
+  test("parses native AWS S3 object storage without static key assumptions", () => {
+    withEnv({
+      OPENGENI_OBJECT_STORAGE_BACKEND: "aws-s3",
+      OPENGENI_OBJECT_STORAGE_BUCKET: "opengeni-files",
+      OPENGENI_OBJECT_STORAGE_REGION: "us-east-1",
+    }, () => {
+      const settings = getSettings();
+      expect(settings.objectStorageBackend).toBe("aws-s3");
+      expect(settings.objectStorageBucket).toBe("opengeni-files");
+      expect(settings.objectStorageRegion).toBe("us-east-1");
+      expect(settings.objectStorageAccessKeyId).toBeUndefined();
+    });
+  });
+
+  test("parses GCS object storage settings and validates inline credentials JSON", () => {
+    withEnv({
+      OPENGENI_OBJECT_STORAGE_BACKEND: "gcs",
+      OPENGENI_OBJECT_STORAGE_BUCKET: "opengeni-files",
+      OPENGENI_OBJECT_STORAGE_GCS_PROJECT_ID: "opengeni-test",
+    }, () => {
+      const settings = getSettings();
+      expect(settings.objectStorageBackend).toBe("gcs");
+      expect(settings.objectStorageBucket).toBe("opengeni-files");
+      expect(settings.objectStorageGcsProjectId).toBe("opengeni-test");
+    });
+
+    withEnv({
+      OPENGENI_OBJECT_STORAGE_BACKEND: "gcs",
+      OPENGENI_OBJECT_STORAGE_GCS_CREDENTIALS_JSON: "not-json",
+    }, () => {
+      expect(() => getSettings()).toThrow("GCS_CREDENTIALS_JSON must be valid JSON");
+    });
+
+    withEnv({
+      OPENGENI_OBJECT_STORAGE_BACKEND: "gcs",
+      OPENGENI_OBJECT_STORAGE_ENDPOINT: "http://127.0.0.1:9000",
+    }, () => {
+      expect(() => getSettings()).toThrow("GCS object storage uses OPENGENI_OBJECT_STORAGE_GCS");
+    });
+  });
+
   test("parses document indexing settings", () => {
     withEnv({
       OPENGENI_DOCUMENT_CHUNK_SIZE: "2000",

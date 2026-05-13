@@ -57,10 +57,13 @@ describe("deployment contract", () => {
     expect(contract.ingress.enabled).toBe(false);
   });
 
-  test("models Azure managed profile with in-cluster Temporal and Azure Blob storage", () => {
+  test("models Azure managed profile with external Temporal/NATS and Azure Blob storage", () => {
     const contract = deploymentProfiles["azure-managed"];
 
-    expect(contract.temporal.mode).toBe("inCluster");
+    expect(contract.temporal.mode).toBe("external");
+    expect(contract.temporal.external?.secretRef?.key).toBe("OPENGENI_TEMPORAL_HOST");
+    expect(contract.nats.mode).toBe("external");
+    expect(contract.nats.external?.secretRef?.key).toBe("OPENGENI_NATS_URL");
     expect(contract.objectStorage.mode).toBe("managed");
     expect(contract.objectStorage.api).toBe("azure-blob");
     expect(contract.sandbox.backend).toBe("none");
@@ -71,12 +74,16 @@ describe("deployment contract", () => {
     const gcp = deploymentProfiles["gcp-managed"];
 
     expect(aws.runtime.cloud).toBe("aws");
+    expect(aws.temporal.mode).toBe("external");
+    expect(aws.nats.mode).toBe("external");
     expect(aws.objectStorage.mode).toBe("managed");
     expect(aws.objectStorage.api).toBe("aws-s3");
     expect(aws.secrets.mode).toBe("awsSecretsManager");
     expect(aws.observability.backend).toBe("awsManaged");
 
     expect(gcp.runtime.cloud).toBe("gcp");
+    expect(gcp.temporal.mode).toBe("external");
+    expect(gcp.nats.mode).toBe("external");
     expect(gcp.objectStorage.mode).toBe("managed");
     expect(gcp.objectStorage.api).toBe("gcs");
     expect(gcp.secrets.mode).toBe("gcpSecretManager");
@@ -112,6 +119,7 @@ describe("deployment contract", () => {
 
     expect(vars).toContain("OPENGENI_DATABASE_URL");
     expect(vars).toContain("OPENGENI_TEMPORAL_HOST");
+    expect(vars).toContain("OPENGENI_NATS_URL");
     expect(vars).toContain("OPENGENI_OBJECT_STORAGE_BACKEND");
     expect(vars).toContain("OPENGENI_OBJECT_STORAGE_AZURE_CONNECTION_STRING");
   });

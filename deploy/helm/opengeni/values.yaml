@@ -282,6 +282,8 @@ migrations:
       cpu: 500m
       memory: 512Mi
 
+# Disposable dependency fixture for local Kubernetes, CI, previews, and smoke tests.
+# Use managed Postgres, an existing database, or an upstream Postgres operator for production.
 postgres:
   enabled: false
   image:
@@ -311,6 +313,8 @@ postgres:
     fsGroup: 999
   securityContext: {}
 
+# Disposable dependency fixture for local Kubernetes, CI, previews, and smoke tests.
+# Use Temporal Cloud, an existing Temporal endpoint, or the official Temporal chart for production.
 temporal:
   enabled: false
   image:
@@ -340,15 +344,17 @@ temporal:
       drop:
         - ALL
 
+# Disposable dependency fixture for local Kubernetes, CI, previews, and smoke tests.
+# Use Azure Blob, AWS S3, GCS, or another production object-store integration for production.
 minio:
   enabled: false
   image:
     repository: minio/minio
-    tag: latest
+    tag: RELEASE.2025-09-07T16-13-09Z
     pullPolicy: IfNotPresent
   mcImage:
     repository: minio/mc
-    tag: latest
+    tag: RELEASE.2025-08-13T08-35-41Z
     pullPolicy: IfNotPresent
   auth:
     rootUser: minioadmin
@@ -392,6 +398,8 @@ ingress:
           service: api
   tls: []
 
+# Disposable dependency fixture for local Kubernetes, CI, previews, and smoke tests.
+# Use an existing NATS endpoint or the official NATS chart for production.
 nats:
   enabled: false
   url: ""

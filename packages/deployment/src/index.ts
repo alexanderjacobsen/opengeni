@@ -337,11 +337,21 @@ export const deploymentProfiles: Record<DeploymentProfileId, DeploymentContract>
       managed: { provider: "azure", notes: "Azure Database for PostgreSQL Flexible Server with pgvector enabled." },
     },
     temporal: {
-      mode: "inCluster",
+      mode: "external",
       namespace: "default",
       taskQueue: "opengeni-runs-ts",
+      external: {
+        secretRef: { name: "opengeni-temporal", key: "OPENGENI_TEMPORAL_HOST" },
+        notes: "Temporal Cloud, customer-provided Temporal, or the official Temporal chart managed outside the OpenGeni chart.",
+      },
     },
-    nats: { mode: "inCluster" },
+    nats: {
+      mode: "external",
+      external: {
+        secretRef: { name: "opengeni-nats", key: "OPENGENI_NATS_URL" },
+        notes: "Customer-provided NATS or the official NATS chart managed outside the OpenGeni chart.",
+      },
+    },
     objectStorage: {
       mode: "managed",
       api: "azure-blob",
@@ -368,7 +378,7 @@ export const deploymentProfiles: Record<DeploymentProfileId, DeploymentContract>
       taskQueue: "opengeni-runs-ts",
       external: { secretRef: { name: "opengeni-temporal" } },
     },
-    nats: { mode: "inCluster" },
+    nats: { mode: "external", external: { secretRef: { name: "opengeni-nats", key: "OPENGENI_NATS_URL" } } },
     objectStorage: {
       mode: "external",
       api: "azure-blob",
@@ -390,11 +400,21 @@ export const deploymentProfiles: Record<DeploymentProfileId, DeploymentContract>
       managed: { provider: "aws", notes: "Amazon RDS PostgreSQL with pgvector compatibility verified." },
     },
     temporal: {
-      mode: "inCluster",
+      mode: "external",
       namespace: "default",
       taskQueue: "opengeni-runs-ts",
+      external: {
+        secretRef: { name: "opengeni-temporal", key: "OPENGENI_TEMPORAL_HOST" },
+        notes: "Temporal Cloud, customer-provided Temporal, or the official Temporal chart managed outside the OpenGeni chart.",
+      },
     },
-    nats: { mode: "inCluster" },
+    nats: {
+      mode: "external",
+      external: {
+        secretRef: { name: "opengeni-nats", key: "OPENGENI_NATS_URL" },
+        notes: "Customer-provided NATS or the official NATS chart managed outside the OpenGeni chart.",
+      },
+    },
     objectStorage: {
       mode: "managed",
       api: "aws-s3",
@@ -421,7 +441,7 @@ export const deploymentProfiles: Record<DeploymentProfileId, DeploymentContract>
       taskQueue: "opengeni-runs-ts",
       external: { secretRef: { name: "opengeni-temporal" } },
     },
-    nats: { mode: "inCluster" },
+    nats: { mode: "external", external: { secretRef: { name: "opengeni-nats", key: "OPENGENI_NATS_URL" } } },
     objectStorage: {
       mode: "external",
       api: "aws-s3",
@@ -443,11 +463,21 @@ export const deploymentProfiles: Record<DeploymentProfileId, DeploymentContract>
       managed: { provider: "gcp", notes: "Cloud SQL for PostgreSQL with pgvector compatibility verified." },
     },
     temporal: {
-      mode: "inCluster",
+      mode: "external",
       namespace: "default",
       taskQueue: "opengeni-runs-ts",
+      external: {
+        secretRef: { name: "opengeni-temporal", key: "OPENGENI_TEMPORAL_HOST" },
+        notes: "Temporal Cloud, customer-provided Temporal, or the official Temporal chart managed outside the OpenGeni chart.",
+      },
     },
-    nats: { mode: "inCluster" },
+    nats: {
+      mode: "external",
+      external: {
+        secretRef: { name: "opengeni-nats", key: "OPENGENI_NATS_URL" },
+        notes: "Customer-provided NATS or the official NATS chart managed outside the OpenGeni chart.",
+      },
+    },
     objectStorage: {
       mode: "managed",
       api: "gcs",
@@ -474,7 +504,7 @@ export const deploymentProfiles: Record<DeploymentProfileId, DeploymentContract>
       taskQueue: "opengeni-runs-ts",
       external: { secretRef: { name: "opengeni-temporal" } },
     },
-    nats: { mode: "inCluster" },
+    nats: { mode: "external", external: { secretRef: { name: "opengeni-nats", key: "OPENGENI_NATS_URL" } } },
     objectStorage: {
       mode: "external",
       api: "gcs",

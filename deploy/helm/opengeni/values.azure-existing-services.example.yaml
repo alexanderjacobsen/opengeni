@@ -29,13 +29,15 @@ networkPolicy:
   enabled: true
 
 nats:
-  enabled: true
+  enabled: false
+  url: "nats://nats.example.internal:4222"
 
 config:
   OPENGENI_SERVICE_NAME: opengeni
   OPENGENI_ENVIRONMENT: azure-existing-services
   OPENGENI_API_HOST: 0.0.0.0
   OPENGENI_API_PORT: "8000"
+  OPENGENI_TEMPORAL_HOST: temporal.example.internal:7233
   OPENGENI_TEMPORAL_NAMESPACE: default
   OPENGENI_TEMPORAL_TASK_QUEUE: opengeni-runs-ts
   OPENGENI_STARTUP_DEPENDENCY_RETRY_ATTEMPTS: "30"

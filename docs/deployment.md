@@ -51,11 +51,11 @@ Current profiles:
 - `local-compose`: existing Docker Compose development stack.
 - `local-kubernetes`: local Kubernetes cluster running the Helm chart with in-cluster dependencies.
 - `kubernetes-external`: Kubernetes workloads connected to existing customer services.
-- `azure-managed`: AKS plus Azure-managed substrate where supported.
+- `azure-managed`: AKS plus Azure-managed substrate where supported, with external Temporal/NATS endpoints.
 - `azure-existing-services`: Azure Kubernetes workloads connected to existing Postgres, Temporal, and object storage.
-- `aws-managed`: EKS plus AWS-managed substrate where supported.
+- `aws-managed`: EKS plus AWS-managed substrate where supported, with external Temporal/NATS endpoints.
 - `aws-existing-services`: EKS workloads connected to existing Postgres, Temporal, and object storage.
-- `gcp-managed`: GKE plus GCP-managed substrate where supported.
+- `gcp-managed`: GKE plus GCP-managed substrate where supported, with external Temporal/NATS endpoints.
 - `gcp-existing-services`: GKE workloads connected to existing Postgres, Temporal, and object storage.
 - `preview-pr`: same-repo pull-request preview environment.
 - `preview-branch`: manually requested branch preview environment.
@@ -98,7 +98,7 @@ helm template opengeni deploy/helm/opengeni \
   --set secret.existingSecret=opengeni-runtime
 ```
 
-For in-cluster NATS:
+For production NATS, use an existing endpoint or the official NATS chart and pass the resulting URL through `nats.url` or `OPENGENI_NATS_URL`. The chart-owned NATS template is only a disposable fixture for local and smoke verification:
 
 ```bash
 helm template opengeni deploy/helm/opengeni \

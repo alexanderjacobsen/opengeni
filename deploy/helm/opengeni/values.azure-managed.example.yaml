@@ -34,16 +34,15 @@ postgres:
   # provide OPENGENI_DATABASE_URL through secret.existingSecret.
 
 temporal:
-  enabled: true
-  postgres:
-    host: AZURE_POSTGRES_HOST
-    port: 5432
-    username: opengeni
-    existingSecret: opengeni-postgres
-    passwordKey: POSTGRES_PASSWORD
+  # Production should use Temporal Cloud, an existing endpoint, or the official
+  # Temporal chart managed outside OpenGeni's chart. Set true only for smoke.
+  enabled: false
 
 nats:
-  enabled: true
+  # Production should use an existing NATS endpoint or the official NATS chart.
+  # Set true only for local/preview/cloud smoke fixtures.
+  enabled: false
+  url: "nats://nats.example.internal:4222"
 
 minio:
   enabled: false
@@ -54,6 +53,7 @@ config:
   OPENGENI_API_HOST: 0.0.0.0
   OPENGENI_API_PORT: "8000"
   OPENGENI_TEMPORAL_NAMESPACE: default
+  OPENGENI_TEMPORAL_HOST: temporal.example.internal:7233
   OPENGENI_TEMPORAL_TASK_QUEUE: opengeni-runs-ts
   OPENGENI_STARTUP_DEPENDENCY_RETRY_ATTEMPTS: "30"
   OPENGENI_STARTUP_DEPENDENCY_RETRY_INITIAL_DELAY_MS: "1000"

@@ -173,6 +173,17 @@ Production self-hosted platform dependencies should use mature upstream projects
 
 The OpenGeni Helm chart owns OpenGeni API, web, worker, migrations, and integration resources such as `ServiceMonitor`, `PrometheusRule`, `ExternalSecret`, and workload NetworkPolicies. It must not become a replacement chart for NATS, Temporal, Postgres, cert-manager, or the observability platform.
 
+Use this boundary when building a production cluster:
+
+| Capability | Production source | OpenGeni wiring |
+| --- | --- | --- |
+| NATS | Existing endpoint or official NATS chart from `https://nats-io.github.io/k8s/helm/charts/` | `nats.enabled=false` plus `nats.url` or `OPENGENI_NATS_URL` |
+| Temporal | Temporal Cloud, existing endpoint, or official Temporal chart from `https://go.temporal.io/helm-charts` with external persistence | `temporal.enabled=false` plus `OPENGENI_TEMPORAL_HOST` |
+| Postgres | Managed cloud Postgres, existing database, or CloudNativePG from `https://cloudnative-pg.github.io/charts` | `postgres.enabled=false` plus `OPENGENI_DATABASE_URL` |
+| Secrets | External Secrets Operator from `https://charts.external-secrets.io`, Vault, or cloud-native secret delivery | `externalSecret.enabled=true` or `secret.existingSecret` |
+| TLS | cert-manager, cloud load balancer certificates, or an existing ingress/TLS stack | `ingress.tls` and SSE-safe ingress annotations |
+| Observability | OpenTelemetry Collector/Operator, Prometheus Operator CRDs, or a managed OTLP/Prometheus backend | `/metrics`, OTLP env, `ServiceMonitor`, `PrometheusRule` |
+
 The secret must provide runtime values such as:
 
 - `OPENGENI_DATABASE_URL`

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { ScheduleNotFoundError, ScheduleOverlapPolicy } from "@temporalio/client";
-import { allowedCorsOrigin, normalizeResources, replaySessionEvents, routeLabel, validateGitHubRepositorySelection, workflowIdForSession } from "../src/app";
+import { HTTPException } from "hono/http-exception";
+import { allowedCorsOrigin, httpStatusForError, normalizeResources, replaySessionEvents, routeLabel, validateGitHubRepositorySelection, workflowIdForSession } from "../src/app";
 import { shouldCreateScheduleAfterUpdateError, temporalOverlapPolicy, temporalScheduleSpec } from "../src/index";
 import type { SessionEvent } from "@opengeni/contracts";
 
@@ -109,6 +110,11 @@ describe("API helpers", () => {
     expect(routeLabel("/v1/documents/document-1/reindex")).toBe("/v1/documents/:id/reindex");
     expect(routeLabel("/v1/scheduled-tasks/task-1/runs")).toBe("/v1/scheduled-tasks/:id/runs");
     expect(routeLabel("/v1/unregistered/resource-1")).toBe("/v1/unknown");
+  });
+
+  test("preserves HTTPException status codes in error metrics", () => {
+    expect(httpStatusForError(new HTTPException(401))).toBe(401);
+    expect(httpStatusForError(new Error("boom"))).toBe(500);
   });
 
   test("replays SSE history across all pages", async () => {

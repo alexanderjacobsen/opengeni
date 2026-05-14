@@ -97,11 +97,12 @@ export function createApp(deps: AppDependencies): Hono {
         durationMs: Math.round(durationSeconds * 1000),
       });
     } catch (error) {
+      const status = httpStatusForError(error);
       const durationSeconds = (performance.now() - start) / 1000;
-      observability.recordHttpRequest({ method: c.req.method, route, status: 500, durationSeconds });
+      observability.recordHttpRequest({ method: c.req.method, route, status, durationSeconds });
       span.end({
         attributes: {
-          "http.response.status_code": 500,
+          "http.response.status_code": status,
           "opengeni.duration_ms": Math.round(durationSeconds * 1000),
         },
         error,
@@ -153,6 +154,13 @@ export function createApp(deps: AppDependencies): Hono {
 
 export function allowedCorsOrigin(pattern: string, origin: string): boolean {
   return new RegExp(`^(?:${pattern})$`).test(origin);
+}
+
+export function httpStatusForError(error: unknown): number {
+  if (error instanceof HTTPException) {
+    return error.status;
+  }
+  return 500;
 }
 
 const routeLabelPatterns: Array<{ pattern: RegExp; label: string }> = [

@@ -13,9 +13,6 @@ data:
   {{- else if .Values.nats.url }}
   OPENGENI_NATS_URL: {{ .Values.nats.url | quote }}
   {{- end }}
-  {{- if .Values.temporal.enabled }}
-  OPENGENI_TEMPORAL_HOST: {{ printf "%s-temporal:%d" (include "opengeni.fullname" .) (.Values.temporal.service.port | int) | quote }}
-  {{- end }}
   {{- if .Values.observability.otel.enabled }}
   OPENGENI_OTEL_EXPORTER_OTLP_ENDPOINT: {{ default (printf "http://%s-otel-collector:4318" (include "opengeni.fullname" .)) .Values.observability.otel.endpoint | quote }}
   {{- end }}

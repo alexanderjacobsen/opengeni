@@ -146,7 +146,7 @@ variable "temporal" {
 }
 
 variable "object_storage" {
-  description = "GCS object storage settings."
+  description = "GCS object storage settings. Managed mode creates a bucket from project_id and name_prefix; bucket is used only for external mode."
   type = object({
     mode                        = string
     bucket                      = optional(string, "opengeni-files")

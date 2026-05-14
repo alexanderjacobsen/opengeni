@@ -1,4 +1,4 @@
-name_prefix      = "opengeni-codex-8092"
+name_prefix      = "opengeni-example"
 region           = "us-east-1"
 deployment_phase = "bootstrap"
 ecr_force_delete = true
@@ -22,6 +22,8 @@ temporal = {
 
 object_storage = {
   mode          = "managed"
-  bucket        = "opengeni-files"
   force_destroy = true
+
+  # In external mode, set bucket to an existing S3 bucket name.
+  # bucket = "existing-opengeni-files"
 }

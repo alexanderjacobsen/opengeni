@@ -1,5 +1,5 @@
 project_id       = "opengeni-project"
-name_prefix      = "opengeni-codex-8092"
+name_prefix      = "opengeni-example"
 region           = "us-central1"
 zone             = "us-central1-a"
 deployment_phase = "bootstrap"
@@ -17,11 +17,11 @@ labels = {
 }
 
 artifact_registry_writer_members = [
-  "serviceAccount:cloudgeni-platform-sa@cloudgeni-gecko.iam.gserviceaccount.com",
+  "serviceAccount:ci-image-writer@opengeni-project.iam.gserviceaccount.com",
 ]
 
 gke_admin_members = [
-  "serviceAccount:terraform-plan-readonly-temp@cloudgeni-gecko.iam.gserviceaccount.com",
+  "serviceAccount:platform-operator@opengeni-project.iam.gserviceaccount.com",
 ]
 
 kubernetes_workload_identity = {
@@ -43,6 +43,8 @@ temporal = {
 
 object_storage = {
   mode          = "managed"
-  bucket        = "opengeni-files"
   force_destroy = true
+
+  # In external mode, set bucket to an existing GCS bucket name.
+  # bucket = "existing-opengeni-files"
 }

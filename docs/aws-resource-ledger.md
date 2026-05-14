@@ -1,43 +1,30 @@
 # AWS Resource Ledger
 
-Track every AWS resource created while developing and verifying the OpenGeni AWS reference deployment. Do not create AWS resources without adding or updating an entry here.
+Track AWS resources created while developing and verifying the OpenGeni AWS reference deployment. Keep this file public-safe: do not record AWS account IDs, ARNs, generated resource IDs, public IPs, generated credentials, kubeconfigs, or account-specific object names.
 
 ## Rules
 
-- Never include secrets, access keys, kubeconfigs, connection strings with passwords, private key material, or generated service credentials.
+- Never include secrets, access keys, kubeconfigs, connection strings with passwords, private key material, public IPs, account IDs, ARNs, or generated service credentials.
 - Prefer cleanup-friendly names and tags.
 - Tag resources with at least `project=opengeni`, `owner=codex`, and `purpose=deployment-verification` when supported.
-- Record the creation command or Terraform module responsible for the resource.
-- Record the cleanup command before considering the resource safe to leave temporarily.
-- If a command fails because of permissions, quota, billing, region availability, or organization policy, record the blocker here instead of retrying blindly.
+- Record the Terraform root, script, or operator command class responsible for the resource.
+- Record cleanup status before considering the resource safe to leave temporarily.
+- Keep exact private cleanup transcripts outside the public repository.
 
 ## Shutdown Status - 2026-05-14
 
-Shutdown was requested and executed from the public working repo on branch `codex/azure-deployment-platform`.
-
-- The Kubernetes release `opengeni-aws` was uninstalled and namespace `opengeni-aws` was deleted.
-- `terraform -chdir=deploy/terraform/aws destroy ...` completed successfully with `Destroy complete! Resources: 30 destroyed.`
-- `terraform -chdir=deploy/terraform/aws state list` returned no resources.
-- Verification lookups confirmed the EKS cluster, ECR repositories, S3 bucket, Secrets Manager secret lookup by `opengeni-codex-8092-runtime`, and tagged VPCs are gone.
-- One Secrets Manager ARN, `arn:aws:secretsmanager:us-east-1:066730217701:secret:opengeni-codex-8092/runtime-rpQxlT`, still appears in tag search only as a deletion-finalizing secret with `DeletedDate` after `--force-delete-without-recovery`.
+Shutdown was requested and completed. The temporary AWS Helm release and namespace were removed, Terraform destroy completed successfully, Terraform state was empty afterward, and follow-up AWS CLI checks confirmed the temporary EKS cluster, ECR repositories, S3 bucket, Secrets Manager entry, VPC, and related tagged resources were gone.
 
 ## Resources
 
-| Status | Resource Type | Name | Account/Region | Purpose | Created By | Cleanup Command | Notes |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| deleted | AWS reference substrate | `opengeni-codex-8092-*` | `066730217701/us-east-1` | EKS/ECR/S3/Secrets/observability verification | `deploy/terraform/aws` | `AWS_PROFILE=AdministratorAccess-066730217701 terraform -chdir=deploy/terraform/aws destroy -var name_prefix=opengeni-codex-8092 -var region=us-east-1 -var deployment_phase=bootstrap -var ecr_force_delete=true -var 'tags={environment="verification",cleanup="delete-after-validation"}' -var 'object_storage={mode="managed",force_destroy=true}' -var 'kubernetes_workload_identity={namespace="opengeni-aws",service_account="opengeni-aws"}'`. | Initial apply with the `jorge-local-dev` IAM user was blocked before resource creation. Apply succeeded with AWS SSO profile `AdministratorAccess-066730217701`. |
-| deleted | EKS cluster | `opengeni-codex-8092-eks` | `066730217701/us-east-1` | Kubernetes workload plane | `deploy/terraform/aws` | Destroy Terraform root above or `AWS_PROFILE=AdministratorAccess-066730217701 aws eks delete-cluster --name opengeni-codex-8092-eks --region us-east-1`. | Created with managed node group `system`. |
-| deleted | EKS managed node group | `system` | `066730217701/us-east-1` | Kubernetes worker nodes | `deploy/terraform/aws` | Destroy Terraform root above or `AWS_PROFILE=AdministratorAccess-066730217701 aws eks delete-nodegroup --cluster-name opengeni-codex-8092-eks --nodegroup-name system --region us-east-1`. | Backed by Auto Scaling group `eks-system-44cf10a8-018f-009d-8710-c96316970caa`. |
-| deleted | ECR repositories | `opengeni-codex-8092/opengeni-api`, `opengeni-codex-8092/opengeni-worker`, `opengeni-codex-8092/opengeni-web` | `066730217701/us-east-1` | Workload image registry | `deploy/terraform/aws` | Destroy Terraform root above or delete repositories with `AWS_PROFILE=AdministratorAccess-066730217701 aws ecr delete-repository --force --region us-east-1 --repository-name ...`. | Scoped under `name_prefix` to avoid collisions with other environments. |
-| deleted | S3 bucket | `opengenicodex8092-files-20260513121826757000000002` | `066730217701/us-east-1` | Native AWS S3 file storage | `deploy/terraform/aws` | Destroy Terraform root above or `AWS_PROFILE=AdministratorAccess-066730217701 aws s3 rm --recursive s3://opengenicodex8092-files-20260513121826757000000002 && AWS_PROFILE=AdministratorAccess-066730217701 aws s3api delete-bucket --bucket opengenicodex8092-files-20260513121826757000000002 --region us-east-1`. | Created with public access block, versioning, server-side encryption, and force destroy for verification cleanup. |
-| deletion-finalizing | Secrets Manager secret | `opengeni-codex-8092/runtime` | `066730217701/us-east-1` | Runtime secret storage | `deploy/terraform/aws` | Destroy Terraform root above or `AWS_PROFILE=AdministratorAccess-066730217701 aws secretsmanager delete-secret --secret-id opengeni-codex-8092/runtime --force-delete-without-recovery --region us-east-1`. | Placeholder only; no secret values committed. |
-| deleted | VPC and public network | `vpc-075a07f96d9b17cf0`, `subnet-05bcd6bc878b8dc65`, `subnet-0ae21bc46f9db9d1f`, `igw-0a8c712b24eebd7c1`, `rtb-037e9954dc629a0fc` | `066730217701/us-east-1` | EKS network substrate | `deploy/terraform/aws` | Destroy Terraform root above. | Cleanup-tagged verification network. |
-| deleted | EKS OIDC provider | `arn:aws:iam::066730217701:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/5FEF95183DB4BE585DE43877C4CE44A5` | `066730217701/us-east-1` | IRSA trust for OpenGeni and add-ons | `deploy/terraform/aws` | Destroy Terraform root above. | Used by OpenGeni runtime role and EBS CSI add-on role. |
-| deleted | IAM role | `opengeni-codex-8092-runtime` | `066730217701/us-east-1` | OpenGeni workload IRSA for S3 access | `deploy/terraform/aws` | Destroy Terraform root above or `AWS_PROFILE=AdministratorAccess-066730217701 aws iam delete-role --role-name opengeni-codex-8092-runtime`. | Service account annotation: `eks.amazonaws.com/role-arn=arn:aws:iam::066730217701:role/opengeni-codex-8092-runtime`. |
-| deleted | IAM role | `opengeni-codex-8092-ebs-csi` | `066730217701/us-east-1` | EBS CSI add-on IRSA | `deploy/terraform/aws` | Destroy Terraform root above. | Attached to AWS-managed `aws-ebs-csi-driver` add-on. |
-| deleted | EKS add-on | `aws-ebs-csi-driver` | `066730217701/us-east-1` | Dynamic EBS volume provisioning | `deploy/terraform/aws` | Destroy Terraform root above or `AWS_PROFILE=AdministratorAccess-066730217701 aws eks delete-addon --cluster-name opengeni-codex-8092-eks --addon-name aws-ebs-csi-driver --region us-east-1`. | Status `ACTIVE`; service account role ARN `arn:aws:iam::066730217701:role/opengeni-codex-8092-ebs-csi`. |
-| deleted | ECR images | `aws-smoke-a20c666-202605131420` | `066730217701/us-east-1` | AWS conformance workload images | Local Docker build/push | Delete repositories through Terraform root above. | API digest `sha256:99034325c9cc9ee2bd559cf50fb450f546d767b0c0c3cc6aa7b9bd654dfd1feb`; worker digest `sha256:9e31020c9c5ba5bae74b9211e31d61e597ebb9e7eee9daa338f982588bad58ad`; web digest `sha256:68bba0c854ac772a4a23f3779c581cdaae8539d2f36eab5f81332b9e71da590b`. |
-| deleted | Kubernetes namespace and Helm release | Namespace `opengeni-aws`, release `opengeni-aws` | `opengeni-codex-8092-eks/us-east-1` | AWS deployment conformance | `helm install opengeni-aws deploy/helm/opengeni` | `helm uninstall opengeni-aws --namespace opengeni-aws && kubectl delete namespace opengeni-aws`. | Helm status `deployed`; API/web/worker replicas available. |
-| deleted | Kubernetes runtime secret | `opengeni-runtime-aws` | `opengeni-codex-8092-eks/opengeni-aws` | Runtime secret injection for AWS smoke deployment | `kubectl create secret generic` from local ignored env file | `kubectl -n opengeni-aws delete secret opengeni-runtime-aws`. | Secret values are intentionally not recorded. |
-| deleted | EBS volume | `vol-06be118aafcc80f0b` | `066730217701/us-east-1b` | Postgres PVC for AWS smoke deployment | Kubernetes PVC `opengeni-aws/data-opengeni-aws-postgres-0` | Delete Helm release/namespace first; PV reclaim policy is `Delete`. If orphaned, `AWS_PROFILE=AdministratorAccess-066730217701 aws ec2 delete-volume --volume-id vol-06be118aafcc80f0b --region us-east-1`. | PV `pvc-bbb87a1d-4cfb-4810-aafa-8dca50bcb3e8`, 20Gi `gp2`, migrated to `ebs.csi.aws.com`. |
-| verified | AWS conformance run | API `http://127.0.0.1:48080` port-forward to `opengeni-aws-api` | `opengeni-codex-8092-eks/opengeni-aws` | End-to-end application verification | `bun run deployment:conformance -- --base-url http://127.0.0.1:48080 --timeout-seconds 180 --json` | No cleanup beyond deployment resources above. | Passed API health, Prometheus metrics, session run, event replay, SSE replay, scheduled task, and S3 upload/download. Session `776ad678-5baa-4cf8-8697-5d28a61f0e94`; scheduled session `acdbaaa0-4a29-446d-93bd-811ace45cc8a`; file `1244dce4-2956-47e4-a3de-77e85efd424e`. |
+| Status | Resource Type | Scope | Purpose | Created By | Cleanup Status | Notes |
+| --- | --- | --- | --- | --- | --- | --- |
+| deleted | AWS reference substrate | Verification account and region | EKS, ECR, S3, Secrets Manager, network, IAM, and observability verification | `deploy/terraform/aws` | Destroyed by Terraform | The full Terraform root was applied and then destroyed. |
+| deleted | EKS cluster and managed node group | Verification account and region | Kubernetes workload plane | `deploy/terraform/aws` | Destroyed by Terraform | Used for Helm and conformance verification. |
+| deleted | ECR repositories and images | Verification account and region | Workload image registry | `deploy/terraform/aws` plus local image pushes | Destroyed by Terraform | Included temporary API, worker, and web verification images. |
+| deleted | S3 bucket | Verification account and region | Native AWS object storage verification | `deploy/terraform/aws` | Destroyed by Terraform | Public access block, versioning, encryption, and force-destroy cleanup were verified. |
+| deleted | Secrets Manager secret | Verification account and region | Runtime secret store reference | `deploy/terraform/aws` | Deleted during shutdown | Placeholder secret metadata only; no secret values were committed. |
+| deleted | VPC, subnets, internet gateway, route table | Verification account and region | EKS network substrate | `deploy/terraform/aws` | Destroyed by Terraform | Verification network was cleanup-tagged. |
+| deleted | IAM roles, policies, and EKS OIDC provider | Verification account and region | IRSA for OpenGeni runtime and storage-driver access | `deploy/terraform/aws` | Destroyed by Terraform | Verified least-privilege S3 access for the runtime role. |
+| deleted | EBS CSI add-on and volume | EKS cluster | Dynamic Postgres PVC provisioning | `deploy/terraform/aws` and Kubernetes PVC | Destroyed by Terraform and namespace cleanup | The smoke Postgres PVC bound through the AWS EBS CSI driver. |
+| deleted | Kubernetes namespace, Helm release, runtime secret, and PVCs | EKS cluster | OpenGeni conformance deployment | Helm and kubectl | Deleted before Terraform destroy | Conformance verified API health, metrics, session run, event replay, SSE replay, scheduled task dispatch, and S3 upload/download. |

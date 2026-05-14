@@ -141,7 +141,7 @@ variable "temporal" {
 }
 
 variable "object_storage" {
-  description = "S3 object storage settings."
+  description = "S3 object storage settings. Managed mode creates a bucket with a generated name; bucket is used only for external mode."
   type = object({
     mode                       = string
     bucket                     = optional(string, "opengeni-files")

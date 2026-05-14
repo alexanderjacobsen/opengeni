@@ -155,21 +155,45 @@ export function allowedCorsOrigin(pattern: string, origin: string): boolean {
   return new RegExp(`^(?:${pattern})$`).test(origin);
 }
 
-function routeLabel(pathname: string): string {
-  if (pathname.startsWith("/v1/sessions/") && pathname.endsWith("/events/stream")) {
-    return "/v1/sessions/:id/events/stream";
+const routeLabelPatterns: Array<{ pattern: RegExp; label: string }> = [
+  { pattern: /^\/healthz$/, label: "/healthz" },
+  { pattern: /^\/metrics$/, label: "/metrics" },
+  { pattern: /^\/v1\/config\/client$/, label: "/v1/config/client" },
+  { pattern: /^\/v1\/mcp$/, label: "/v1/mcp" },
+  { pattern: /^\/v1\/mcp\/docs$/, label: "/v1/mcp/docs" },
+  { pattern: /^\/v1\/sessions$/, label: "/v1/sessions" },
+  { pattern: /^\/v1\/sessions\/[^/]+\/events\/stream$/, label: "/v1/sessions/:id/events/stream" },
+  { pattern: /^\/v1\/sessions\/[^/]+\/events$/, label: "/v1/sessions/:id/events" },
+  { pattern: /^\/v1\/sessions\/[^/]+\/turns\/reorder$/, label: "/v1/sessions/:id/turns/reorder" },
+  { pattern: /^\/v1\/sessions\/[^/]+\/turns\/[^/]+$/, label: "/v1/sessions/:id/turns/:turnId" },
+  { pattern: /^\/v1\/sessions\/[^/]+\/turns$/, label: "/v1/sessions/:id/turns" },
+  { pattern: /^\/v1\/sessions\/[^/]+$/, label: "/v1/sessions/:id" },
+  { pattern: /^\/v1\/files\/uploads$/, label: "/v1/files/uploads" },
+  { pattern: /^\/v1\/files\/uploads\/[^/]+\/complete$/, label: "/v1/files/uploads/:id/complete" },
+  { pattern: /^\/v1\/files\/[^/]+\/download-url$/, label: "/v1/files/:id/download-url" },
+  { pattern: /^\/v1\/files\/[^/]+$/, label: "/v1/files/:id" },
+  { pattern: /^\/v1\/scheduled-tasks$/, label: "/v1/scheduled-tasks" },
+  { pattern: /^\/v1\/scheduled-tasks\/[^/]+\/pause$/, label: "/v1/scheduled-tasks/:id/pause" },
+  { pattern: /^\/v1\/scheduled-tasks\/[^/]+\/resume$/, label: "/v1/scheduled-tasks/:id/resume" },
+  { pattern: /^\/v1\/scheduled-tasks\/[^/]+\/trigger$/, label: "/v1/scheduled-tasks/:id/trigger" },
+  { pattern: /^\/v1\/scheduled-tasks\/[^/]+\/runs$/, label: "/v1/scheduled-tasks/:id/runs" },
+  { pattern: /^\/v1\/scheduled-tasks\/[^/]+$/, label: "/v1/scheduled-tasks/:id" },
+  { pattern: /^\/v1\/document-bases$/, label: "/v1/document-bases" },
+  { pattern: /^\/v1\/document-bases\/[^/]+\/documents$/, label: "/v1/document-bases/:id/documents" },
+  { pattern: /^\/v1\/document-bases\/[^/]+\/search$/, label: "/v1/document-bases/:id/search" },
+  { pattern: /^\/v1\/document-bases\/[^/]+$/, label: "/v1/document-bases/:id" },
+  { pattern: /^\/v1\/documents\/[^/]+\/reindex$/, label: "/v1/documents/:id/reindex" },
+  { pattern: /^\/v1\/github\/app$/, label: "/v1/github/app" },
+  { pattern: /^\/v1\/github\/repositories$/, label: "/v1/github/repositories" },
+  { pattern: /^\/v1\/github\/repositories\/sync$/, label: "/v1/github/repositories/sync" },
+  { pattern: /^\/v1\/github\/app-manifest$/, label: "/v1/github/app-manifest" },
+  { pattern: /^\/v1\/github\/app-manifest\/callback$/, label: "/v1/github/app-manifest/callback" },
+];
+
+export function routeLabel(pathname: string): string {
+  const match = routeLabelPatterns.find(({ pattern }) => pattern.test(pathname));
+  if (match) {
+    return match.label;
   }
-  if (pathname.startsWith("/v1/sessions/") && pathname.includes("/events")) {
-    return "/v1/sessions/:id/events";
-  }
-  if (pathname.startsWith("/v1/sessions/")) {
-    return "/v1/sessions/:id";
-  }
-  if (pathname.startsWith("/v1/files/uploads/")) {
-    return "/v1/files/uploads/:id";
-  }
-  if (pathname.startsWith("/v1/files/") && pathname.endsWith("/download-url")) {
-    return "/v1/files/:id/download-url";
-  }
-  return pathname;
+  return pathname.startsWith("/v1/") ? "/v1/unknown" : "/unknown";
 }

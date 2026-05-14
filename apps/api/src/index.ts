@@ -2,7 +2,7 @@ import { getSettings, retryStartupDependency, startupRetryOptions } from "@openg
 import type { ScheduledTask, ScheduledTaskOverlapPolicy, ScheduledTaskScheduleSpec } from "@opengeni/contracts";
 import { createDb } from "@opengeni/db";
 import { createNatsEventBus } from "@opengeni/events";
-import { createObservability, type Observability } from "@opengeni/observability";
+import { createObservability, logStartupDependencyRetry } from "@opengeni/observability";
 import { Connection, Client as TemporalClient, ScheduleNotFoundError, ScheduleOverlapPolicy } from "@temporalio/client";
 import type { ScheduleOptions, ScheduleSpec, ScheduleUpdateOptions } from "@temporalio/client";
 import { createApp, type DocumentIndexClient, type SessionWorkflowClient } from "./app";
@@ -103,7 +103,7 @@ export async function startApi() {
   let bus: Awaited<ReturnType<typeof createNatsEventBus>> | undefined;
   let workflowClient: Awaited<ReturnType<typeof createTemporalWorkflowClient>> | undefined;
   const retryOptions = startupRetryOptions(settings);
-  const onRetry = (event: { label: string; attempt: number; attempts: number; delayMs: number; error: unknown }) => startupRetryLogger(event, observability);
+  const onRetry = (event: Parameters<typeof logStartupDependencyRetry>[1]) => logStartupDependencyRetry(observability, event);
   try {
     bus = await retryStartupDependency("NATS", () => createNatsEventBus(settings.natsUrl), {
       ...retryOptions,
@@ -154,17 +154,6 @@ export async function startApi() {
       ]);
     },
   };
-}
-
-function startupRetryLogger(event: { label: string; attempt: number; attempts: number; delayMs: number; error: unknown }, observability: Observability) {
-  const message = event.error instanceof Error ? event.error.message : String(event.error);
-  observability.warn("Startup dependency connection failed; retrying", {
-    dependency: event.label,
-    attempt: event.attempt,
-    attempts: event.attempts,
-    delayMs: event.delayMs,
-    error: message,
-  });
 }
 
 if (import.meta.main) {

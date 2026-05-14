@@ -202,6 +202,25 @@ export class Observability {
   }
 }
 
+export type StartupDependencyRetryEvent = {
+  label: string;
+  attempt: number;
+  attempts: number;
+  delayMs: number;
+  error: unknown;
+};
+
+export function logStartupDependencyRetry(observability: Observability, event: StartupDependencyRetryEvent): void {
+  const message = event.error instanceof Error ? event.error.message : String(event.error);
+  observability.warn("Startup dependency connection failed; retrying", {
+    dependency: event.label,
+    attempt: event.attempt,
+    attempts: event.attempts,
+    delayMs: event.delayMs,
+    error: message,
+  });
+}
+
 class MetricsRegistry {
   private readonly counters = new Map<string, number>();
   private readonly histograms = new Map<string, { buckets: number[]; counts: number[]; sum: number; count: number; labels: Record<string, string> }>();

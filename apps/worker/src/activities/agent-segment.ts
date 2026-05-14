@@ -49,57 +49,60 @@ export function createRunAgentSegmentActivity(services: () => Promise<ActivitySe
     });
     let activityStatus = "unknown";
     let activityError: unknown;
-    runtime.configure(settings);
-    const session = await requireSession(db, input.sessionId);
-    const trigger = await getSessionEvent(db, input.triggerEventId);
-    if (!trigger) {
-      throw new Error(`Trigger event not found: ${input.triggerEventId}`);
-    }
-    let turn = input.turnId ? await getSessionTurn(db, input.turnId) : await claimNextQueuedTurnDb(db, input.sessionId, input.workflowId);
-    if (!turn && !input.turnId) {
-      const turnId = await createTurn(db, {
-        sessionId: input.sessionId,
-        temporalWorkflowId: input.workflowId,
-        triggerEventId: input.triggerEventId,
-      });
-      turn = await getSessionTurn(db, turnId);
-    }
-    if (!turn) {
-      throw new Error(`Session turn not found for trigger: ${input.triggerEventId}`);
-    }
-    const turnId = turn.id;
-    const activityContext = currentActivityContext();
-    const heartbeatTimer = startActivityHeartbeat(activityContext, {
-      phase: "running",
-      sessionId: input.sessionId,
-      turnId,
-    });
-    let producerSeq = 0;
-    const producerId = `${input.workflowId}:${turnId}`;
-    const publish = async (events: Array<Omit<AppendEventInput, "producerId" | "producerSeq" | "turnId">>, immediate = false) => {
-      const inputs = events.map((event) => ({
-        ...event,
-        turnId,
-        producerId,
-        producerSeq: ++producerSeq,
-      }));
-      await appendAndPublishEvents(db, bus, input.sessionId, inputs);
-      activityContext?.heartbeat({ phase: "events_published", sessionId: input.sessionId, turnId, producerSeq });
-      if (immediate) {
-        await Bun.sleep(0);
-      }
-    };
-    activityContext?.heartbeat({ phase: "turn_started", sessionId: input.sessionId, turnId });
-
+    let turnId: string | undefined;
+    let heartbeatTimer: ReturnType<typeof startActivityHeartbeat> | undefined;
     let batcher: ReturnType<typeof createRuntimeBatcher> | null = null;
     let preparedTools: Awaited<ReturnType<OpenGeniRuntime["prepareTools"]>> | null = null;
-    await setSessionStatus(db, input.sessionId, "running", turnId);
-    await publish([
-      { type: "session.status.changed", payload: { status: "running" } },
-      { type: "turn.started", payload: { triggerEventId: input.triggerEventId } },
-    ], true);
-
+    let publish: ((events: Array<Omit<AppendEventInput, "producerId" | "producerSeq" | "turnId">>, immediate?: boolean) => Promise<void>) | null = null;
     try {
+      runtime.configure(settings);
+      const session = await requireSession(db, input.sessionId);
+      const trigger = await getSessionEvent(db, input.triggerEventId);
+      if (!trigger) {
+        throw new Error(`Trigger event not found: ${input.triggerEventId}`);
+      }
+      let turn = input.turnId ? await getSessionTurn(db, input.turnId) : await claimNextQueuedTurnDb(db, input.sessionId, input.workflowId);
+      if (!turn && !input.turnId) {
+        const createdTurnId = await createTurn(db, {
+          sessionId: input.sessionId,
+          temporalWorkflowId: input.workflowId,
+          triggerEventId: input.triggerEventId,
+        });
+        turn = await getSessionTurn(db, createdTurnId);
+      }
+      if (!turn) {
+        throw new Error(`Session turn not found for trigger: ${input.triggerEventId}`);
+      }
+      turnId = turn.id;
+      const activityContext = currentActivityContext();
+      heartbeatTimer = startActivityHeartbeat(activityContext, {
+        phase: "running",
+        sessionId: input.sessionId,
+        turnId,
+      });
+      let producerSeq = 0;
+      const producerId = `${input.workflowId}:${turnId}`;
+      publish = async (events: Array<Omit<AppendEventInput, "producerId" | "producerSeq" | "turnId">>, immediate = false) => {
+        const inputs = events.map((event) => ({
+          ...event,
+          turnId: turnId!,
+          producerId,
+          producerSeq: ++producerSeq,
+        }));
+        await appendAndPublishEvents(db, bus, input.sessionId, inputs);
+        activityContext?.heartbeat({ phase: "events_published", sessionId: input.sessionId, turnId, producerSeq });
+        if (immediate) {
+          await Bun.sleep(0);
+        }
+      };
+      activityContext?.heartbeat({ phase: "turn_started", sessionId: input.sessionId, turnId });
+
+      await setSessionStatus(db, input.sessionId, "running", turnId);
+      await publish([
+        { type: "session.status.changed", payload: { status: "running" } },
+        { type: "turn.started", payload: { triggerEventId: input.triggerEventId } },
+      ], true);
+
       const runSettings = {
         ...settings,
         openaiModel: turn.model,
@@ -121,11 +124,11 @@ export function createRunAgentSegmentActivity(services: () => Promise<ActivitySe
       const stream = await runtime.runStream(agent, runInput, runSettings, {
         sandboxEnvironment,
         onRuntimeEvent: async (event) => {
-          await publish([{ type: event.type, payload: event.payload }], true);
+          await publish!([{ type: event.type, payload: event.payload }], true);
         },
       });
       batcher = createRuntimeBatcher(async (events) => {
-        await publish(events);
+        await publish!(events);
       });
 
       const iterator = stream.toStream()[Symbol.asyncIterator]();
@@ -189,11 +192,16 @@ export function createRunAgentSegmentActivity(services: () => Promise<ActivitySe
         activityStatus = "cancelled";
         activityError = error;
         await batcher?.flush().catch(() => undefined);
-        await finishTurn(db, turnId, "cancelled").catch(() => undefined);
+        if (turnId) {
+          await finishTurn(db, turnId, "cancelled").catch(() => undefined);
+        }
         throw error;
       }
       activityStatus = "failed";
       activityError = error;
+      if (!publish || !turnId) {
+        throw error;
+      }
       const message = error instanceof Error ? error.message : String(error);
       await publish([
         { type: "turn.failed", payload: { error: message } },
@@ -211,7 +219,7 @@ export function createRunAgentSegmentActivity(services: () => Promise<ActivitySe
       });
       activitySpan.end({
         attributes: {
-          "opengeni.turn_id": typeof turnId === "string" ? turnId : "",
+          "opengeni.turn_id": turnId ?? "",
           "opengeni.status": activityStatus,
           "opengeni.duration_ms": Math.round(durationSeconds * 1000),
         },

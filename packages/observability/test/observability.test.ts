@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { createObservability, parseHeaders } from "../src";
+import { createObservability, logStartupDependencyRetry, parseHeaders } from "../src";
 
 const settings = {
   serviceName: "opengeni",
@@ -45,5 +45,27 @@ describe("observability", () => {
 
   test("parses OTLP headers", () => {
     expect(parseHeaders("a=b,c=d=e")).toEqual({ a: "b", c: "d=e" });
+  });
+
+  test("logs startup dependency retry events", () => {
+    const observed: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (message?: unknown) => {
+      observed.push(String(message));
+    };
+    try {
+      const obs = createObservability({ ...settings, observabilityStructuredLogs: false }, { component: "api" });
+      logStartupDependencyRetry(obs, {
+        label: "Temporal",
+        attempt: 1,
+        attempts: 3,
+        delayMs: 100,
+        error: new Error("temporarily unavailable"),
+      });
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    expect(observed).toEqual(["Startup dependency connection failed; retrying: temporarily unavailable"]);
   });
 });

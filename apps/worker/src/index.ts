@@ -1,5 +1,5 @@
 import { getSettings, retryStartupDependency, startupRetryOptions, type Settings } from "@opengeni/config";
-import { createObservability, type Observability } from "@opengeni/observability";
+import { createObservability, logStartupDependencyRetry } from "@opengeni/observability";
 import { NativeConnection, Worker } from "@temporalio/worker";
 import { createActivities, type ActivityDependencies } from "./activities";
 
@@ -20,7 +20,7 @@ export async function createOpenGeniWorker(options: WorkerOptions = {}): Promise
     () => NativeConnection.connect({ address: settings.temporalHost }),
     {
       ...startupRetryOptions(settings),
-      onRetry: (event) => startupRetryLogger(event, observability),
+      onRetry: (event) => logStartupDependencyRetry(observability, event),
     },
   );
   const activities = options.activities ?? createActivities({
@@ -54,15 +54,4 @@ export async function startWorker() {
 
 if (import.meta.main) {
   await startWorker();
-}
-
-function startupRetryLogger(event: { label: string; attempt: number; attempts: number; delayMs: number; error: unknown }, observability: Observability) {
-  const message = event.error instanceof Error ? event.error.message : String(event.error);
-  observability.warn("Startup dependency connection failed; retrying", {
-    dependency: event.label,
-    attempt: event.attempt,
-    attempts: event.attempts,
-    delayMs: event.delayMs,
-    error: message,
-  });
 }

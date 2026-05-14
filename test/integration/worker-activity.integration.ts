@@ -19,6 +19,7 @@ import {
   setSessionStatus,
 } from "@opengeni/db";
 import { createNatsEventBus, type EventBus } from "@opengeni/events";
+import { createObservability } from "@opengeni/observability";
 import { createProductionAgentRuntime, type OpenGeniRuntime } from "@opengeni/runtime";
 import { createActivities } from "../../apps/worker/src/activities";
 import { sandboxEnvironmentForRun } from "../../apps/worker/src/activities/environment";
@@ -236,6 +237,43 @@ describe("worker activities integration", () => {
     const events = await listSessionEvents(dbClient.db, session.id, 0, 50);
     expect(events.some((event) => event.type === "turn.failed")).toBe(true);
     expect((await getSession(dbClient.db, session.id))?.status).toBe("failed");
+  });
+
+  test("records worker observability when setup fails before a turn starts", async () => {
+    const exported: Array<{ body: any }> = [];
+    const settings = testSettings({
+      databaseUrl: services.databaseUrl,
+      natsUrl: services.natsUrl,
+      observabilityOtlpEndpoint: "http://collector:4318",
+    });
+    const observability = createObservability(settings, {
+      component: "worker",
+      exporter: async (_url, body) => {
+        exported.push({ body });
+      },
+    });
+    const activities = createActivities({
+      settings,
+      db: dbClient.db,
+      bus,
+      runtime: createProductionAgentRuntime({
+        model: new ScriptedModel([{ outputText: "unused" }]),
+      }),
+      observability,
+    });
+
+    await expect(activities.runAgentSegment({
+      sessionId: crypto.randomUUID(),
+      triggerEventId: crypto.randomUUID(),
+      workflowId: "workflow-missing-session",
+    })).rejects.toThrow("Session not found");
+    await Bun.sleep(0);
+
+    expect(exported).toHaveLength(1);
+    const span = exported[0]!.body.resourceSpans[0].scopeSpans[0].spans[0];
+    expect(span.name).toBe("worker.run_agent_segment");
+    expect(span.status.code).toBe(2);
+    expect(observability.prometheusMetrics()).toContain('status="failed"');
   });
 
   test("marks approval reruns running before resuming the agent", async () => {

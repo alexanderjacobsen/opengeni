@@ -276,6 +276,62 @@ describe("worker activities integration", () => {
     expect(observability.prometheusMetrics()).toContain('status="failed"');
   });
 
+  test("does not publish turn failure before turn start when status update fails", async () => {
+    const session = await createSession(dbClient.db, {
+      initialMessage: "run",
+      resources: [],
+      metadata: {},
+      model: "scripted-model",
+      sandboxBackend: "none",
+    });
+    const [trigger] = await appendSessionEvents(dbClient.db, session.id, [
+      { type: "user.message", payload: { text: "run" } },
+    ]);
+    const turnId = await createTurn(dbClient.db, {
+      sessionId: session.id,
+      temporalWorkflowId: "workflow-status-update-fails",
+      triggerEventId: trigger!.id,
+      source: "user",
+      prompt: "run",
+      resources: [],
+      tools: [],
+      model: "scripted-model",
+      reasoningEffort: "high",
+      sandboxBackend: "none",
+      metadata: {},
+    });
+    const failingDb = new Proxy(dbClient.db, {
+      get(target, prop, receiver) {
+        if (prop === "update") {
+          return () => {
+            throw new Error("status update failed");
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as typeof dbClient.db;
+    const activities = createActivities({
+      settings: testSettings({ databaseUrl: services.databaseUrl, natsUrl: services.natsUrl }),
+      db: failingDb,
+      bus,
+      runtime: createProductionAgentRuntime({
+        model: new ScriptedModel([{ outputText: "unused" }]),
+      }),
+    });
+
+    await expect(activities.runAgentSegment({
+      sessionId: session.id,
+      triggerEventId: trigger!.id,
+      workflowId: "workflow-status-update-fails",
+      turnId,
+    })).rejects.toThrow("status update failed");
+
+    const eventTypes = (await listSessionEvents(dbClient.db, session.id, 0, 50)).map((event) => event.type);
+    expect(eventTypes).not.toContain("turn.started");
+    expect(eventTypes).not.toContain("turn.failed");
+  });
+
   test("marks approval reruns running before resuming the agent", async () => {
     const workflowId = "workflow-approval-rerun";
     const session = await createSession(dbClient.db, {

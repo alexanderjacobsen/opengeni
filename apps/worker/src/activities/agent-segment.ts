@@ -54,6 +54,7 @@ export function createRunAgentSegmentActivity(services: () => Promise<ActivitySe
     let batcher: ReturnType<typeof createRuntimeBatcher> | null = null;
     let preparedTools: Awaited<ReturnType<OpenGeniRuntime["prepareTools"]>> | null = null;
     let publish: ((events: Array<Omit<AppendEventInput, "producerId" | "producerSeq" | "turnId">>, immediate?: boolean) => Promise<void>) | null = null;
+    let turnStartedPublished = false;
     try {
       runtime.configure(settings);
       const session = await requireSession(db, input.sessionId);
@@ -102,6 +103,7 @@ export function createRunAgentSegmentActivity(services: () => Promise<ActivitySe
         { type: "session.status.changed", payload: { status: "running" } },
         { type: "turn.started", payload: { triggerEventId: input.triggerEventId } },
       ], true);
+      turnStartedPublished = true;
 
       const runSettings = {
         ...settings,
@@ -199,7 +201,7 @@ export function createRunAgentSegmentActivity(services: () => Promise<ActivitySe
       }
       activityStatus = "failed";
       activityError = error;
-      if (!publish || !turnId) {
+      if (!publish || !turnId || !turnStartedPublished) {
         throw error;
       }
       const message = error instanceof Error ? error.message : String(error);

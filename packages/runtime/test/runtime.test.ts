@@ -407,6 +407,36 @@ describe("runtime event normalization", () => {
     expect(Object.keys(applied[0]!.entries)).toEqual(["repos/acme/two"]);
   });
 
+  test("refreshes manifest environment on resumed sandbox sessions", async () => {
+    const current = new Manifest({
+      root: "/workspace",
+      entries: {
+        "repos/acme/one": { type: "git_repo", host: "github.com", repo: "acme/one", ref: "main" },
+      },
+      environment: { GH_TOKEN: "old-token" },
+    });
+    const target = new Manifest({
+      root: "/workspace",
+      entries: {
+        "repos/acme/one": { type: "git_repo", host: "github.com", repo: "acme/one", ref: "main" },
+      },
+      environment: { GH_TOKEN: "new-token" },
+    });
+    const applied: Manifest[] = [];
+    const session = {
+      state: { manifest: current },
+      applyManifest: async (manifest: Manifest) => {
+        applied.push(manifest);
+      },
+    };
+    await applyMissingManifestEntries(session as any, target);
+    expect(applied).toHaveLength(1);
+    expect(Object.keys(applied[0]!.entries)).toEqual([]);
+    expect(JSON.parse(JSON.stringify((session.state.manifest as Manifest).environment))).toMatchObject({
+      GH_TOKEN: { value: "new-token" },
+    });
+  });
+
   test("normalizes serialized manifest state before applying missing entries", async () => {
     const current = buildManifest(testSettings(), [{
       kind: "repository",

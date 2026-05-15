@@ -142,7 +142,7 @@ export function configureOpenAI(settings: Settings): void {
     setDefaultOpenAIClient(new OpenAI({
       apiKey,
       baseURL,
-      defaultQuery: settings.azureOpenaiBaseUrl ? undefined : { "api-version": settings.azureOpenaiApiVersion },
+      defaultQuery: settings.azureOpenaiApiVersion ? { "api-version": settings.azureOpenaiApiVersion } : undefined,
       defaultHeaders: settings.azureOpenaiAdToken && !settings.azureOpenaiApiKey
         ? { Authorization: `Bearer ${settings.azureOpenaiAdToken}` }
         : undefined,
@@ -595,7 +595,11 @@ export async function applyMissingManifestEntries(session: SandboxSessionLike, t
       throw new Error(`Cannot replace existing sandbox manifest entry: ${path}`);
     }
   }
-  if (Object.keys(entries).length === 0) {
+  const environmentChanged = stableJson(currentManifest.environment) !== stableJson(target.environment);
+  if (environmentChanged && !session.applyManifest) {
+    throw new Error("Resumed sandbox session cannot refresh manifest environment because it does not support applyManifest()");
+  }
+  if (Object.keys(entries).length === 0 && !environmentChanged) {
     return;
   }
   const delta = new Manifest({
@@ -612,7 +616,7 @@ export async function applyMissingManifestEntries(session: SandboxSessionLike, t
   }
   (session as { state?: { manifest?: Manifest } }).state!.manifest = new Manifest({
     root: currentManifest.root,
-    environment: currentManifest.environment,
+    environment: environmentChanged ? target.environment : currentManifest.environment,
     entries: {
       ...currentManifest.entries,
       ...entries,

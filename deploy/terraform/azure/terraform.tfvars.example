@@ -8,15 +8,23 @@ tags = {
 }
 
 postgres = {
-  mode          = "external"
-  existing_host = "existing-postgres.postgres.database.azure.com"
+  mode                 = "external"
+  existing_host        = "existing-postgres.postgres.database.azure.com"
+  allow_azure_services = false
+  # Optional for managed PostgreSQL when the subscription cannot create Flexible
+  # Server in the primary resource location, or when retrying after a failed
+  # provider create reserved a server name.
+  # location = "northeurope"
+  # name     = "opengeni-dev-pg"
+  # zone     = "1"
 }
 
 temporal = {
-  mode          = "external"
-  existing_host = "temporal.example.com:7233"
-  namespace     = "default"
-  task_queue    = "opengeni-runs-ts"
+  mode = "officialChart"
+  # Use mode = "external" plus existing_host for Temporal Cloud or customer Temporal.
+  # existing_host = "temporal.example.com:7233"
+  namespace  = "default"
+  task_queue = "opengeni-runs-ts"
 }
 
 object_storage = {

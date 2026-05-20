@@ -9,7 +9,7 @@ locals {
   acr_name            = replace("${var.name_prefix}acr", "-", "")
   aks_name            = "${var.name_prefix}-aks"
   key_vault_name      = substr(replace("${var.name_prefix}-kv", "-", ""), 0, 24)
-  postgres_name       = "${var.name_prefix}-postgres"
+  postgres_name       = coalesce(var.postgres.name, "${var.name_prefix}-postgres")
   storage_account_name = substr(
     coalesce(var.object_storage.account_name, replace("${var.name_prefix}files", "-", "")),
     0,
@@ -99,7 +99,8 @@ resource "azurerm_postgresql_flexible_server" "this" {
   count                  = var.postgres.mode == "managed" ? 1 : 0
   name                   = local.postgres_name
   resource_group_name    = local.resource_group_name
-  location               = var.location
+  location               = coalesce(var.postgres.location, var.location)
+  zone                   = var.postgres.zone
   version                = var.postgres.version
   administrator_login    = var.postgres.administrator_login
   administrator_password = var.postgres.administrator_password
@@ -116,11 +117,27 @@ resource "azurerm_postgresql_flexible_server_database" "opengeni" {
   collation = "en_US.utf8"
 }
 
+resource "azurerm_postgresql_flexible_server_firewall_rule" "azure_services" {
+  count            = var.postgres.mode == "managed" && var.postgres.allow_azure_services ? 1 : 0
+  name             = "allow-azure-services"
+  server_id        = azurerm_postgresql_flexible_server.this[0].id
+  start_ip_address = "0.0.0.0"
+  end_ip_address   = "0.0.0.0"
+}
+
+resource "azurerm_postgresql_flexible_server_firewall_rule" "custom" {
+  for_each         = var.postgres.mode == "managed" ? var.postgres.firewall_rules : {}
+  name             = each.key
+  server_id        = azurerm_postgresql_flexible_server.this[0].id
+  start_ip_address = each.value.start_ip_address
+  end_ip_address   = each.value.end_ip_address
+}
+
 resource "azurerm_postgresql_flexible_server_configuration" "pgvector" {
   count     = var.postgres.mode == "managed" ? 1 : 0
   name      = "azure.extensions"
   server_id = azurerm_postgresql_flexible_server.this[0].id
-  value     = "PGCRYPTO,VECTOR"
+  value     = "PGCRYPTO,VECTOR,BTREE_GIN"
 }
 
 resource "azurerm_storage_account" "files" {

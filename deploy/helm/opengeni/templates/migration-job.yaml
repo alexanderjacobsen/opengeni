@@ -9,7 +9,7 @@ metadata:
   annotations:
     {{- toYaml .Values.migrations.annotations | nindent 4 }}
 spec:
-  backoffLimit: 1
+  backoffLimit: {{ .Values.migrations.backoffLimit }}
   template:
     metadata:
       labels:

@@ -272,6 +272,59 @@ describe("API component integration", () => {
     expect(payload.fileUploads).toEqual({ enabled: false, maxSizeBytes: 5_000_000_000 });
   });
 
+  test("enforces shared-key auth on user-facing routes when enabled", async () => {
+    const app = createApp({
+      settings: testSettings({
+        databaseUrl: services.databaseUrl,
+        authRequired: true,
+        accessKey: "local-test-key",
+      }),
+      db: dbClient.db,
+      bus: new MemoryEventBus(),
+      workflowClient: new FakeWorkflowClient(),
+    });
+
+    const config = await app.request("/v1/config/client");
+    expect(config.status).toBe(200);
+    expect((await config.json() as { auth: { required: boolean } }).auth.required).toBe(true);
+
+    expect((await app.request("/healthz")).status).toBe(200);
+    expect((await app.request("/metrics")).status).toBe(401);
+    expect((await app.request("/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({ initialMessage: "blocked" }),
+      headers: { "content-type": "application/json" },
+    })).status).toBe(401);
+
+    const created = await app.request("/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({ initialMessage: "allowed" }),
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer local-test-key",
+      },
+    });
+    expect(created.status).toBe(202);
+  });
+
+  test("can explicitly allow unauthenticated metrics for internal scrapers", async () => {
+    const app = createApp({
+      settings: testSettings({
+        databaseUrl: services.databaseUrl,
+        authRequired: true,
+        accessKey: "local-test-key",
+        authAllowMetrics: true,
+      }),
+      db: dbClient.db,
+      bus: new MemoryEventBus(),
+      workflowClient: new FakeWorkflowClient(),
+    });
+
+    const response = await app.request("/metrics");
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("opengeni_http_requests_total");
+  });
+
   test("creates and manages scheduled tasks", async () => {
     workflow = new FakeWorkflowClient();
     const app = createApp({

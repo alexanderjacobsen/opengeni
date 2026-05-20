@@ -54,7 +54,7 @@ The final state must support:
 - Container registry and immutable image references.
 - Sandbox backend selection and readiness verification.
 - Backup, restore, retention, and cleanup expectations for durable data.
-- Auth/gateway boundary guidance until OpenGeni ships built-in auth, tenancy, RBAC, or API keys.
+- Temporary shared-key access boundary for deployment smoke and early self-hosted use, plus gateway guidance for real auth, tenancy, RBAC, SSO, and rate limiting.
 - Preview lifecycle: namespace naming, image tag selection, Helm values generation, URL/DNS/TLS strategy, conformance execution, TTL/teardown, and cost controls.
 - Concise README, SECURITY, deployment docs, AGENTS notes, and OpenGeni skill guidance that point operators and future agents to current source files.
 
@@ -79,7 +79,7 @@ OpenGeni should not build a bespoke platform controller in this PR. The deployme
 
 - **Provider-neutral app layer:** Helm chart plus preflight/conformance scripts define the OpenGeni workload contract.
 - **Provider-specific substrate layer:** Terraform/OpenTofu roots create cloud primitives and produce non-secret Helm values.
-- **Official dependency layer:** production NATS, Temporal, Postgres, secret sync, ingress/TLS, and observability are installed or referenced through managed services or upstream charts/operators.
+- **Official dependency layer:** production NATS, Temporal, Postgres, secret sync, ingress/TLS, and observability are installed or referenced through managed services or upstream charts/operators. Wrapper stack plans may install upstream charts and generate endpoint wiring, but those charts are not dependencies of the OpenGeni app chart.
 - **Preview/GitOps layer:** immutable images and generated values are deployable by GitHub Actions, Argo CD ApplicationSets, Flux, or manual Helm.
 - **Observability layer:** OpenTelemetry is the stable contract; export can target a self-hosted LGTM-compatible stack or managed cloud observability.
 - **Secret layer:** local smoke may use Kubernetes Secrets; production should use External Secrets Operator or cloud-native workload identity with provider secret stores.
@@ -125,8 +125,11 @@ The final change is ready to merge when:
 
 ## Current Status
 
-- Status: PR-ready source state reached, PR opened, GitHub checks green, and all temporary cloud verification resources shut down.
-- Completion notes: Kubernetes structure, observability, CI/CD preview artifacts, Azure/AWS/GCP reference paths, provider ledgers, conformance tooling, and docs meet the PR-ready definition. The ledgers and audit are intentionally public-safe rather than private cleanup transcripts.
+- Status: implementation in progress for the open-source deployment platform hardening pass.
+- Completed locally: shared-key smoke auth, authenticated web/SSE client path, stack-profile dry-runs, ledger validation, Helm/Terraform validation, and local Kubernetes conformance with teardown evidence.
+- Completed live: GCP managed conformance against GKE, private Cloud SQL, Artifact Registry, GCS, wrapper-managed NATS, wrapper-managed Temporal, and port-forwarded OpenGeni; AWS managed conformance against EKS, RDS, ECR, S3, wrapper-managed NATS, wrapper-managed Temporal, and port-forwarded OpenGeni; Azure managed conformance against AKS, Azure PostgreSQL, ACR, Azure Blob, wrapper-managed NATS, wrapper-managed Temporal, and port-forwarded OpenGeni.
+- Live findings folded back into implementation: GCP Cloud SQL private IP and explicit edition handling; GKE verification node-location control; GCS public access prevention; Temporal namespace registration; AWS RDS TLS/CA handling for Temporal; encrypted AWS RDS application database URLs; Azure PostgreSQL region/name/zone controls; Azure PostgreSQL `BTREE_GIN` extension allowlist for Temporal visibility; ACR exposed-token Docker login fallback.
+- Remaining before PR-ready: none known. Live cloud resources remain intentionally retained per operator instruction and should be destroyed later from the tracked private state/ledger commands.
 
 ## Public Evidence Log
 
@@ -137,11 +140,12 @@ The final change is ready to merge when:
 - Added OpenTelemetry metrics/tracing/log correlation package and Helm collector support.
 - Added CI validation for deployment profiles, Helm rendering, Terraform validation, workflow syntax, image builds, and floating-tag guards.
 - Added preview workflow with secret-aware create/update/destroy behavior.
-- Verified Docker Compose, local Kubernetes, Azure, AWS, and GCP conformance during private validation.
-- Shut down temporary Azure, AWS, and GCP verification resources and sanitized public ledgers.
+- Verified local Kubernetes conformance during private validation and retained teardown evidence.
+- Verified GCP managed, AWS managed, and Azure managed live conformance during private validation; temporary resources remain intentionally retained per operator instruction and are tracked in provider ledgers.
+- Verified existing-service behavior by deploying an app-only smoke release against already-running AWS externalized dependencies; no Terraform or platform dependency lifecycle was invoked, conformance passed, and only the smoke Helm release was removed.
 
 ## Remaining Operator Actions
 
 - For a real long-lived deployment, install or connect production Postgres, Temporal, NATS, secret sync, TLS/ingress, and observability backends.
-- Put OpenGeni behind a production auth/gateway boundary before exposing it to untrusted users.
+- Enable built-in shared-key auth for exposed smoke/self-hosted deployments, and put OpenGeni behind a production auth/gateway boundary before exposing it to untrusted users long term.
 - Pin images by digest and run the conformance suite after every deployment.

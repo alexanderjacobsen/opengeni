@@ -12,6 +12,7 @@ import { cors } from "hono/cors";
 import { HTTPException } from "hono/http-exception";
 import type { ApiRouteDeps, AppDependencies, ObjectStorageDependency, SessionWorkflowClient } from "./dependencies";
 import { buildOpenGeniMcpServer } from "./mcp/server";
+import { requireAccessKey } from "./http/auth";
 import { registerDocumentRoutes } from "./routes/documents";
 import { registerFileRoutes } from "./routes/files";
 import { registerGitHubRoutes } from "./routes/github";
@@ -111,6 +112,8 @@ export function createApp(deps: AppDependencies): Hono {
     }
   });
 
+  app.use("*", requireAccessKey(deps.settings));
+
   app.get("/healthz", (c) => c.json({
     service: deps.settings.serviceName,
     environment: deps.settings.environment,
@@ -133,6 +136,11 @@ export function createApp(deps: AppDependencies): Hono {
     fileUploads: {
       enabled: objectStorage !== null,
       maxSizeBytes: objectStorage?.maxSinglePutSizeBytes ?? 5_000_000_000,
+    },
+    auth: {
+      required: deps.settings.authRequired,
+      headerName: "authorization",
+      scheme: "bearer",
     },
   })));
 

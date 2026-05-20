@@ -6,6 +6,7 @@ interface Args {
   agentMessage: string;
   sandboxBackend: string | null;
   objectConnectTo: string | null;
+  accessKey: string | null;
   skipAgent: boolean;
   skipStorage: boolean;
   skipObservability: boolean;
@@ -29,6 +30,26 @@ await runCheck("api-health", async () => {
   }
   return `service=${String(health.service ?? "unknown")} environment=${String(health.environment ?? "unknown")}`;
 });
+
+if (args.accessKey) {
+  await runCheck("access-boundary", async () => {
+    const config = await getJson(new URL("/v1/config/client", args.baseUrl), { auth: false });
+    if (config?.auth?.required !== true) {
+      throw new Error("client config did not report auth.required=true");
+    }
+    const response = await fetch(new URL("/v1/sessions", args.baseUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ initialMessage: "unauthorized conformance probe" }),
+    });
+    if (response.status !== 401) {
+      throw new Error(`/v1/sessions without access key returned HTTP ${response.status}, expected 401`);
+    }
+    return "client config is secret-free and user-facing routes reject missing access keys";
+  });
+} else {
+  results.push(skipped("access-boundary", "No access key was provided; shared-key deployment auth was not verified."));
+}
 
 if (args.skipObservability) {
   results.push(skipped("observability", "--skip-observability was set"));
@@ -95,6 +116,7 @@ if (args.skipAgent) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5_000);
     const response = await fetch(new URL(`/v1/sessions/${sessionId}/events/stream?after=0`, args.baseUrl), {
+      headers: requestHeaders(true),
       signal: controller.signal,
     });
     const text = await readStreamUntilAbort(response, controller.signal);
@@ -214,8 +236,8 @@ async function runCheck(id: string, fn: () => Promise<string>): Promise<void> {
   }
 }
 
-async function getJson(url: URL): Promise<any> {
-  const response = await fetch(url);
+async function getJson(url: URL, options: { auth?: boolean } = {}): Promise<any> {
+  const response = await fetch(url, { headers: requestHeaders(options.auth !== false) });
   if (!response.ok) {
     throw new Error(`${url.pathname} returned HTTP ${response.status}`);
   }
@@ -223,7 +245,7 @@ async function getJson(url: URL): Promise<any> {
 }
 
 async function getText(url: URL): Promise<string> {
-  const response = await fetch(url);
+  const response = await fetch(url, { headers: requestHeaders(true) });
   if (!response.ok) {
     throw new Error(`${url.pathname} returned HTTP ${response.status}`);
   }
@@ -233,7 +255,7 @@ async function getText(url: URL): Promise<string> {
 async function postJson(url: URL, payload: unknown): Promise<any> {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: requestHeaders(true, { "content-type": "application/json" }),
     body: JSON.stringify(payload),
   });
   if (!response.ok) {
@@ -243,7 +265,7 @@ async function postJson(url: URL, payload: unknown): Promise<any> {
 }
 
 async function deleteJson(url: URL): Promise<any> {
-  const response = await fetch(url, { method: "DELETE" });
+  const response = await fetch(url, { method: "DELETE", headers: requestHeaders(true) });
   if (!response.ok) {
     throw new Error(`${url.pathname} returned HTTP ${response.status}: ${await response.text()}`);
   }
@@ -330,6 +352,7 @@ function parseArgs(values: string[]): Args {
     agentMessage: process.env.OPENGENI_CONFORMANCE_AGENT_MESSAGE ?? "Reply with exactly: opengeni conformance ok",
     sandboxBackend: process.env.OPENGENI_CONFORMANCE_SANDBOX_BACKEND ?? "none",
     objectConnectTo: process.env.OPENGENI_CONFORMANCE_OBJECT_CONNECT_TO ?? null,
+    accessKey: process.env.OPENGENI_CONFORMANCE_ACCESS_KEY ?? null,
     skipAgent: false,
     skipStorage: false,
     skipObservability: false,
@@ -380,12 +403,20 @@ function parseArgs(values: string[]): Args {
       out.objectConnectTo = requiredNext(values, ++index, value);
       continue;
     }
+    if (value === "--access-key") {
+      out.accessKey = requiredNext(values, ++index, value);
+      continue;
+    }
     if (value.startsWith("--base-url=")) {
       out.baseUrl = value.slice("--base-url=".length);
       continue;
     }
     if (value.startsWith("--object-connect-to=")) {
       out.objectConnectTo = value.slice("--object-connect-to=".length);
+      continue;
+    }
+    if (value.startsWith("--access-key=")) {
+      out.accessKey = value.slice("--access-key=".length);
       continue;
     }
     throw new Error(`Unknown argument: ${value}`);
@@ -398,6 +429,13 @@ function parseArgs(values: string[]): Args {
     throw new Error("--timeout-seconds must be a positive number");
   }
   return out;
+}
+
+function requestHeaders(auth: boolean, extra: Record<string, string> = {}): Record<string, string> {
+  return {
+    ...(auth && args.accessKey ? { authorization: `Bearer ${args.accessKey}` } : {}),
+    ...extra,
+  };
 }
 
 function requiredNext(values: string[], index: number, flag: string): string {

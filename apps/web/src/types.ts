@@ -105,6 +105,11 @@ export type ClientConfig = {
     enabled: boolean;
     maxSizeBytes: number;
   };
+  auth: {
+    required: boolean;
+    headerName: "authorization";
+    scheme: "bearer";
+  };
 };
 
 export type Session = {

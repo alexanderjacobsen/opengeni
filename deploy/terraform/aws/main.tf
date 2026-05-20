@@ -338,7 +338,7 @@ resource "aws_security_group" "postgres" {
 }
 
 resource "aws_vpc_security_group_ingress_rule" "postgres_from_vpc" {
-  count             = var.postgres.mode == "managed" && local.selected_vpc_id != null ? 1 : 0
+  count             = var.postgres.mode == "managed" ? 1 : 0
   security_group_id = aws_security_group.postgres[0].id
   cidr_ipv4         = var.network.create_vpc ? var.network.cidr_block : "10.0.0.0/8"
   from_port         = 5432
@@ -347,19 +347,20 @@ resource "aws_vpc_security_group_ingress_rule" "postgres_from_vpc" {
 }
 
 resource "aws_db_instance" "postgres" {
-  count                  = var.postgres.mode == "managed" ? 1 : 0
-  identifier             = "${var.name_prefix}-postgres"
-  engine                 = "postgres"
-  engine_version         = var.postgres.engine_version
-  instance_class         = var.postgres.instance_class
-  allocated_storage      = var.postgres.allocated_storage
-  db_name                = "opengeni"
-  username               = var.postgres.administrator_login
-  password               = var.postgres.administrator_password
-  db_subnet_group_name   = aws_db_subnet_group.postgres[0].name
-  vpc_security_group_ids = [aws_security_group.postgres[0].id]
-  skip_final_snapshot    = false
-  deletion_protection    = true
-  storage_encrypted      = true
-  tags                   = local.tags
+  count                     = var.postgres.mode == "managed" ? 1 : 0
+  identifier                = "${var.name_prefix}-postgres"
+  engine                    = "postgres"
+  engine_version            = var.postgres.engine_version
+  instance_class            = var.postgres.instance_class
+  allocated_storage         = var.postgres.allocated_storage
+  db_name                   = "opengeni"
+  username                  = var.postgres.administrator_login
+  password                  = var.postgres.administrator_password
+  db_subnet_group_name      = aws_db_subnet_group.postgres[0].name
+  vpc_security_group_ids    = [aws_security_group.postgres[0].id]
+  skip_final_snapshot       = var.postgres.skip_final_snapshot
+  final_snapshot_identifier = var.postgres.skip_final_snapshot ? null : "${var.name_prefix}-postgres-final"
+  deletion_protection       = var.postgres.deletion_protection
+  storage_encrypted         = true
+  tags                      = local.tags
 }

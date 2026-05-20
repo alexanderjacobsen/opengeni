@@ -19,6 +19,7 @@ export type TestServices = {
   databaseUrl: string;
   natsUrl: string;
   temporalHost: string;
+  dockerNetwork: string;
   objectStorageEndpoint?: string;
   objectStorageSandboxEndpoint?: string;
   migrate: () => Promise<void>;
@@ -76,9 +77,10 @@ async function startTestServicesAttempt(options: { temporal?: boolean; objectSto
     databaseUrl: `postgres://opengeni:opengeni@127.0.0.1:${ports.postgres}/opengeni`,
     natsUrl: `nats://127.0.0.1:${ports.nats}`,
     temporalHost: `127.0.0.1:${ports.temporal}`,
+    dockerNetwork: `${projectName}_default`,
     ...(options.objectStorage ? {
       objectStorageEndpoint: `http://127.0.0.1:${ports.minio}`,
-      objectStorageSandboxEndpoint: `http://host.docker.internal:${ports.minio}`,
+      objectStorageSandboxEndpoint: "http://minio:9000",
     } : {}),
     migrate: async () => {
       await migrate(services.databaseUrl);

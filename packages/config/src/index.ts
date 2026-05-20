@@ -64,6 +64,10 @@ const SettingsSchema = z.object({
   observabilityMetricsEnabled: EnvBoolean.default(true),
   observabilityOtlpEndpoint: z.string().url().optional(),
   observabilityOtlpHeaders: z.string().default(""),
+  authRequired: EnvBoolean.default(false),
+  accessKey: z.string().optional(),
+  authAllowHealth: EnvBoolean.default(true),
+  authAllowMetrics: EnvBoolean.default(false),
   apiHost: z.string().default("0.0.0.0"),
   apiPort: z.coerce.number().int().positive().default(8000),
   opengeniMcpUrl: z.string().url().optional(),
@@ -86,6 +90,7 @@ const SettingsSchema = z.object({
   sandboxBackend: SandboxBackend.default("docker"),
   dockerImage: z.string().default("opengeni-sandbox:local"),
   dockerExposedPorts: z.string().default(""),
+  dockerNetwork: z.string().optional(),
   modalAppName: z.string().default("opengeni-sandbox"),
   modalImageRef: z.string().optional(),
   modalTimeoutSeconds: z.coerce.number().int().positive().default(900),
@@ -165,6 +170,10 @@ export function getSettings(): Settings {
     observabilityMetricsEnabled: optional("OPENGENI_OBSERVABILITY_METRICS_ENABLED"),
     observabilityOtlpEndpoint: optional("OPENGENI_OTEL_EXPORTER_OTLP_ENDPOINT") ?? optional("OTEL_EXPORTER_OTLP_ENDPOINT"),
     observabilityOtlpHeaders: optional("OPENGENI_OTEL_EXPORTER_OTLP_HEADERS") ?? optional("OTEL_EXPORTER_OTLP_HEADERS"),
+    authRequired: optional("OPENGENI_AUTH_REQUIRED"),
+    accessKey: optional("OPENGENI_ACCESS_KEY"),
+    authAllowHealth: optional("OPENGENI_AUTH_ALLOW_HEALTH"),
+    authAllowMetrics: optional("OPENGENI_AUTH_ALLOW_METRICS"),
     apiHost: optional("OPENGENI_API_HOST"),
     apiPort: optional("OPENGENI_API_PORT"),
     opengeniMcpUrl: optional("OPENGENI_MCP_URL"),
@@ -187,6 +196,7 @@ export function getSettings(): Settings {
     sandboxBackend: optional("OPENGENI_SANDBOX_BACKEND"),
     dockerImage: optional("OPENGENI_DOCKER_IMAGE"),
     dockerExposedPorts: optional("OPENGENI_DOCKER_EXPOSED_PORTS"),
+    dockerNetwork: optional("OPENGENI_DOCKER_NETWORK"),
     modalAppName: optional("OPENGENI_MODAL_APP_NAME"),
     modalImageRef: optional("OPENGENI_MODAL_IMAGE_REF"),
     modalTimeoutSeconds: optional("OPENGENI_MODAL_TIMEOUT_SECONDS"),
@@ -407,6 +417,9 @@ function ensureBuiltInMcpServers(settings: Settings): Settings["mcpServers"] {
 }
 
 function validateSettings(settings: Settings): void {
+  if (settings.authRequired && !settings.accessKey) {
+    throw new Error("OPENGENI_ACCESS_KEY is required when OPENGENI_AUTH_REQUIRED=true");
+  }
   if (settings.openaiProvider === "azure") {
     if (!settings.azureOpenaiBaseUrl && !settings.azureOpenaiEndpoint) {
       throw new Error("Azure OpenAI requires OPENGENI_AZURE_OPENAI_BASE_URL or OPENGENI_AZURE_OPENAI_ENDPOINT");

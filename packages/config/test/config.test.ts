@@ -103,12 +103,26 @@ describe("sandbox preparation profiles", () => {
       OPENGENI_OBSERVABILITY_METRICS_ENABLED: "true",
       OPENGENI_DISABLE_OPENAI_TRACING: "false",
       OPENGENI_OBJECT_STORAGE_FORCE_PATH_STYLE: "0",
+      OPENGENI_AUTH_REQUIRED: "true",
+      OPENGENI_ACCESS_KEY: "test-access-key",
+      OPENGENI_AUTH_ALLOW_HEALTH: "yes",
+      OPENGENI_AUTH_ALLOW_METRICS: "no",
     }, () => getSettings());
 
     expect(settings.observabilityStructuredLogs).toBe(false);
     expect(settings.observabilityMetricsEnabled).toBe(true);
     expect(settings.disableOpenaiTracing).toBe(false);
     expect(settings.objectStorageForcePathStyle).toBe(false);
+    expect(settings.authRequired).toBe(true);
+    expect(settings.accessKey).toBe("test-access-key");
+    expect(settings.authAllowHealth).toBe(true);
+    expect(settings.authAllowMetrics).toBe(false);
+  });
+
+  test("requires an access key when shared-key auth is enabled", () => {
+    expect(() => withEnv({
+      OPENGENI_AUTH_REQUIRED: "true",
+    }, () => getSettings())).toThrow("OPENGENI_ACCESS_KEY is required");
   });
 
   test("retries startup dependency operations with bounded backoff", async () => {

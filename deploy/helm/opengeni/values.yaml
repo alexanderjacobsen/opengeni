@@ -30,6 +30,9 @@ config:
   OPENGENI_STARTUP_DEPENDENCY_RETRY_ATTEMPTS: "30"
   OPENGENI_STARTUP_DEPENDENCY_RETRY_INITIAL_DELAY_MS: "1000"
   OPENGENI_STARTUP_DEPENDENCY_RETRY_MAX_DELAY_MS: "5000"
+  OPENGENI_AUTH_REQUIRED: "false"
+  OPENGENI_AUTH_ALLOW_HEALTH: "true"
+  OPENGENI_AUTH_ALLOW_METRICS: "false"
   OPENGENI_OBJECT_STORAGE_BACKEND: s3-compatible
   OPENGENI_OBJECT_STORAGE_BUCKET: opengeni-files
   OPENGENI_OBJECT_STORAGE_REGION: us-east-1
@@ -41,6 +44,8 @@ config:
 secret:
   create: false
   existingSecret: opengeni-runtime
+  # When OPENGENI_AUTH_REQUIRED is true, provide OPENGENI_ACCESS_KEY through
+  # this secret or an ExternalSecret. Never commit real access keys in values.
   stringData: {}
 
 externalSecret:
@@ -143,6 +148,7 @@ worker:
     tag: "0.1.0"
     digest: ""
     pullPolicy: IfNotPresent
+  command: []
   resources:
     requests:
       cpu: 500m
@@ -270,6 +276,7 @@ migrations:
     digest: ""
     pullPolicy: IfNotPresent
   command: ["bun", "run", "db:migrate"]
+  backoffLimit: 6
   annotations:
     helm.sh/hook: post-install,pre-upgrade
     helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded

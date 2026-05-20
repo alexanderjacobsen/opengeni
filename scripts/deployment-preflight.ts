@@ -51,6 +51,7 @@ if (args.json) {
       nats: contract.nats.mode,
       objectStorage: contract.objectStorage.mode,
       secrets: contract.secrets.mode,
+      access: contract.access.mode,
       sandbox: contract.sandbox.backend,
       observability: contract.observability.backend,
     },
@@ -84,6 +85,7 @@ console.log(`  temporal: ${contract.temporal.mode}`);
 console.log(`  nats: ${contract.nats.mode}`);
 console.log(`  object storage: ${contract.objectStorage.mode} (${contract.objectStorage.api})`);
 console.log(`  secrets: ${contract.secrets.mode}`);
+console.log(`  access: ${contract.access.mode}`);
 console.log(`  sandbox: ${contract.sandbox.backend}`);
 console.log(`  observability: ${contract.observability.backend}`);
 console.log("");

@@ -5,11 +5,12 @@ locals {
     purpose = "deployment-verification"
   })
 
-  cluster_name     = "${var.name_prefix}-gke"
-  artifact_repo_id = "${var.name_prefix}-images"
-  runtime_sa_id    = "${var.name_prefix}-runtime"
-  network_name     = var.network.create_network ? google_compute_network.this[0].name : var.network.network_name
-  subnet_name      = var.network.create_network ? google_compute_subnetwork.this[0].name : var.network.subnet_name
+  cluster_name                = "${var.name_prefix}-gke"
+  artifact_repo_id            = "${var.name_prefix}-images"
+  runtime_sa_id               = "${var.name_prefix}-runtime"
+  network_name                = var.network.create_network ? google_compute_network.this[0].name : var.network.network_name
+  subnet_name                 = var.network.create_network ? google_compute_subnetwork.this[0].name : var.network.subnet_name
+  postgres_private_ip_enabled = var.postgres.mode == "managed" && var.postgres.private_ip_enabled
 }
 
 resource "google_compute_network" "this" {
@@ -26,6 +27,31 @@ resource "google_compute_subnetwork" "this" {
   region        = var.region
 }
 
+resource "google_project_service" "servicenetworking" {
+  count              = local.postgres_private_ip_enabled ? 1 : 0
+  project            = var.project_id
+  service            = "servicenetworking.googleapis.com"
+  disable_on_destroy = false
+}
+
+resource "google_compute_global_address" "private_services" {
+  count         = local.postgres_private_ip_enabled ? 1 : 0
+  name          = "${var.name_prefix}-private-services"
+  purpose       = "VPC_PEERING"
+  address_type  = "INTERNAL"
+  prefix_length = 16
+  network       = google_compute_network.this[0].id
+}
+
+resource "google_service_networking_connection" "private_vpc" {
+  count                   = local.postgres_private_ip_enabled ? 1 : 0
+  network                 = google_compute_network.this[0].id
+  service                 = "servicenetworking.googleapis.com"
+  reserved_peering_ranges = [google_compute_global_address.private_services[0].name]
+
+  depends_on = [google_project_service.servicenetworking]
+}
+
 resource "google_service_account" "runtime" {
   account_id   = local.runtime_sa_id
   display_name = "OpenGeni runtime"
@@ -39,6 +65,7 @@ resource "google_container_cluster" "this" {
   initial_node_count       = 1
   network                  = local.network_name
   subnetwork               = local.subnet_name
+  node_locations           = var.gke.node_locations
   deletion_protection      = var.gke.deletion_protection
 
   release_channel {
@@ -63,10 +90,11 @@ resource "google_container_cluster" "this" {
 }
 
 resource "google_container_node_pool" "system" {
-  name       = "system"
-  location   = var.region
-  cluster    = google_container_cluster.this.name
-  node_count = var.gke.node_count
+  name           = "system"
+  location       = var.region
+  cluster        = google_container_cluster.this.name
+  node_count     = var.gke.node_count
+  node_locations = var.gke.node_locations
 
   autoscaling {
     min_node_count = var.gke.min_node_count
@@ -123,6 +151,7 @@ resource "google_storage_bucket" "files" {
   location                    = coalesce(var.object_storage.location, var.region)
   force_destroy               = var.object_storage.force_destroy
   uniform_bucket_level_access = var.object_storage.uniform_bucket_level_access
+  public_access_prevention    = "enforced"
   labels                      = local.labels
 
   versioning {
@@ -156,6 +185,8 @@ resource "google_service_account_iam_member" "runtime_workload_identity" {
   service_account_id = google_service_account.runtime.name
   role               = "roles/iam.workloadIdentityUser"
   member             = "serviceAccount:${var.project_id}.svc.id.goog[${var.kubernetes_workload_identity.namespace}/${var.kubernetes_workload_identity.service_account}]"
+
+  depends_on = [google_container_cluster.this]
 }
 
 resource "google_service_account_iam_member" "runtime_token_creator" {
@@ -179,17 +210,29 @@ resource "google_sql_database_instance" "postgres" {
   deletion_protection = var.postgres.deletion_protection
 
   settings {
+    edition           = var.postgres.edition
     tier              = var.postgres.tier
     disk_size         = var.postgres.disk_size_gb
     disk_autoresize   = true
-    availability_type = "REGIONAL"
+    availability_type = var.postgres.availability_type
     user_labels       = local.labels
 
     backup_configuration {
       enabled                        = true
       point_in_time_recovery_enabled = true
     }
+
+    dynamic "ip_configuration" {
+      for_each = local.postgres_private_ip_enabled ? [1] : []
+
+      content {
+        ipv4_enabled    = false
+        private_network = google_compute_network.this[0].id
+      }
+    }
   }
+
+  depends_on = [google_service_networking_connection.private_vpc]
 }
 
 resource "google_sql_database" "opengeni" {

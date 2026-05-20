@@ -64,6 +64,7 @@ variable "gke" {
     node_count           = optional(number, 2)
     min_node_count       = optional(number, 1)
     max_node_count       = optional(number, 4)
+    node_locations       = optional(list(string))
     enable_private_nodes = optional(bool, false)
   })
   default = {}
@@ -96,11 +97,14 @@ variable "postgres" {
     mode                   = string
     existing_host          = optional(string)
     database_version       = optional(string, "POSTGRES_16")
+    edition                = optional(string, "ENTERPRISE")
     tier                   = optional(string, "db-custom-2-8192")
+    availability_type      = optional(string, "REGIONAL")
     disk_size_gb           = optional(number, 32)
     administrator_login    = optional(string, "opengeni")
     administrator_password = optional(string)
     deletion_protection    = optional(bool, true)
+    private_ip_enabled     = optional(bool, true)
   })
   default = {
     mode = "external"
@@ -120,10 +124,25 @@ variable "postgres" {
     condition     = var.deployment_phase != "complete" || var.postgres.mode != "managed" || try(length(var.postgres.administrator_password) >= 16, false)
     error_message = "postgres.administrator_password with at least 16 characters is required when postgres.mode is managed and deployment_phase is complete."
   }
+
+  validation {
+    condition     = var.postgres.mode != "managed" || contains(["ENTERPRISE", "ENTERPRISE_PLUS"], try(var.postgres.edition, "ENTERPRISE"))
+    error_message = "postgres.edition must be ENTERPRISE or ENTERPRISE_PLUS when postgres.mode is managed."
+  }
+
+  validation {
+    condition     = var.postgres.mode != "managed" || contains(["ZONAL", "REGIONAL"], try(var.postgres.availability_type, "REGIONAL"))
+    error_message = "postgres.availability_type must be ZONAL or REGIONAL when postgres.mode is managed."
+  }
+
+  validation {
+    condition     = var.postgres.mode != "managed" || !try(var.postgres.private_ip_enabled, true) || var.network.create_network
+    error_message = "postgres.private_ip_enabled currently requires network.create_network=true so Terraform can create private service networking."
+  }
 }
 
 variable "temporal" {
-  description = "Temporal endpoint settings. Self-hosted Temporal belongs in the Helm/platform layer."
+  description = "Temporal endpoint settings. Use external for an existing endpoint or officialChart for the stack-wrapper managed upstream Temporal chart."
   type = object({
     mode          = string
     existing_host = optional(string)
@@ -135,13 +154,13 @@ variable "temporal" {
   }
 
   validation {
-    condition     = contains(["external"], var.temporal.mode)
-    error_message = "temporal.mode currently supports external only in the GCP Terraform substrate."
+    condition     = contains(["external", "officialChart"], var.temporal.mode)
+    error_message = "temporal.mode must be external or officialChart."
   }
 
   validation {
-    condition     = var.deployment_phase != "complete" || try(length(var.temporal.existing_host) > 0, false)
-    error_message = "temporal.existing_host is required when deployment_phase is complete."
+    condition     = var.deployment_phase != "complete" || var.temporal.mode != "external" || try(length(var.temporal.existing_host) > 0, false)
+    error_message = "temporal.existing_host is required when temporal.mode is external and deployment_phase is complete."
   }
 }
 

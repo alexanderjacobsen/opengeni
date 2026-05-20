@@ -324,6 +324,7 @@ describe("runtime event normalization", () => {
 
     expect(commands).toHaveLength(1);
     expect(commands[0]).toContain("curl --fail");
+    expect(commands[0]).toContain("chmod a-w");
     expect(commands[0]).toContain("https://storage.example/input.txt?sig=secret");
     expect(events.join("\n")).not.toContain("sig=secret");
     expect(events.join("\n")).toContain("file-resource-download");

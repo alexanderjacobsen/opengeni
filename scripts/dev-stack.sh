@@ -14,7 +14,19 @@ set -a
 set +a
 
 port_available() {
-  ! lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+  if command -v lsof >/dev/null 2>&1; then
+    ! lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+    return
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    ! ss -H -ltn "sport = :$1" | grep -q .
+    return
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    ! netstat -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|[:.])$1$"
+    return
+  fi
+  ! (echo >"/dev/tcp/127.0.0.1/$1") >/dev/null 2>&1
 }
 
 choose_port() {
@@ -47,6 +59,8 @@ choose_port OPENGENI_NATS_MONITOR_HOST_PORT 8222
 choose_port OPENGENI_TEMPORAL_HOST_PORT 7233
 choose_port OPENGENI_MINIO_HOST_PORT 9000
 choose_port OPENGENI_MINIO_CONSOLE_HOST_PORT 9001
+choose_port OPENGENI_API_PORT 8000
+choose_port OPENGENI_WEB_PORT 3000
 
 default_database_url="postgres://opengeni:opengeni@127.0.0.1:5432/opengeni"
 if [ "${OPENGENI_DATABASE_URL:-$default_database_url}" = "$default_database_url" ]; then
@@ -70,7 +84,16 @@ fi
 
 default_sandbox_object_endpoint="http://host.docker.internal:9000"
 if [ "${OPENGENI_OBJECT_STORAGE_SANDBOX_ENDPOINT:-$default_sandbox_object_endpoint}" = "$default_sandbox_object_endpoint" ]; then
-  export OPENGENI_OBJECT_STORAGE_SANDBOX_ENDPOINT="http://host.docker.internal:${OPENGENI_MINIO_HOST_PORT}"
+  export OPENGENI_OBJECT_STORAGE_SANDBOX_ENDPOINT="http://minio:9000"
+fi
+
+if [ -z "${OPENGENI_DOCKER_NETWORK:-}" ]; then
+  export OPENGENI_DOCKER_NETWORK="opengeni_default"
+fi
+
+default_vite_api_base_url="http://127.0.0.1:8000"
+if [ "${VITE_API_BASE_URL:-$default_vite_api_base_url}" = "$default_vite_api_base_url" ]; then
+  export VITE_API_BASE_URL="http://127.0.0.1:${OPENGENI_API_PORT}"
 fi
 
 bun install
@@ -92,7 +115,7 @@ pids+=("$!")
 (cd apps/worker && bun run dev) &
 pids+=("$!")
 
-(cd apps/web && bun run dev) &
+(cd apps/web && bunx vite dev --port "${OPENGENI_WEB_PORT}" --host 0.0.0.0) &
 pids+=("$!")
 
 wait

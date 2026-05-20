@@ -20,3 +20,4 @@ bun.lockb
 *.tfplan
 terraform.tfvars
 terraform.tfvars.json
+.agent/

@@ -10,6 +10,49 @@ List supported profiles:
 bun run deployment:profiles
 ```
 
+Render a stack plan before creating anything. The plan lists resource classes,
+platform dependencies managed by wrapper commands, external dependencies,
+required secret keys, deploy commands, verification commands, destroy commands,
+and the provider ledger that must be updated:
+
+```bash
+bun run deployment:stack -- --profile gcp-managed
+bun run deployment:stack -- --profile aws-existing-services --json
+```
+
+After Terraform apply, generate private deployment artifacts from Terraform
+outputs and the current shell environment. The generated Helm values file
+contains non-secret provider wiring; `runtime.env` is intended for a private
+Kubernetes Secret and must not be committed:
+
+```bash
+terraform -chdir=deploy/terraform/gcp output -json \
+  > .agent/generated/gcp-managed/terraform-output.json
+
+OPENGENI_ACCESS_KEY="$OPENGENI_ACCESS_KEY" \
+OPENGENI_DATABASE_URL="$OPENGENI_DATABASE_URL" \
+  bun run deployment:runtime-artifacts -- \
+  --profile gcp-managed \
+  --terraform-output .agent/generated/gcp-managed/terraform-output.json \
+  --out-dir .agent/generated/gcp-managed
+
+kubectl -n opengeni create secret generic opengeni-runtime \
+  --from-env-file=.agent/generated/gcp-managed/runtime.env \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+For Azure managed Blob storage, the artifact generator can consume the
+sensitive Terraform output `object_storage_azure_connection_string` into the
+private `runtime.env` file. Keep the Terraform output JSON under `.agent/` or
+another ignored private path.
+
+Check provider ledgers for active rows without cleanup instructions and obvious
+secret-like table contents:
+
+```bash
+bun run deployment:ledger-check
+```
+
 Inspect required modes, environment variables, and checks:
 
 ```bash
@@ -26,6 +69,15 @@ Run API-level deployment conformance against a reachable OpenGeni API:
 
 ```bash
 bun run deployment:conformance -- --base-url https://opengeni.example.com
+```
+
+For deployments with the built-in shared-key boundary enabled, pass the same key
+used by the backend. Conformance verifies that client config is secret-free,
+protected routes reject missing keys, and authenticated API/SSE requests work:
+
+```bash
+OPENGENI_CONFORMANCE_ACCESS_KEY="$OPENGENI_ACCESS_KEY" \
+  bun run deployment:conformance -- --base-url https://opengeni.example.com
 ```
 
 For private in-cluster MinIO behind a local port-forward, keep the presigned URL host intact with curl's connect mapping:
@@ -51,11 +103,11 @@ Current profiles:
 - `local-compose`: existing Docker Compose development stack.
 - `local-kubernetes`: local Kubernetes cluster running the Helm chart with in-cluster dependencies.
 - `kubernetes-external`: Kubernetes workloads connected to existing customer services.
-- `azure-managed`: AKS plus Azure-managed substrate where supported, with external Temporal/NATS endpoints.
+- `azure-managed`: AKS plus Azure-managed substrate where supported, provider-native object storage, and stack-wrapper managed upstream NATS/Temporal charts unless you replace them with existing endpoints.
 - `azure-existing-services`: Azure Kubernetes workloads connected to existing Postgres, Temporal, and object storage.
-- `aws-managed`: EKS plus AWS-managed substrate where supported, with external Temporal/NATS endpoints.
+- `aws-managed`: EKS plus AWS-managed substrate where supported, provider-native object storage, and stack-wrapper managed upstream NATS/Temporal charts unless you replace them with existing endpoints.
 - `aws-existing-services`: EKS workloads connected to existing Postgres, Temporal, and object storage.
-- `gcp-managed`: GKE plus GCP-managed substrate where supported, with external Temporal/NATS endpoints.
+- `gcp-managed`: GKE plus GCP-managed substrate where supported, provider-native object storage, and stack-wrapper managed upstream NATS/Temporal charts unless you replace them with existing endpoints.
 - `gcp-existing-services`: GKE workloads connected to existing Postgres, Temporal, and object storage.
 - `preview-pr`: same-repo pull-request preview environment.
 - `preview-branch`: manually requested branch preview environment.
@@ -173,6 +225,66 @@ Production self-hosted platform dependencies should use mature upstream projects
 
 The OpenGeni Helm chart owns OpenGeni API, web, worker, migrations, and integration resources such as `ServiceMonitor`, `PrometheusRule`, `ExternalSecret`, and workload NetworkPolicies. It must not become a replacement chart for NATS, Temporal, Postgres, cert-manager, or the observability platform.
 
+The stack wrapper may install upstream charts as a convenience layer. That
+keeps lifecycle commands visible and reversible without making those charts
+OpenGeni chart dependencies. For managed cloud profiles, the generated stack
+plan includes:
+
+- upstream NATS from `https://nats-io.github.io/k8s/helm/charts`, release
+  `opengeni-nats` in namespace `opengeni-platform`;
+- upstream Temporal from `https://go.temporal.io/helm-charts`, release
+  `opengeni-temporal` in namespace `opengeni-platform`;
+- `deploy/stacks/opengeni-platform-networkpolicies.yaml`, which keeps those
+  ClusterIP services limited to OpenGeni API/worker pods when the cluster CNI
+  enforces Kubernetes `NetworkPolicy`;
+- runtime endpoints wired as `nats://opengeni-nats.opengeni-platform.svc.cluster.local:4222`
+  and `opengeni-temporal-frontend.opengeni-platform.svc.cluster.local:7233`.
+
+Temporal still needs durable persistence. The committed example upstream
+Temporal values file at
+`deploy/stacks/official-temporal-postgres.values.example.yaml` documents the
+shape, but stack runs should generate a private values file under
+`.agent/generated/` instead of editing the example:
+
+```bash
+TEMPORAL_POSTGRES_HOST="$(terraform -chdir=deploy/terraform/gcp output -raw postgres_host)" \
+  bun run deployment:temporal-values -- \
+  --out .agent/generated/official-temporal-postgres.values.yaml
+```
+
+The generator writes no database password. By default it uses the managed
+Postgres admin user `opengeni` and asks the upstream Temporal schema jobs to
+create/manage the `temporal` and `temporal_visibility` databases. Create a
+Kubernetes Secret named `opengeni-temporal-postgres` in `opengeni-platform`
+with that user's password. Keep that database server and secret outside the
+OpenGeni app chart lifecycle and record any cloud resources in the provider
+ledger.
+Use `TEMPORAL_POSTGRES_CONNECT_ADDR=host:port` instead of
+`TEMPORAL_POSTGRES_HOST` when the provider-specific connection endpoint already
+includes a port or needs a proxy-local address.
+
+Some managed PostgreSQL services require encrypted connections. For AWS RDS,
+the managed stack wrapper downloads the AWS RDS global CA bundle into
+`.agent/generated/<profile>/`, creates a private `opengeni-postgres-ca`
+ConfigMap in `opengeni-platform`, and generates Temporal SQL TLS settings with:
+
+```bash
+TEMPORAL_POSTGRES_TLS_ENABLED=true
+TEMPORAL_POSTGRES_TLS_CA_FILE=/etc/opengeni/postgres-ca/ca.pem
+TEMPORAL_POSTGRES_TLS_CA_CONFIG_MAP_NAME=opengeni-postgres-ca
+```
+
+Use an encrypted OpenGeni application database URL for the same service, for
+example `OPENGENI_DATABASE_URL=postgres://.../opengeni?sslmode=require` for AWS
+RDS. If a different provider or customer database requires a custom CA, mount
+that CA through a private ConfigMap/Secret and set the same Temporal TLS env
+vars before running `bun run deployment:temporal-values`.
+
+After the upstream Temporal chart is running, the stack wrapper applies
+`deploy/stacks/official-temporal-namespace-job.yaml` to register the Temporal
+namespace used by OpenGeni (`default` by default). The OpenGeni worker cannot
+poll task queues until that Temporal namespace exists.
+
 Use this boundary when building a production cluster:
 
 | Capability | Production source | OpenGeni wiring |
@@ -195,6 +307,7 @@ The secret must provide runtime values such as:
 - `OPENGENI_OBJECT_STORAGE_BACKEND=azure-blob` plus Azure Blob connection string/account-key settings
 - `OPENGENI_OBJECT_STORAGE_BACKEND=aws-s3` plus `OPENGENI_OBJECT_STORAGE_REGION`; prefer IRSA/EKS Pod Identity over static keys
 - `OPENGENI_OBJECT_STORAGE_BACKEND=gcs` plus `OPENGENI_OBJECT_STORAGE_GCS_PROJECT_ID`; prefer GKE Workload Identity over service-account JSON
+- `OPENGENI_AUTH_REQUIRED=true` and `OPENGENI_ACCESS_KEY` for the temporary built-in shared-key boundary, unless an external gateway supplies authentication
 - sandbox backend credentials when required
 
 Do not commit real secret values.
@@ -210,9 +323,9 @@ Sandbox file mount support is also backend-specific:
 
 ## Security Boundary
 
-OpenGeni does not currently ship built-in public auth, tenancy, RBAC, API keys, WAF policy, or rate limiting. Treat the API as an internal service unless an external gateway supplies those controls.
+OpenGeni ships a deliberately small shared-key boundary for deployment smoke and early self-hosted use. Set `OPENGENI_AUTH_REQUIRED=true` and provide `OPENGENI_ACCESS_KEY` through a Kubernetes Secret, ExternalSecret, or provider secret manager. The browser stores the key only in local storage and sends it as `Authorization: Bearer ...`; the API also accepts `X-OpenGeni-Access-Key` for simple automation.
 
-Production ingress should sit behind a gateway or ingress stack that provides:
+This is not full product auth. It does not provide users, tenancy, RBAC, audit identity, SSO, or rate limiting. Long-lived public deployments should still sit behind a gateway or ingress stack that provides:
 
 - TLS termination with a managed certificate.
 - Authentication and authorization for every user-facing route.
@@ -220,6 +333,8 @@ Production ingress should sit behind a gateway or ingress stack that provides:
 - Long-lived SSE support with buffering disabled and read/send timeouts of at least `3600` seconds.
 - Access logs that include request id, user or tenant id from the gateway, route, status, and duration.
 - Explicit deny rules for internal-only surfaces if you expose only the public client API.
+
+When `OPENGENI_AUTH_REQUIRED=true`, `/v1/config/client` remains public but does not expose the access key, `/healthz` is public by default for Kubernetes probes, and `/metrics` is protected by default unless `OPENGENI_AUTH_ALLOW_METRICS=true` is set for an internal scraper path.
 
 For AKS smoke deployments using `ingress-nginx` behind an Azure LoadBalancer service, configure the ingress controller service health probes explicitly. HTTP/HTTPS probes to `/` can mark ingress-nginx unhealthy when the default backend returns a non-200 response, leaving the public VIP allocated but unrouted. TCP probes are sufficient for the temporary ingress-controller smoke path:
 

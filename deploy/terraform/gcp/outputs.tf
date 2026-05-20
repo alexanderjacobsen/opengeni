@@ -30,12 +30,12 @@ output "runtime_secret_id" {
 
 output "postgres_host" {
   description = "Postgres host to use for OPENGENI_DATABASE_URL."
-  value       = var.postgres.mode == "managed" ? google_sql_database_instance.postgres[0].connection_name : var.postgres.existing_host
+  value       = var.postgres.mode == "managed" ? (var.postgres.private_ip_enabled ? google_sql_database_instance.postgres[0].private_ip_address : google_sql_database_instance.postgres[0].public_ip_address) : var.postgres.existing_host
 }
 
 output "temporal_host" {
   description = "Temporal host to use for OPENGENI_TEMPORAL_HOST."
-  value       = var.temporal.existing_host
+  value       = var.temporal.mode == "officialChart" ? "opengeni-temporal-frontend.opengeni-platform.svc.cluster.local:7233" : var.temporal.existing_host
 }
 
 output "object_storage_backend" {
@@ -53,7 +53,7 @@ output "helm_set_values" {
   value = {
     "global.imageRegistry"                                          = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.images.repository_id}"
     "serviceAccount.annotations.iam\\.gke\\.io/gcp-service-account" = google_service_account.runtime.email
-    "config.OPENGENI_TEMPORAL_HOST"                                 = try(var.temporal.existing_host, null)
+    "config.OPENGENI_TEMPORAL_HOST"                                 = var.temporal.mode == "officialChart" ? "opengeni-temporal-frontend.opengeni-platform.svc.cluster.local:7233" : try(var.temporal.existing_host, null)
     "config.OPENGENI_TEMPORAL_NAMESPACE"                            = var.temporal.namespace
     "config.OPENGENI_TEMPORAL_TASK_QUEUE"                           = var.temporal.task_queue
     "config.OPENGENI_OBJECT_STORAGE_BACKEND"                        = "gcs"

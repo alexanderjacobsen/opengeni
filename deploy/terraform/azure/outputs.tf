@@ -40,7 +40,7 @@ output "postgres_host" {
 
 output "temporal_host" {
   description = "Temporal host to use for OPENGENI_TEMPORAL_HOST."
-  value       = var.temporal.existing_host
+  value       = var.temporal.mode == "officialChart" ? "opengeni-temporal-frontend.opengeni-platform.svc.cluster.local:7233" : var.temporal.existing_host
 }
 
 output "temporal_namespace" {
@@ -83,7 +83,7 @@ output "helm_set_values" {
   description = "Non-secret Helm values that connect OpenGeni workloads to this Azure substrate."
   value = {
     "global.imageRegistry"                       = azurerm_container_registry.this.login_server
-    "config.OPENGENI_TEMPORAL_HOST"              = try(var.temporal.existing_host, null)
+    "config.OPENGENI_TEMPORAL_HOST"              = var.temporal.mode == "officialChart" ? "opengeni-temporal-frontend.opengeni-platform.svc.cluster.local:7233" : try(var.temporal.existing_host, null)
     "config.OPENGENI_TEMPORAL_NAMESPACE"         = var.temporal.namespace
     "config.OPENGENI_TEMPORAL_TASK_QUEUE"        = var.temporal.task_queue
     "config.OPENGENI_OBJECT_STORAGE_BACKEND"     = var.object_storage.api

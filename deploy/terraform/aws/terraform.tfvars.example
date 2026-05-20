@@ -9,12 +9,15 @@ tags = {
 }
 
 postgres = {
-  mode = "external"
+  mode                = "external"
+  deletion_protection = false
+  skip_final_snapshot = true
   # existing_host = "postgres.example.com"
 }
 
 temporal = {
-  mode = "external"
+  mode = "officialChart"
+  # Use mode = "external" plus existing_host for Temporal Cloud or customer Temporal.
   # existing_host = "temporal.example.com:7233"
   namespace  = "default"
   task_queue = "opengeni-runs-ts"

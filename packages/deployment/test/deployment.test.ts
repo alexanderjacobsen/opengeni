@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
   deploymentProfiles,
+  generateRuntimeArtifacts,
   missingRuntimeEnvVars,
   parseDeploymentContract,
   preflightChecksFor,
   requiredRuntimeEnvVars,
+  stackPlanFor,
 } from "../src/index";
 
 describe("deployment contract", () => {
@@ -45,6 +47,7 @@ describe("deployment contract", () => {
 
   test("models local Kubernetes as Helm with in-cluster dependencies and port-forward conformance", () => {
     const contract = deploymentProfiles["local-kubernetes"];
+    const plan = stackPlanFor(contract);
 
     expect(contract.runtime.platform).toBe("kubernetes");
     expect(contract.runtime.cloud).toBe("local");
@@ -55,6 +58,9 @@ describe("deployment contract", () => {
     expect(contract.objectStorage.mode).toBe("inCluster");
     expect(contract.objectStorage.api).toBe("s3-compatible");
     expect(contract.ingress.enabled).toBe(false);
+    expect(plan.helmValuesFile).toBe("deploy/helm/opengeni/values.local-kubernetes.example.yaml");
+    expect(plan.deployCommands.some((command) => command.includes("kind load docker-image"))).toBe(true);
+    expect(plan.deployCommands.some((command) => command.includes("opengeni-runtime-local-k8s"))).toBe(true);
   });
 
   test("models Azure managed profile with external Temporal/NATS and Azure Blob storage", () => {
@@ -66,6 +72,7 @@ describe("deployment contract", () => {
     expect(contract.nats.external?.secretRef?.key).toBe("OPENGENI_NATS_URL");
     expect(contract.objectStorage.mode).toBe("managed");
     expect(contract.objectStorage.api).toBe("azure-blob");
+    expect(contract.access.mode).toBe("sharedKey");
     expect(contract.sandbox.backend).toBe("none");
   });
 
@@ -79,6 +86,7 @@ describe("deployment contract", () => {
     expect(aws.objectStorage.mode).toBe("managed");
     expect(aws.objectStorage.api).toBe("aws-s3");
     expect(aws.secrets.mode).toBe("awsSecretsManager");
+    expect(aws.access.mode).toBe("sharedKey");
     expect(aws.observability.backend).toBe("awsManaged");
 
     expect(gcp.runtime.cloud).toBe("gcp");
@@ -87,7 +95,15 @@ describe("deployment contract", () => {
     expect(gcp.objectStorage.mode).toBe("managed");
     expect(gcp.objectStorage.api).toBe("gcs");
     expect(gcp.secrets.mode).toBe("gcpSecretManager");
+    expect(gcp.access.mode).toBe("sharedKey");
     expect(gcp.observability.backend).toBe("gcpManaged");
+  });
+
+  test("requires an access boundary for ingress-enabled deployments", () => {
+    expect(() => parseDeploymentContract({
+      ...deploymentProfiles["kubernetes-external"],
+      access: { mode: "disabled" },
+    })).toThrow("ingress-enabled deployments require shared-key auth or an external gateway");
   });
 
   test("models PR and branch previews as isolated Kubernetes environments", () => {
@@ -120,6 +136,8 @@ describe("deployment contract", () => {
     expect(vars).toContain("OPENGENI_DATABASE_URL");
     expect(vars).toContain("OPENGENI_TEMPORAL_HOST");
     expect(vars).toContain("OPENGENI_NATS_URL");
+    expect(vars).toContain("OPENGENI_AUTH_REQUIRED");
+    expect(vars).toContain("OPENGENI_ACCESS_KEY");
     expect(vars).toContain("OPENGENI_OBJECT_STORAGE_BACKEND");
     expect(vars).toContain("OPENGENI_OBJECT_STORAGE_AZURE_CONNECTION_STRING");
   });
@@ -156,5 +174,118 @@ describe("deployment contract", () => {
     expect(missing).not.toContain("OPENGENI_DATABASE_URL");
     expect(missing).not.toContain("OPENGENI_TEMPORAL_HOST");
     expect(missing).toContain("OPENGENI_OBJECT_STORAGE_AZURE_CONNECTION_STRING");
+  });
+
+  test("renders stack plans with deploy, verify, destroy, and ledger evidence", () => {
+    const plan = stackPlanFor(deploymentProfiles["gcp-managed"]);
+
+    expect(plan.ledgerPath).toBe("docs/gcp-resource-ledger.md");
+    expect(plan.terraformRoot).toBe("deploy/terraform/gcp");
+    expect(plan.helmValuesFile).toBe("deploy/helm/opengeni/values.gcp-managed.example.yaml");
+    expect(plan.platformDependencies.map((dependency) => dependency.id)).toEqual(["nats", "temporal"]);
+    expect(plan.platformDependencies[0]?.chartName).toBe("nats/nats");
+    expect(plan.platformDependencies[1]?.chartName).toBe("temporal/temporal");
+    expect(plan.platformDependencies[0]?.runtimeEnv.OPENGENI_NATS_URL).toContain("opengeni-nats.opengeni-platform");
+    expect(plan.platformDependencies[1]?.runtimeEnv.OPENGENI_TEMPORAL_HOST).toContain("opengeni-temporal-frontend.opengeni-platform");
+    expect(plan.platformDependencies[1]?.requiredEnvVars).toContain("TEMPORAL_POSTGRES_HOST");
+    expect(plan.platformDependencies[1]?.requiredEnvVars).toContain("TEMPORAL_POSTGRES_PASSWORD");
+    expect(plan.creates).toContain("GKE cluster");
+    expect(plan.requiredSecretKeys).toContain("OPENGENI_ACCESS_KEY");
+    expect(plan.requiredSecretKeys).toContain("opengeni-temporal-postgres/password");
+    expect(plan.deployCommands.some((command) => command.includes("helm repo add nats"))).toBe(true);
+    expect(plan.deployCommands.some((command) => command.includes("helm repo add temporal"))).toBe(true);
+    expect(plan.deployCommands.some((command) => command.includes("terraform -chdir=deploy/terraform/gcp apply"))).toBe(true);
+    expect(plan.deployCommands.some((command) => command.includes("docker build") && command.includes("--target api"))).toBe(true);
+    expect(plan.deployCommands.some((command) => command.includes("docker push"))).toBe(true);
+    expect(plan.deployCommands.some((command) => command.includes("deployment:runtime-artifacts"))).toBe(true);
+    expect(plan.deployCommands.some((command) => command.includes("opengeni-runtime"))).toBe(true);
+    expect(plan.deployCommands.some((command) => command.includes(".agent/generated/gcp-managed/helm-values.generated.yaml"))).toBe(true);
+    expect(plan.verifyCommands.some((command) => command.includes("rollout status statefulset/opengeni-nats"))).toBe(true);
+    expect(plan.verifyCommands.some((command) => command.includes("helm test opengeni-nats"))).toBe(true);
+    expect(plan.verifyCommands.some((command) => command.includes("rollout status deployment/opengeni-temporal-frontend"))).toBe(true);
+    expect(plan.verifyCommands.some((command) => command.includes("helm test opengeni-temporal"))).toBe(true);
+    expect(plan.verifyCommands.some((command) => command.includes("OPENGENI_CONFORMANCE_ACCESS_KEY"))).toBe(true);
+    expect(plan.destroyCommands.some((command) => command.includes("helm uninstall opengeni-temporal"))).toBe(true);
+    expect(plan.destroyCommands.some((command) => command.includes("helm uninstall opengeni-nats"))).toBe(true);
+    expect(plan.destroyCommands.at(-1)).toContain("terraform -chdir=deploy/terraform/gcp destroy");
+  });
+
+  test("does not plan cloud substrate for existing-service profiles", () => {
+    const plan = stackPlanFor(deploymentProfiles["aws-existing-services"]);
+
+    expect(plan.terraformRoot).toBeNull();
+    expect(plan.platformDependencies).toEqual([]);
+    expect(plan.externalDependencies).toContain("Postgres with pgvector reachable through OPENGENI_DATABASE_URL");
+    expect(plan.destroyCommands.some((command) => command.includes("terraform"))).toBe(false);
+  });
+
+  test("generates private runtime artifacts from GCP Terraform outputs without hand-editing Helm paths", () => {
+    const artifacts = generateRuntimeArtifacts(deploymentProfiles["gcp-managed"], {
+      project_id: { value: "opengeni-verification" },
+      region: { value: "us-central1" },
+      temporal_host: { value: "opengeni-temporal-frontend.opengeni-platform.svc.cluster.local:7233" },
+      temporal_namespace: { value: "default" },
+      temporal_task_queue: { value: "opengeni-runs-ts" },
+      object_storage_bucket: { value: "opengeni-verification-ogv-files" },
+      helm_set_values: {
+        value: {
+          "global.imageRegistry": "us-central1-docker.pkg.dev/opengeni-verification/opengeni",
+          "serviceAccount.annotations.iam\\.gke\\.io/gcp-service-account": "opengeni-runtime@opengeni-verification.iam.gserviceaccount.com",
+          "config.OPENGENI_OBJECT_STORAGE_BUCKET": "opengeni-verification-ogv-files",
+        },
+      },
+    }, {
+      OPENGENI_ACCESS_KEY: "test-access-key",
+      OPENGENI_DATABASE_URL: "postgres://opengeni:secret@postgres/opengeni",
+      OPENGENI_IMAGE_TAG: "test-sha",
+    });
+
+    expect(artifacts.missingEnvVars).toEqual([]);
+    expect(artifacts.helmValuesYaml).toContain("imageRegistry: \"us-central1-docker.pkg.dev/opengeni-verification/opengeni\"");
+    expect(artifacts.helmValuesYaml).toContain("tag: \"test-sha\"");
+    expect(artifacts.helmValuesYaml).toContain("digest: \"\"");
+    expect(artifacts.helmValuesYaml).toContain("iam.gke.io/gcp-service-account: \"opengeni-runtime@opengeni-verification.iam.gserviceaccount.com\"");
+    expect(artifacts.runtimeEnv).toContain("OPENGENI_OBJECT_STORAGE_BACKEND=gcs");
+    expect(artifacts.runtimeEnv).toContain("OPENGENI_OBJECT_STORAGE_GCS_PROJECT_ID=opengeni-verification");
+    expect(artifacts.runtimeEnv).toContain("OPENGENI_NATS_URL=nats://opengeni-nats.opengeni-platform.svc.cluster.local:4222");
+    expect(artifacts.summary.secretNames).toContain("opengeni-runtime");
+  });
+
+  test("uses sensitive Azure Terraform connection string only in private runtime env", () => {
+    const artifacts = generateRuntimeArtifacts(deploymentProfiles["azure-managed"], {
+      temporal_host: { value: "opengeni-temporal-frontend.opengeni-platform.svc.cluster.local:7233" },
+      temporal_namespace: { value: "default" },
+      temporal_task_queue: { value: "opengeni-runs-ts" },
+      object_storage_bucket: { value: "opengeni-files" },
+      object_storage_azure_connection_string: { value: "DefaultEndpointsProtocol=https;AccountName=files;AccountKey=secret", sensitive: true },
+      helm_set_values: {
+        value: {
+          "global.imageRegistry": "opengeni.azurecr.io",
+          "config.OPENGENI_OBJECT_STORAGE_BACKEND": "azure-blob",
+        },
+      },
+    }, {
+      OPENGENI_ACCESS_KEY: "test-access-key",
+      OPENGENI_DATABASE_URL: "postgres://opengeni:secret@postgres/opengeni",
+    });
+
+    expect(artifacts.missingEnvVars).toEqual([]);
+    expect(artifacts.sensitiveTerraformOutputsUsed).toEqual(["object_storage_azure_connection_string"]);
+    expect(artifacts.runtimeEnv).toContain("OPENGENI_OBJECT_STORAGE_AZURE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=files;AccountKey=secret");
+    expect(artifacts.helmValuesYaml).not.toContain("AccountKey=secret");
+  });
+
+  test("reports missing required runtime secrets without fabricating values", () => {
+    const artifacts = generateRuntimeArtifacts(deploymentProfiles["aws-managed"], {
+      region: { value: "us-east-1" },
+      temporal_host: { value: "opengeni-temporal-frontend.opengeni-platform.svc.cluster.local:7233" },
+      object_storage_bucket: { value: "opengeni-files" },
+      helm_set_values: { value: {} },
+    }, {});
+
+    expect(artifacts.missingEnvVars).toContain("OPENGENI_ACCESS_KEY");
+    expect(artifacts.missingEnvVars).toContain("OPENGENI_DATABASE_URL");
+    expect(artifacts.runtimeEnv).toContain("OPENGENI_ACCESS_KEY=");
+    expect(artifacts.runtimeEnv).toContain("OPENGENI_DATABASE_URL=");
   });
 });

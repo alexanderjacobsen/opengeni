@@ -35,14 +35,16 @@ postgres:
 
 temporal:
   # Production should use Temporal Cloud, an existing endpoint, or the official
-  # Temporal chart managed outside OpenGeni's chart. Set true only for smoke.
+  # Temporal chart managed by the stack wrapper outside OpenGeni's chart.
+  # Set true only for smoke.
   enabled: false
 
 nats:
-  # Production should use an existing NATS endpoint or the official NATS chart.
+  # Production should use an existing NATS endpoint or the official NATS chart
+  # managed by the stack wrapper outside OpenGeni's chart.
   # Set true only for local/preview/cloud smoke fixtures.
   enabled: false
-  url: "nats://nats.example.internal:4222"
+  url: "nats://opengeni-nats.opengeni-platform.svc.cluster.local:4222"
 
 minio:
   enabled: false
@@ -53,8 +55,11 @@ config:
   OPENGENI_API_HOST: 0.0.0.0
   OPENGENI_API_PORT: "8000"
   OPENGENI_TEMPORAL_NAMESPACE: default
-  OPENGENI_TEMPORAL_HOST: temporal.example.internal:7233
+  OPENGENI_TEMPORAL_HOST: opengeni-temporal-frontend.opengeni-platform.svc.cluster.local:7233
   OPENGENI_TEMPORAL_TASK_QUEUE: opengeni-runs-ts
+  OPENGENI_AUTH_REQUIRED: "true"
+  OPENGENI_AUTH_ALLOW_HEALTH: "true"
+  OPENGENI_AUTH_ALLOW_METRICS: "false"
   OPENGENI_STARTUP_DEPENDENCY_RETRY_ATTEMPTS: "30"
   OPENGENI_STARTUP_DEPENDENCY_RETRY_INITIAL_DELAY_MS: "1000"
   OPENGENI_STARTUP_DEPENDENCY_RETRY_MAX_DELAY_MS: "5000"

@@ -339,10 +339,10 @@ class PrefixedMcpServer implements MCPServer {
 
 export function createSandboxClient(settings: Settings, environment = collectSandboxEnvironment(settings)): unknown {
   if (settings.sandboxBackend === "docker") {
-    return new DockerSandboxClient({
+    return withDockerNetwork(new DockerSandboxClient({
       image: settings.dockerImage,
       exposedPorts: parseExposedPorts(settings.dockerExposedPorts),
-    });
+    }), settings.dockerNetwork);
   }
   if (settings.sandboxBackend === "modal") {
     const options: ConstructorParameters<typeof ModalSandboxClient>[0] = {
@@ -369,6 +369,46 @@ export function createSandboxClient(settings: Settings, environment = collectSan
     return new UnixLocalSandboxClient();
   }
   return undefined;
+}
+
+function withDockerNetwork(client: SandboxClient, network: string | undefined): SandboxClient {
+  const trimmed = network?.trim();
+  if (!trimmed) {
+    return client;
+  }
+  const wrapSession = async <T extends SandboxSessionLike>(session: T): Promise<T> => {
+    const containerId = (session as { state?: { containerId?: unknown } }).state?.containerId;
+    if (typeof containerId === "string" && containerId.length > 0) {
+      await connectDockerNetwork(trimmed, containerId);
+    }
+    return session;
+  };
+  return {
+    backendId: client.backendId,
+    ...(client.supportsDefaultOptions !== undefined ? { supportsDefaultOptions: client.supportsDefaultOptions } : {}),
+    ...(client.create ? { create: async (...args: any[]) => await wrapSession(await (client.create as any)(...args)) } : {}),
+    ...(client.resume ? { resume: async (state: SandboxSessionState) => await wrapSession(await client.resume!(state)) } : {}),
+    ...(client.delete ? { delete: async (state: SandboxSessionState) => await client.delete!(state) } : {}),
+    ...(client.serializeSessionState ? { serializeSessionState: async (state: SandboxSessionState, options) => await client.serializeSessionState!(state, options) } : {}),
+    ...(client.canPersistOwnedSessionState ? { canPersistOwnedSessionState: async (state: SandboxSessionState) => await client.canPersistOwnedSessionState!(state) } : {}),
+    ...(client.canReusePreservedOwnedSession ? { canReusePreservedOwnedSession: async (state: SandboxSessionState) => await client.canReusePreservedOwnedSession!(state) } : {}),
+    ...(client.deserializeSessionState ? { deserializeSessionState: async (state: Record<string, unknown>) => await client.deserializeSessionState!(state) } : {}),
+  };
+}
+
+async function connectDockerNetwork(network: string, containerId: string): Promise<void> {
+  const result = Bun.spawnSync(["docker", "network", "connect", network, containerId], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (result.exitCode === 0) {
+    return;
+  }
+  const stderr = new TextDecoder().decode(result.stderr);
+  if (stderr.includes("already exists")) {
+    return;
+  }
+  throw new Error(`Failed to connect Docker sandbox container to network ${network}: ${stderr.trim()}`);
 }
 
 export type PrepareInputOptions = {
@@ -903,6 +943,7 @@ function sandboxFileDownloadCommand(download: SandboxFileDownload, targetPath: s
     `  mv -- "$tmp" ${shellQuote(targetPath)}`,
     "  trap - EXIT",
     "fi",
+    `chmod a-w -- ${shellQuote(targetPath)} 2>/dev/null || true`,
   ].join("\n");
 }
 

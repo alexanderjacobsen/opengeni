@@ -75,9 +75,11 @@ describe("contracts", () => {
       allowedReasoningEfforts: ["low", "medium", "high"],
       mcpServers: [{ id: "opengeni", name: "OpenGeni" }],
       fileUploads: { enabled: true, maxSizeBytes: 5_000_000_000 },
+      auth: { required: true, headerName: "authorization", scheme: "bearer" },
     });
     expect(payload.defaultReasoningEffort).toBe("high");
     expect(payload.fileUploads.enabled).toBe(true);
+    expect(payload.auth.required).toBe(true);
     expect(payload.mcpServers[0]?.id).toBe("opengeni");
   });
 

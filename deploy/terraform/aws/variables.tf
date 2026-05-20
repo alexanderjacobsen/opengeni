@@ -96,6 +96,8 @@ variable "postgres" {
     allocated_storage      = optional(number, 32)
     administrator_login    = optional(string, "opengeni")
     administrator_password = optional(string)
+    deletion_protection    = optional(bool, true)
+    skip_final_snapshot    = optional(bool, false)
   })
   default = {
     mode = "external"
@@ -118,7 +120,7 @@ variable "postgres" {
 }
 
 variable "temporal" {
-  description = "Temporal endpoint settings. Self-hosted Temporal belongs in the Helm/platform layer."
+  description = "Temporal endpoint settings. Use external for an existing endpoint or officialChart for the stack-wrapper managed upstream Temporal chart."
   type = object({
     mode          = string
     existing_host = optional(string)
@@ -130,13 +132,13 @@ variable "temporal" {
   }
 
   validation {
-    condition     = contains(["external"], var.temporal.mode)
-    error_message = "temporal.mode currently supports external only in the AWS Terraform substrate."
+    condition     = contains(["external", "officialChart"], var.temporal.mode)
+    error_message = "temporal.mode must be external or officialChart."
   }
 
   validation {
-    condition     = var.deployment_phase != "complete" || try(length(var.temporal.existing_host) > 0, false)
-    error_message = "temporal.existing_host is required when deployment_phase is complete."
+    condition     = var.deployment_phase != "complete" || var.temporal.mode != "external" || try(length(var.temporal.existing_host) > 0, false)
+    error_message = "temporal.existing_host is required when temporal.mode is external and deployment_phase is complete."
   }
 }
 

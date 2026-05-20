@@ -77,12 +77,20 @@ variable "postgres" {
   description = "Postgres mode. Use managed to create Azure Database for PostgreSQL Flexible Server or external to connect an existing compatible server."
   type = object({
     mode                   = string
+    name                   = optional(string)
+    location               = optional(string)
+    zone                   = optional(string)
     existing_host          = optional(string)
     administrator_login    = optional(string, "opengeni")
     administrator_password = optional(string)
     sku_name               = optional(string, "B_Standard_B2s")
     storage_mb             = optional(number, 32768)
     version                = optional(string, "16")
+    allow_azure_services   = optional(bool, false)
+    firewall_rules = optional(map(object({
+      start_ip_address = string
+      end_ip_address   = string
+    })), {})
   })
   default = {
     mode = "external"
@@ -105,7 +113,7 @@ variable "postgres" {
 }
 
 variable "temporal" {
-  description = "Temporal mode. This module currently connects to an existing Temporal endpoint; self-hosted Temporal belongs in the Helm/platform layer."
+  description = "Temporal mode. Use external for an existing endpoint or officialChart for the stack-wrapper managed upstream Temporal chart."
   type = object({
     mode          = string
     existing_host = optional(string)
@@ -117,13 +125,13 @@ variable "temporal" {
   }
 
   validation {
-    condition     = contains(["external"], var.temporal.mode)
-    error_message = "temporal.mode currently supports external only in the Azure Terraform substrate."
+    condition     = contains(["external", "officialChart"], var.temporal.mode)
+    error_message = "temporal.mode must be external or officialChart."
   }
 
   validation {
-    condition     = var.deployment_phase != "complete" || try(length(var.temporal.existing_host) > 0, false)
-    error_message = "temporal.existing_host is required when deployment_phase is complete."
+    condition     = var.deployment_phase != "complete" || var.temporal.mode != "external" || try(length(var.temporal.existing_host) > 0, false)
+    error_message = "temporal.existing_host is required when temporal.mode is external and deployment_phase is complete."
   }
 }
 

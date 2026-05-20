@@ -35,7 +35,7 @@ import type {
   RunAgentSegmentInput,
   RunAgentSegmentResult,
 } from "./types";
-import type { ObjectStorage } from "@opengeni/storage";
+import { createObjectStorage, type ObjectStorage } from "@opengeni/storage";
 import type { ResourceRef } from "@opengeni/contracts";
 
 export function createRunAgentSegmentActivity(services: () => Promise<ActivityServices>) {
@@ -251,10 +251,11 @@ async function sandboxFileDownloadsForRun(
   if (!objectStorage) {
     throw new Error(`${settings.objectStorageBackend} file resources require configured object storage`);
   }
+  const downloadStorage = objectStorageForSandboxDownloads(settings, objectStorage);
   const downloads: SandboxFileDownload[] = [];
   for (const resource of fileResources) {
     const file = await requireFile(db, resource.fileId);
-    const url = await objectStorage.createGetUrl({ key: file.objectKey });
+    const url = await downloadStorage.createGetUrl({ key: file.objectKey });
     downloads.push({
       fileId: file.id,
       mountPath: resource.mountPath ?? `files/${file.id}`,
@@ -268,7 +269,18 @@ async function sandboxFileDownloadsForRun(
 }
 
 function requiresSignedFileResourceDownloads(settings: Settings): boolean {
-  return settings.objectStorageBackend === "aws-s3"
+  return (settings.sandboxBackend === "docker" && settings.objectStorageBackend === "s3-compatible")
+    || settings.objectStorageBackend === "aws-s3"
     || settings.objectStorageBackend === "gcs"
     || (settings.sandboxBackend === "modal" && settings.objectStorageBackend === "azure-blob");
+}
+
+function objectStorageForSandboxDownloads(settings: Settings, objectStorage: ObjectStorage): ObjectStorage {
+  if (settings.objectStorageBackend !== "s3-compatible" || !settings.objectStorageSandboxEndpoint) {
+    return objectStorage;
+  }
+  return createObjectStorage({
+    ...settings,
+    objectStorageEndpoint: settings.objectStorageSandboxEndpoint,
+  }) ?? objectStorage;
 }

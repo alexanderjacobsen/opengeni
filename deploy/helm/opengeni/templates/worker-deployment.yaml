@@ -44,6 +44,10 @@ spec:
           imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.worker.securityContext | nindent 12 }}
+          {{- if .Values.worker.command }}
+          command:
+            {{- toYaml .Values.worker.command | nindent 12 }}
+          {{- end }}
           envFrom:
             - configMapRef:
                 name: {{ include "opengeni.fullname" . }}-config

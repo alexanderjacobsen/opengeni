@@ -9,6 +9,9 @@ gke = {
   node_count          = 1
   min_node_count      = 1
   max_node_count      = 2
+  # Optional: constrain a regional cluster's node pool to specific zones for
+  # temporary verification stacks. Omit for multi-zone production resilience.
+  # node_locations = ["us-central1-a"]
 }
 
 labels = {
@@ -31,11 +34,15 @@ kubernetes_workload_identity = {
 
 postgres = {
   mode = "external"
+  private_ip_enabled  = true
+  edition             = "ENTERPRISE"
+  availability_type   = "REGIONAL"
   # existing_host = "postgres.example.com"
 }
 
 temporal = {
-  mode = "external"
+  mode = "officialChart"
+  # Use mode = "external" plus existing_host for Temporal Cloud or customer Temporal.
   # existing_host = "temporal.example.com:7233"
   namespace  = "default"
   task_queue = "opengeni-runs-ts"

@@ -141,10 +141,11 @@ For local MinIO, keep S3-compatible storage and both object-storage endpoints:
 ```bash
 OPENGENI_OBJECT_STORAGE_BACKEND=s3-compatible
 OPENGENI_OBJECT_STORAGE_ENDPOINT=http://127.0.0.1:9000
-OPENGENI_OBJECT_STORAGE_SANDBOX_ENDPOINT=http://host.docker.internal:9000
+OPENGENI_OBJECT_STORAGE_SANDBOX_ENDPOINT=http://minio:9000
+OPENGENI_DOCKER_NETWORK=opengeni_default
 ```
 
-The first endpoint is for the host, browser, and API. The sandbox endpoint is for Docker agent containers, where `127.0.0.1` points at the sandbox container instead of host MinIO. Presigned URLs generated for one host are not safely interchangeable with the other because the host is part of the S3 signature.
+The first endpoint is for the host, browser, and API. The sandbox endpoint is for Docker agent containers joined to the local Compose network, where `minio:9000` resolves to the MinIO service. Presigned URLs generated for one host are not safely interchangeable with the other because the host is part of the S3 signature.
 
 `bun run dev` auto-selects alternate Docker Compose host ports when common defaults such as `5432` are already in use, and it rewrites the in-memory runtime URLs for that run. Set `OPENGENI_*_HOST_PORT` values in `.env` when you need fixed local ports.
 
@@ -287,7 +288,7 @@ Integration and E2E tests use Bun's test runner. Deterministic SDK-level tests u
 - Public clients should treat the API as the source of truth.
 - Browser streaming uses `GET /v1/sessions/:id/events/stream`.
 - Agent activities are side-effectful. Do not add automatic Temporal retries around full agent segments unless each model, tool, and sandbox boundary has been made idempotent.
-- Docker sandbox file resources use native S3-compatible in-container mounts. Attach file resources before the first run when using the Docker backend.
+- Docker sandbox file resources from local S3-compatible storage are materialized into the sandbox before the run. Attach file resources before the first run when using the Docker backend.
 - Sandbox preparation profiles are explicit. Model provider credentials are not automatically exposed inside sandboxes unless configured.
 
 ## Open Source Release Notes

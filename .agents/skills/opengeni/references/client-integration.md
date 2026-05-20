@@ -11,7 +11,7 @@ Ask or infer:
 - API base URL for the deployed OpenGeni service.
 - Whether the user needs a browser UI, server-side integration, CLI, SDK wrapper, or docs.
 - Whether file upload, repository attachment, MCP tools, approvals, interrupts, or schedules are in scope.
-- Whether auth/tenancy exists in the target deployment. The base repo may not ship auth yet, but a deployment can add an API gateway, reverse proxy, or product auth layer.
+- Whether the shared-key access boundary is enabled in the target deployment, and whether a product gateway, reverse proxy, VPN, or tenancy layer sits in front of OpenGeni.
 - Whether exact source behavior is needed. If yes, inspect the repo or the deployed service contract rather than trusting this reference.
 
 ## Client Mental Model
@@ -52,14 +52,15 @@ If only a deployment is available:
 
 Prefer this shape, adjusted to the current contracts:
 
-1. **Fetch config**: get default model, allowed models, reasoning efforts, MCP providers, and whether file uploads are enabled.
-2. **Prepare resources**: upload files first; select repository resources from available repo/source picker; select MCP tool providers by id.
-3. **Create session**: send initial message plus selected resources/tools/model/sandbox options.
-4. **Connect SSE**: stream events from the returned session id. Use the last event sequence as the reconnect cursor.
-5. **Render timeline**: display user messages, agent deltas/completions, reasoning, tool calls, sandbox operations, approvals, status changes, failures, and final output according to current event types.
-6. **Send follow-ups**: post a user message into the existing session; the API queues another turn.
-7. **Control work**: send interrupt or approval-decision events when the session requires action.
-8. **Replay**: on reload or reconnect, list events after the last known sequence before resuming the live stream.
+1. **Prepare access**: if shared-key auth is enabled, collect the deployment access key and send it as `Authorization: Bearer ...` or `X-OpenGeni-Access-Key`.
+2. **Fetch config**: get default model, allowed models, reasoning efforts, MCP providers, and whether file uploads are enabled.
+3. **Prepare resources**: upload files first; select repository resources from available repo/source picker; select MCP tool providers by id.
+4. **Create session**: send initial message plus selected resources/tools/model/sandbox options.
+5. **Connect SSE**: stream events from the returned session id. Use the last event sequence as the reconnect cursor.
+6. **Render timeline**: display user messages, agent deltas/completions, reasoning, tool calls, sandbox operations, approvals, status changes, failures, and final output according to current event types.
+7. **Send follow-ups**: post a user message into the existing session; the API queues another turn.
+8. **Control work**: send interrupt or approval-decision events when the session requires action.
+9. **Replay**: on reload or reconnect, list events after the last known sequence before resuming the live stream.
 
 ## Event Handling Rules
 
@@ -125,6 +126,7 @@ Use client-centered language:
 - "Attach files, repositories, and MCP tool providers to a run."
 - "Replay the event log after reloads or network drops."
 - "Handle approvals and interrupts as normal API events."
+- "Self-hosted deployments can enable a simple shared-key boundary, but production products should still put real auth, tenancy, and policy in front of OpenGeni."
 
 Avoid implying clients call Temporal, NATS, Postgres, the worker, or the sandbox directly.
 
@@ -139,4 +141,3 @@ Update this file when:
 - Client config capabilities change.
 - File upload or repository selection flow changes.
 - New first-class client SDKs are added.
-

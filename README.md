@@ -28,9 +28,9 @@ This repository is early, but it now includes the baseline files expected for pu
 
 ## Public Preview / Security Boundary
 
-OpenGeni is intended to be self-hosted behind a trusted product, gateway, VPN, or reverse proxy. The base API does not yet ship built-in authentication, tenancy, RBAC, API keys, or scoped client permissions.
+OpenGeni is intended to be self-hosted behind a trusted product, gateway, VPN, or reverse proxy. The base API includes a deliberately small shared-key access boundary for early self-hosted deployments and smoke tests: set `OPENGENI_AUTH_REQUIRED=true` and provide `OPENGENI_ACCESS_KEY` through a secret. The browser stores that key only client-side and sends it as `Authorization: Bearer ...`; automation can also use `X-OpenGeni-Access-Key`.
 
-Do not expose the API or worker control plane directly to the public internet without an external access-control layer. Sandbox preparation profiles and env allowlists can make host credentials available to agent sandboxes, so review `.env` before running live sessions.
+This is not a replacement for product-grade authentication, tenancy, RBAC, audit policy, quotas, or per-user scoped permissions. Do not expose the API or worker control plane directly to the public internet without at least the shared-key boundary and, for production, an external access-control layer. Sandbox preparation profiles and env allowlists can make host credentials available to agent sandboxes, so review `.env` before running live sessions.
 
 ## Architecture
 
@@ -77,7 +77,7 @@ Temporal coordinates the work, but token streams and tool output do not go throu
 - Temporal worker
 - Postgres with Drizzle and pgvector
 - NATS Core realtime bus
-- MinIO for local S3-compatible file storage and Azure Blob for production object storage
+- MinIO for local S3-compatible file storage and Azure Blob, AWS S3, or GCS for production object storage
 - OpenAI Agents SDK
 - Docker and Modal sandbox backends
 
@@ -170,16 +170,20 @@ The deployment foundation is tracked in `docs/infra-deployment-goal.md` and the 
 Current deployment artifacts include:
 
 - A repo-owned deployment contract in `packages/deployment`.
-- A Helm chart for API, web, worker, migrations, and optional in-cluster NATS at `deploy/helm/opengeni`.
+- A Helm chart for API, web, worker, migrations, and disposable local/smoke fixtures at `deploy/helm/opengeni`.
 - An Azure reference Terraform substrate at `deploy/terraform/azure`.
+- AWS and GCP reference Terraform substrates at `deploy/terraform/aws` and `deploy/terraform/gcp`.
+- Stack-wrapper plans that can install official upstream NATS and Temporal Helm charts outside the OpenGeni application chart.
+- Runtime artifact generators for provider-specific non-secret Helm values and private runtime env files.
 - A preflight/profile command:
 
 ```bash
 bun run deployment:profiles
 bun run deployment:preflight -- --profile azure-existing-services
+bun run deployment:stack -- --profile gcp-managed
 ```
 
-Azure resources created during deployment verification must be tracked in `docs/azure-resource-ledger.md`.
+Production operators should use managed services, existing endpoints, or official upstream charts/operators for Postgres, Temporal, NATS, secret delivery, ingress/TLS, and observability. The in-chart Postgres, Temporal, NATS, and MinIO templates are only for local, CI, preview, and smoke verification. Azure, AWS, and GCP resources created during deployment verification must be tracked in their provider ledgers under `docs/`.
 
 ## Web App
 

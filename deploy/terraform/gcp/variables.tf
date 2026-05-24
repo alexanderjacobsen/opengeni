@@ -173,6 +173,8 @@ variable "object_storage" {
     force_destroy               = optional(bool, false)
     versioning_enabled          = optional(bool, true)
     uniform_bucket_level_access = optional(bool, true)
+    cors_allowed_origins        = optional(list(string), [])
+    cors_max_age_seconds        = optional(number, 3600)
   })
   default = {
     mode = "managed"

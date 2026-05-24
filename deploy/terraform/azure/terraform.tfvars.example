@@ -31,4 +31,7 @@ object_storage = {
   mode   = "managed"
   api    = "azure-blob"
   bucket = "opengeni-files"
+  # Required for direct browser uploads to signed Blob URLs. Prefer exact
+  # HTTPS app origins; "*" is acceptable only for private verification stacks.
+  cors_allowed_origins = ["https://opengeni.example.com"]
 }

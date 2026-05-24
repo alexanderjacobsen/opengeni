@@ -26,6 +26,9 @@ temporal = {
 object_storage = {
   mode          = "managed"
   force_destroy = true
+  # Required for direct browser uploads to signed S3 URLs. Prefer exact
+  # HTTPS app origins; "*" is acceptable only for private verification stacks.
+  cors_allowed_origins = ["https://opengeni.example.com"]
 
   # In external mode, set bucket to an existing S3 bucket name.
   # bucket = "existing-opengeni-files"

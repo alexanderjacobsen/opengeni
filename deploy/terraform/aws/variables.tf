@@ -150,6 +150,8 @@ variable "object_storage" {
     force_destroy              = optional(bool, false)
     versioning_enabled         = optional(bool, true)
     noncurrent_expiration_days = optional(number, 30)
+    cors_allowed_origins       = optional(list(string), [])
+    cors_max_age_seconds       = optional(number, 3600)
   })
   default = {
     mode = "managed"

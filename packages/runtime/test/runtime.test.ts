@@ -527,6 +527,32 @@ describe("runtime event normalization", () => {
     }
   });
 
+  test("sends the shared access key to first-party MCP servers", async () => {
+    const accessKey = "local-mcp-access-key";
+    const mcp = startTestMcpServer({ requiredAuthorization: `Bearer ${accessKey}` });
+    const prepared = await prepareAgentTools(testSettings({
+      authRequired: true,
+      accessKey,
+      opengeniMcpUrl: mcp.url,
+      mcpServers: [{
+        id: "opengeni",
+        name: "OpenGeni",
+        url: mcp.url,
+        allowedTools: ["search_documents"],
+        cacheToolsList: false,
+      }],
+    }), [{ kind: "mcp", id: "opengeni" }]);
+    try {
+      const tools = await prepared.mcpServers[0]!.listTools();
+      expect(tools.map((tool) => tool.name)).toEqual(["opengeni__search_documents"]);
+      const result = await prepared.mcpServers[0]!.callTool("opengeni__search_documents", { query: "auth" });
+      expect(JSON.stringify(result)).toContain("found document for auth");
+    } finally {
+      await prepared.close();
+      mcp.close();
+    }
+  });
+
   test("rejects unknown MCP tool ids during runtime preparation", async () => {
     await expect(prepareAgentTools(testSettings(), [{ kind: "mcp", id: "missing" }])).rejects.toThrow("Unknown MCP server id");
   });

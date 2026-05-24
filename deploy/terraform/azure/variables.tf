@@ -149,6 +149,8 @@ variable "object_storage" {
     replication_type      = optional(string, "LRS")
     versioning_enabled    = optional(bool, true)
     delete_retention_days = optional(number, 7)
+    cors_allowed_origins  = optional(list(string), [])
+    cors_max_age_seconds  = optional(number, 3600)
   })
   default = {
     mode = "managed"

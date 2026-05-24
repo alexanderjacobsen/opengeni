@@ -388,7 +388,8 @@ export function parseMcpServers(raw: string | undefined): unknown[] | undefined 
 
 function ensureBuiltInMcpServers(settings: Settings): Settings["mcpServers"] {
   const existing = settings.mcpServers.filter((server) => server.id !== "opengeni");
-  const firstPartyMcpUrl = settings.opengeniMcpUrl ?? `http://127.0.0.1:${settings.apiPort}/v1/mcp`;
+  const firstPartyMcpUrl = firstPartyMcpServerUrl(settings);
+  const firstPartyDocsMcpUrl = firstPartyDocumentsMcpServerUrl(firstPartyMcpUrl);
   const hasFiles = existing.some((server) => server.id === "files");
   const hasDocs = existing.some((server) => server.id === "docs");
   return [
@@ -408,12 +409,22 @@ function ensureBuiltInMcpServers(settings: Settings): Settings["mcpServers"] {
     ...(hasDocs ? [] : [{
       id: "docs",
       name: "Document Search",
-      url: `http://127.0.0.1:${settings.apiPort}/v1/mcp/docs`,
+      url: firstPartyDocsMcpUrl,
       allowedTools: ["search_documents", "fetch_document_chunk", "list_document_bases"],
       cacheToolsList: false,
     }]),
     ...existing,
   ];
+}
+
+function firstPartyMcpServerUrl(settings: Settings): string {
+  return settings.opengeniMcpUrl ?? `http://127.0.0.1:${settings.apiPort}/v1/mcp`;
+}
+
+function firstPartyDocumentsMcpServerUrl(mcpUrl: string): string {
+  const url = new URL(mcpUrl);
+  url.pathname = `${url.pathname.replace(/\/+$/, "")}/docs`;
+  return url.toString();
 }
 
 function validateSettings(settings: Settings): void {

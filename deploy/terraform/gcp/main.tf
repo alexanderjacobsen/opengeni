@@ -154,6 +154,16 @@ resource "google_storage_bucket" "files" {
   public_access_prevention    = "enforced"
   labels                      = local.labels
 
+  dynamic "cors" {
+    for_each = length(var.object_storage.cors_allowed_origins) > 0 ? [1] : []
+    content {
+      origin          = var.object_storage.cors_allowed_origins
+      method          = ["GET", "HEAD", "PUT"]
+      response_header = ["Content-Type", "ETag", "x-goog-meta-sha256"]
+      max_age_seconds = var.object_storage.cors_max_age_seconds
+    }
+  }
+
   versioning {
     enabled = var.object_storage.versioning_enabled
   }

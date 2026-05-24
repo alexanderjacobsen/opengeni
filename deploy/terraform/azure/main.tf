@@ -161,6 +161,17 @@ resource "azurerm_storage_account" "files" {
     container_delete_retention_policy {
       days = var.object_storage.delete_retention_days
     }
+
+    dynamic "cors_rule" {
+      for_each = length(var.object_storage.cors_allowed_origins) > 0 ? [1] : []
+      content {
+        allowed_headers    = ["*"]
+        allowed_methods    = ["GET", "HEAD", "OPTIONS", "PUT"]
+        allowed_origins    = var.object_storage.cors_allowed_origins
+        exposed_headers    = ["*"]
+        max_age_in_seconds = var.object_storage.cors_max_age_seconds
+      }
+    }
   }
 }
 

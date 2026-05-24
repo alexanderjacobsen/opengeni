@@ -239,6 +239,7 @@ export async function prepareAgentTools(settings: Settings, tools: ToolRef[]): P
       url: config.url,
       name: config.name ?? config.id,
       cacheToolsList: config.cacheToolsList,
+      ...firstPartyMcpRequestInit(settings, config),
       ...(config.timeoutMs ? {
         timeout: config.timeoutMs,
         clientSessionTimeoutSeconds: Math.ceil(config.timeoutMs / 1000),
@@ -255,6 +256,51 @@ export async function prepareAgentTools(settings: Settings, tools: ToolRef[]): P
       await connected.close();
     },
   };
+}
+
+function firstPartyMcpRequestInit(settings: Settings, config: Settings["mcpServers"][number]): { requestInit: { headers: Record<string, string> } } | {} {
+  if (!settings.authRequired || !settings.accessKey || !isFirstPartyMcpServer(settings, config)) {
+    return {};
+  }
+  return {
+    requestInit: {
+      headers: {
+        authorization: `Bearer ${settings.accessKey}`,
+      },
+    },
+  };
+}
+
+function isFirstPartyMcpServer(settings: Settings, config: Settings["mcpServers"][number]): boolean {
+  if (!["opengeni", "files", "docs"].includes(config.id)) {
+    return false;
+  }
+  const url = normalizeUrl(config.url);
+  if (!url) {
+    return false;
+  }
+  return firstPartyMcpUrls(settings).some((candidate) => candidate === url);
+}
+
+function firstPartyMcpUrls(settings: Settings): string[] {
+  const base = normalizeUrl(settings.opengeniMcpUrl ?? `http://127.0.0.1:${settings.apiPort}/v1/mcp`);
+  if (!base) {
+    return [];
+  }
+  const docs = new URL(base);
+  docs.pathname = `${docs.pathname.replace(/\/+$/, "")}/docs`;
+  return [base, normalizeUrl(docs.toString())].filter((value): value is string => Boolean(value));
+}
+
+function normalizeUrl(raw: string): string | null {
+  try {
+    const url = new URL(raw);
+    url.hash = "";
+    url.pathname = url.pathname.replace(/\/+$/, "");
+    return url.toString();
+  } catch {
+    return null;
+  }
 }
 
 export function prefixedMcpToolName(registryId: string, toolName: string): string {

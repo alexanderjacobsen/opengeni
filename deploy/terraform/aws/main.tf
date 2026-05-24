@@ -317,6 +317,19 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "files" {
   }
 }
 
+resource "aws_s3_bucket_cors_configuration" "files" {
+  count  = var.object_storage.mode == "managed" && length(var.object_storage.cors_allowed_origins) > 0 ? 1 : 0
+  bucket = aws_s3_bucket.files[0].id
+
+  cors_rule {
+    allowed_headers = ["*"]
+    allowed_methods = ["GET", "HEAD", "PUT"]
+    allowed_origins = var.object_storage.cors_allowed_origins
+    expose_headers  = ["ETag"]
+    max_age_seconds = var.object_storage.cors_max_age_seconds
+  }
+}
+
 resource "aws_secretsmanager_secret" "runtime" {
   name                    = "${var.name_prefix}/runtime"
   recovery_window_in_days = 7

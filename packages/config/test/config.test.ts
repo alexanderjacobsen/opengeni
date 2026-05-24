@@ -232,6 +232,14 @@ describe("sandbox preparation profiles", () => {
     });
   });
 
+  test("derives built-in document MCP URL from OPENGENI_MCP_URL", () => {
+    const settings = withEnv({
+      OPENGENI_MCP_URL: "http://opengeni-api.opengeni.svc.cluster.local:8000/v1/mcp",
+    }, () => getSettings());
+    expect(settings.mcpServers.find((server) => server.id === "opengeni")?.url).toBe("http://opengeni-api.opengeni.svc.cluster.local:8000/v1/mcp");
+    expect(settings.mcpServers.find((server) => server.id === "docs")?.url).toBe("http://opengeni-api.opengeni.svc.cluster.local:8000/v1/mcp/docs");
+  });
+
   test("does not duplicate a custom files MCP profile", () => {
     withEnv({
       OPENGENI_MCP_SERVERS: '[{"id":"files","name":"Custom Files","url":"http://127.0.0.1:8787/mcp","allowedTools":["custom_download"]}]',

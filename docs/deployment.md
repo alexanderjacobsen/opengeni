@@ -88,6 +88,12 @@ bun run deployment:conformance -- \
   --object-connect-to opengeni-minio:9000:127.0.0.1:19000
 ```
 
+The object-storage check performs a browser-style `OPTIONS` preflight before
+the signed `PUT`. Managed and external buckets must allow direct upload CORS
+for the deployed web origin. Prefer exact HTTPS origins in production; use `*`
+only for disposable private verification stacks where signed URLs and the
+OpenGeni access key are the real access boundaries.
+
 The conformance command verifies API health, Prometheus metrics exposure, a real session run, event replay, SSE replay, manual scheduled-task dispatch, and file upload/download unless the corresponding `--skip-observability`, `--skip-agent`, `--skip-scheduled-tasks`, or `--skip-storage` flag is set.
 
 For Azure Blob-backed deployments, no object host rewrite should be needed because upload/download URLs are public Azure Blob SAS URLs:
@@ -444,6 +450,9 @@ It supports:
 - Managed Azure Blob storage when `object_storage.mode = "managed"` and `object_storage.api = "azure-blob"`.
 - Existing Azure Blob or S3-compatible object storage through runtime secrets.
 
+Set `object_storage.cors_allowed_origins` to every browser origin that will
+directly upload files to signed Blob URLs.
+
 Before applying anything in Azure:
 
 1. Add planned resources to `docs/azure-resource-ledger.md`.
@@ -464,6 +473,9 @@ The AWS Terraform root lives at `deploy/terraform/aws`.
 
 It supports EKS, ECR, S3, AWS Secrets Manager, optional RDS PostgreSQL, and existing Postgres/Temporal endpoints. Use `deploy/helm/opengeni/values.aws-managed.example.yaml` as the non-secret Helm values shape.
 
+Set `object_storage.cors_allowed_origins` to every browser origin that will
+directly upload files to signed S3 URLs.
+
 Before applying anything in AWS:
 
 1. Add planned resources to `docs/aws-resource-ledger.md`.
@@ -483,6 +495,9 @@ After apply, update the ledger with exact resources and cleanup commands.
 The GCP Terraform root lives at `deploy/terraform/gcp`.
 
 It supports GKE, Artifact Registry, GCS, Secret Manager, workload identity, optional Cloud SQL PostgreSQL, and existing Postgres/Temporal endpoints. Use `deploy/helm/opengeni/values.gcp-managed.example.yaml` as the non-secret Helm values shape.
+
+Set `object_storage.cors_allowed_origins` to every browser origin that will
+directly upload files to signed GCS URLs.
 
 Before applying anything in GCP:
 

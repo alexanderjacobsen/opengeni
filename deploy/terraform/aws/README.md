@@ -21,17 +21,19 @@ terraform -chdir=deploy/terraform/aws validate
 
 ## Apply
 
-Before creating resources, add planned names, region, and cleanup commands to `docs/aws-resource-ledger.md`.
+Before creating resources, decide where the operator will keep exact resource
+names, cleanup notes, and generated access material. Keep those records outside
+the repository along with Terraform state, plans, kubeconfigs, and filled
+tfvars.
 
 ```bash
 terraform -chdir=deploy/terraform/aws plan -var-file=terraform.tfvars
 terraform -chdir=deploy/terraform/aws apply -var-file=terraform.tfvars
 ```
 
-For temporary verification stacks, set `postgres.deletion_protection = false`
-and `postgres.skip_final_snapshot = true` before apply, and record that cleanup
-choice in `docs/aws-resource-ledger.md`. For production-like stacks, keep final
-snapshots and deletion protection enabled.
+For short-lived evaluation stacks, set `postgres.deletion_protection = false`
+and `postgres.skip_final_snapshot = true` before apply. For production-like
+stacks, keep final snapshots and deletion protection enabled.
 
 Do not commit state, kubeconfigs, generated database passwords, AWS credentials, or filled secret values.
 The official Temporal chart still needs durable Postgres databases prepared outside the OpenGeni app chart before Helm install.

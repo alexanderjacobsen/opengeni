@@ -1,8 +1,8 @@
 locals {
   tags = merge(var.tags, {
-    project = "opengeni"
-    owner   = "codex"
-    purpose = "deployment-verification"
+    project    = "opengeni"
+    managed_by = "terraform"
+    purpose    = "opengeni-deployment"
   })
 
   cluster_name = "${var.name_prefix}-eks"

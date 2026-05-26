@@ -38,13 +38,12 @@
     "deployment:runtime-artifacts": "bun scripts/deployment-runtime-artifacts.ts",
     "deployment:temporal-values": "bun scripts/deployment-temporal-values.ts",
     "deployment:conformance": "bun scripts/deployment-conformance.ts",
-    "deployment:ledger-check": "bun scripts/deployment-ledger-check.ts",
     "image:build:api": "docker build --platform ${OPENGENI_IMAGE_PLATFORM:-linux/amd64} -f docker/opengeni.Dockerfile --target api -t opengeni-api:local .",
     "image:build:worker": "docker build --platform ${OPENGENI_IMAGE_PLATFORM:-linux/amd64} -f docker/opengeni.Dockerfile --target worker -t opengeni-worker:local .",
     "image:build:web": "docker build --platform ${OPENGENI_IMAGE_PLATFORM:-linux/amd64} -f docker/opengeni.Dockerfile --target web -t opengeni-web:local .",
     "check": "bun run typecheck && bun run test:unit && cd apps/web && bun run build",
     "check:full": "bun run check && bun run test:integration && bun run test:e2e",
-    "prep": "bun run check:full && bun run deployment:ledger-check"
+    "prep": "bun run check:full"
   },
   "devDependencies": {
     "@opengeni/api": "workspace:*",

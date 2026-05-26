@@ -37,10 +37,6 @@ printList("Required secret keys", plan.requiredSecretKeys);
 printList("Deploy", plan.deployCommands);
 printList("Verify", plan.verifyCommands);
 printList("Destroy", plan.destroyCommands);
-if (plan.ledgerPath) {
-  console.log("");
-  console.log(`Ledger: ${plan.ledgerPath}`);
-}
 if (plan.terraformRoot) {
   console.log(`Terraform root: ${plan.terraformRoot}`);
 }

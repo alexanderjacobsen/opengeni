@@ -36,7 +36,7 @@ Then open the smallest source files that answer the question:
 - Worker/orchestration: `apps/worker/src/workflows/`, `apps/worker/src/activities/`.
 - Runtime/sandbox/tools: `packages/runtime/src/index.ts`.
 - Files/object storage: `apps/api/src/routes/files.ts`, `packages/storage/src/index.ts`.
-- Deployment goal and operator docs: `docs/infra-deployment-goal.md`, `docs/deployment.md`, `deploy/helm/opengeni`, and `deploy/terraform/`.
+- Deployment/operator sources: `packages/deployment`, `docs/deployment.md`, `deploy/helm/opengeni`, `deploy/terraform/`, and `deploy/stacks/`.
 - Documents/retrieval: `apps/api/src/routes/documents.ts`, `packages/documents/src/index.ts`, `apps/api/src/mcp/`.
 - GitHub integration: `apps/api/src/routes/github.ts`, `packages/github/src/index.ts`.
 - Web usage examples: `apps/web/src/api.ts`, `apps/web/src/types.ts`, relevant UI components.
@@ -47,9 +47,9 @@ If paths have moved, find concepts by symbol name, not by old paths:
 rg -n "CreateSessionRequest|ClientSessionEvent|sessionWorkflow|runAgentSegment|createSandboxClient|buildManifest|createObjectStorage|build.*McpServer|getSettings"
 ```
 
-## Client Integration Mode
+## Client Integration
 
-When the user is building an external client, SaaS integration, SDK wrapper, or UI on top of OpenGeni, read `references/client-integration.md`. Treat OpenGeni as a service boundary: the client creates sessions, streams/replays events, sends follow-up/control events, uploads files, selects resources/tools, and displays approvals/status. Do not require the client to know worker, Temporal, NATS, or sandbox internals except as concepts for status and product behavior.
+For external clients, SaaS integrations, SDK wrappers, or UIs on top of OpenGeni, read `references/client-integration.md`. Treat OpenGeni as a service boundary: the client creates sessions, streams/replays events, sends follow-up/control events, uploads files, selects resources/tools, and displays approvals/status. Do not require the client to know worker, Temporal, NATS, or sandbox internals except as concepts for status and product behavior.
 
 ## Mental Model
 
@@ -67,9 +67,9 @@ Keep these concepts straight while working:
 - **Object storage**: stores uploaded bytes. Database stores metadata/object keys. Sandbox file access is normally via manifest/mount/injection based on current runtime code.
 - **Scheduled task**: persisted schedule plus agent config that dispatches one or more session turns through Temporal scheduling.
 
-## Workflow For Architecture Or Documentation Tasks
+## Source Discovery Workflow
 
-When asked to explain OpenGeni, create a current picture from code:
+For architecture, documentation, implementation, debugging, or operational work, create a current picture from code:
 
 1. Read `AGENTS.md` and `README.md` for operator intent and warnings.
 2. Read contracts for names and public shapes.
@@ -82,7 +82,7 @@ When asked to explain OpenGeni, create a current picture from code:
 
 Do not rely on this skill for exact route lists, env var lists, event types, model names, or backend names. Re-discover those from contracts/config/routes every time exactness matters.
 
-## Workflow For Code Changes
+## Code Change Workflow
 
 Before editing, identify which layer owns the behavior:
 
@@ -110,7 +110,7 @@ Use the full local stack only when the task requires real Temporal/NATS/Postgres
 bun run dev
 ```
 
-For infrastructure and deployment work, keep `docs/infra-deployment-goal.md` current and keep operator-facing docs compact. Long evidence belongs in ledgers or audit notes, not in primary how-to docs.
+For infrastructure and deployment work, read `references/deployment-infrastructure.md`, `packages/deployment`, `docs/deployment.md`, `deploy/helm/opengeni`, `deploy/terraform/`, and `deploy/stacks/`. Keep public docs focused on reusable operator behavior, not private verification history or cloud-account-specific records.
 
 For production Kubernetes, use official upstream charts/operators or managed services for platform dependencies. OpenGeni's chart should own OpenGeni workloads and integration resources; built-in Postgres, Temporal, NATS, or MinIO templates are disposable conformance fixtures only and must not be described as the production path.
 
@@ -130,7 +130,7 @@ Do not claim a generic artifact system, write-back path, or live mid-session rem
 
 ## Sandbox Backend Discovery
 
-When asked about sandbox pluggability or adding a backend:
+For sandbox pluggability or adding a backend:
 
 1. Find the current `SandboxBackend` contract.
 2. Find config for backend-specific settings.
@@ -146,7 +146,7 @@ For sandbox configuration work, read `references/sandbox-configuration.md`. Use 
 
 ## Tools And MCP Discovery
 
-When asked about tools, distinguish:
+For tools and MCP work, distinguish:
 
 - MCP tool providers selected by session/turn/scheduled-task config.
 - First-party MCP servers exposed by the API.
@@ -157,7 +157,7 @@ Find current MCP behavior in config parsing, tool validation, runtime `prepareTo
 
 ## Scheduling Discovery
 
-When asked about queueing or scheduling:
+For queueing or scheduling work:
 
 1. Inspect turn queue state and claim logic.
 2. Inspect Temporal schedules and overlap policy mapping.

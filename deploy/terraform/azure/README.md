@@ -46,9 +46,12 @@ object_storage = {
 
 External mode means Terraform does not create that dependency. The Helm values or secret manager integration must still provide the runtime values expected by OpenGeni, such as `OPENGENI_OBJECT_STORAGE_AZURE_CONNECTION_STRING` for Azure Blob.
 
-## Resource Tracking
+## Resource Records
 
-Before applying this module, add the planned resource group and resource names to `docs/azure-resource-ledger.md`. After apply, update the ledger with exact names and cleanup commands.
+Before applying this module, decide where the operator will keep exact resource
+names, cleanup notes, and generated access material. Keep those records outside
+the repository along with Terraform state, plans, kubeconfigs, and filled
+tfvars.
 
 ## Safe Defaults
 
@@ -56,7 +59,7 @@ Before applying this module, add the planned resource group and resource names t
 - Default AKS node count is 2.
 - AKS node-pool upgrades default to Azure's standard `10%` max surge and can be overridden through the `aks` object.
 - If `aks.microsoft_defender_log_analytics_workspace_id` is set, Terraform enables the AKS Microsoft Defender block. The workspace ID field is ignored after creation because Azure may normalize resource ID casing in plan output.
-- Key Vault purge protection defaults to enabled for production-like usage. Disable it only for temporary verification resources that must be deleted immediately.
+- Key Vault purge protection defaults to enabled for production-like usage. Disable it only for short-lived evaluation resources that must be deleted immediately.
 - ACR pull role assignment defaults to enabled. Set `create_acr_pull_role_assignment = false` if the current Azure identity cannot create role assignments; in that case an operator with RBAC permissions must grant AKS `AcrPull` before private images can run.
 - Object storage defaults to managed Azure Blob for Azure reference deployments with private container access, nested public blob access disabled, blob versioning enabled, and seven-day blob/container delete retention. The sensitive connection string is exposed only as a sensitive Terraform output and should be written to Key Vault or a Kubernetes Secret, not source control.
 - Temporal can be `external` for Temporal Cloud/customer endpoints or `officialChart` for the stack-wrapper managed upstream Temporal chart. The chart still needs durable Postgres persistence prepared outside the OpenGeni app chart.
@@ -72,7 +75,7 @@ az role assignment create \
   --scope "$(az acr show --name "$(terraform output -raw acr_login_server | cut -d. -f1)" --query id -o tsv)"
 ```
 
-Until that is done, use a temporary Kubernetes image pull secret only for verification.
+Until that is done, use a temporary Kubernetes image pull secret only for private evaluation.
 
 ## Example
 

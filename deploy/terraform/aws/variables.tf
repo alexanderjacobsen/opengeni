@@ -72,7 +72,7 @@ variable "eks" {
 }
 
 variable "ecr_force_delete" {
-  description = "Whether to allow Terraform destroy to delete non-empty ECR repositories. Use true for short-lived verification environments."
+  description = "Whether to allow Terraform destroy to delete non-empty ECR repositories. Use true for short-lived evaluation environments."
   type        = bool
   default     = false
 }

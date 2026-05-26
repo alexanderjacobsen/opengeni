@@ -77,7 +77,7 @@ variable "artifact_registry_writer_members" {
 }
 
 variable "gke_admin_members" {
-  description = "IAM members allowed to administer the verification GKE cluster through Kubernetes API."
+  description = "IAM members allowed to administer the GKE cluster through Kubernetes API."
   type        = list(string)
   default     = []
 }

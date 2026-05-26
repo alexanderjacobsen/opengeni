@@ -12,8 +12,8 @@ bun run deployment:profiles
 
 Render a stack plan before creating anything. The plan lists resource classes,
 platform dependencies managed by wrapper commands, external dependencies,
-required secret keys, deploy commands, verification commands, destroy commands,
-and the provider ledger that must be updated:
+required secret keys, deploy commands, verification commands, and destroy
+commands:
 
 ```bash
 bun run deployment:stack -- --profile gcp-managed
@@ -45,13 +45,6 @@ For Azure managed Blob storage, the artifact generator can consume the
 sensitive Terraform output `object_storage_azure_connection_string` into the
 private `runtime.env` file. Keep the Terraform output JSON under `.agent/` or
 another ignored private path.
-
-Check provider ledgers for active rows without cleanup instructions and obvious
-secret-like table contents:
-
-```bash
-bun run deployment:ledger-check
-```
 
 Inspect required modes, environment variables, and checks:
 
@@ -91,7 +84,7 @@ bun run deployment:conformance -- \
 The object-storage check performs a browser-style `OPTIONS` preflight before
 the signed `PUT`. Managed and external buckets must allow direct upload CORS
 for the deployed web origin. Prefer exact HTTPS origins in production; use `*`
-only for disposable private verification stacks where signed URLs and the
+only for disposable private evaluation stacks where signed URLs and the
 OpenGeni access key are the real access boundaries.
 
 The conformance command verifies API health, Prometheus metrics exposure, a real session run, event replay, SSE replay, manual scheduled-task dispatch, and file upload/download unless the corresponding `--skip-observability`, `--skip-agent`, `--skip-scheduled-tasks`, or `--skip-storage` flag is set.
@@ -263,8 +256,7 @@ Postgres admin user `opengeni` and asks the upstream Temporal schema jobs to
 create/manage the `temporal` and `temporal_visibility` databases. Create a
 Kubernetes Secret named `opengeni-temporal-postgres` in `opengeni-platform`
 with that user's password. Keep that database server and secret outside the
-OpenGeni app chart lifecycle and record any cloud resources in the provider
-ledger.
+OpenGeni app chart lifecycle.
 Use `TEMPORAL_POSTGRES_CONNECT_ADDR=host:port` instead of
 `TEMPORAL_POSTGRES_HOST` when the provider-specific connection endpoint already
 includes a port or needs a proxy-local address.
@@ -455,7 +447,7 @@ directly upload files to signed Blob URLs.
 
 Before applying anything in Azure:
 
-1. Add planned resources to `docs/azure-resource-ledger.md`.
+1. Keep provider resource names and cleanup notes in private operator-controlled storage outside the repository.
 2. Keep secrets in local env files, Key Vault, or Terraform variables that are not committed.
 3. Run:
 
@@ -465,7 +457,7 @@ terraform -chdir=deploy/terraform/azure validate
 terraform -chdir=deploy/terraform/azure plan
 ```
 
-After apply, update the ledger with exact resources and cleanup commands.
+After apply, save exact resource names and cleanup commands outside the repository.
 
 ## AWS Reference
 
@@ -478,7 +470,7 @@ directly upload files to signed S3 URLs.
 
 Before applying anything in AWS:
 
-1. Add planned resources to `docs/aws-resource-ledger.md`.
+1. Keep provider resource names and cleanup notes in private operator-controlled storage outside the repository.
 2. Keep secrets in local env files, AWS Secrets Manager, or uncommitted Terraform variables.
 3. Run:
 
@@ -488,7 +480,7 @@ terraform -chdir=deploy/terraform/aws validate
 terraform -chdir=deploy/terraform/aws plan
 ```
 
-After apply, update the ledger with exact resources and cleanup commands.
+After apply, save exact resource names and cleanup commands outside the repository.
 
 ## GCP Reference
 
@@ -501,7 +493,7 @@ directly upload files to signed GCS URLs.
 
 Before applying anything in GCP:
 
-1. Add planned resources to `docs/gcp-resource-ledger.md`.
+1. Keep provider resource names and cleanup notes in private operator-controlled storage outside the repository.
 2. Keep secrets in local env files, Secret Manager, or uncommitted Terraform variables.
 3. Run:
 
@@ -511,7 +503,7 @@ terraform -chdir=deploy/terraform/gcp validate
 terraform -chdir=deploy/terraform/gcp plan
 ```
 
-After apply, update the ledger with exact resources and cleanup commands.
+After apply, save exact resource names and cleanup commands outside the repository.
 
 ## Previews
 
@@ -541,4 +533,6 @@ A deployment is not acceptable until it proves:
 - A scheduled task can be created, manually triggered through Temporal, dispatch a session, and be cleaned up.
 - Logs, metrics, and traces carry enough correlation data for production debugging.
 
-The strict completion criteria live in `docs/infra-deployment-goal.md`.
+Use `bun run deployment:stack`, `bun run deployment:preflight`, provider
+Terraform validation, Helm rendering, and this conformance suite as the merge
+and release gate for deployment changes.

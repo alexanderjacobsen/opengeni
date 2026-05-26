@@ -297,7 +297,6 @@ export interface PreflightCheck {
 
 export interface DeploymentStackPlan {
   profile: DeploymentProfileId;
-  ledgerPath: string | null;
   terraformRoot: string | null;
   helmValuesFile: string | null;
   platformDependencies: PlatformDependencyPlan[];
@@ -728,7 +727,6 @@ export function missingRuntimeEnvVars(
 
 export function stackPlanFor(contract: DeploymentContract): DeploymentStackPlan {
   const terraformRoot = terraformRootFor(contract);
-  const ledgerPath = ledgerPathFor(contract);
   const helmValuesFile = helmValuesFileFor(contract);
   const platformDependencies = platformDependencyPlans(contract);
   const requiredSecretKeys = [
@@ -737,7 +735,6 @@ export function stackPlanFor(contract: DeploymentContract): DeploymentStackPlan 
   ];
   return {
     profile: contract.profile,
-    ledgerPath,
     terraformRoot,
     helmValuesFile,
     platformDependencies,
@@ -800,13 +797,6 @@ function terraformRootFor(contract: DeploymentContract): string | null {
     return null;
   }
   return `deploy/terraform/${contract.runtime.cloud}`;
-}
-
-function ledgerPathFor(contract: DeploymentContract): string | null {
-  if (contract.runtime.cloud === "azure") return "docs/azure-resource-ledger.md";
-  if (contract.runtime.cloud === "aws") return "docs/aws-resource-ledger.md";
-  if (contract.runtime.cloud === "gcp") return "docs/gcp-resource-ledger.md";
-  return null;
 }
 
 function helmValuesFileFor(contract: DeploymentContract): string | null {
@@ -1066,8 +1056,8 @@ function usesOfficialPlatformChart(contract: DeploymentContract, id: PlatformDep
 
 function planNotes(contract: DeploymentContract): string[] {
   const notes = [
-    "Record planned resources in the provider ledger before apply and update deletion status after teardown.",
-    "Do not commit Terraform state, tfvars with secrets, kubeconfigs, generated credentials, or access keys.",
+    "Keep provider resource names, generated credentials, kubeconfigs, Terraform state, and filled tfvars in private operator-controlled storage outside the repository.",
+    "Use the generated destroy commands as the baseline cleanup path for environments created from this plan.",
   ];
   if (contract.access.mode === "sharedKey") {
     notes.push("Generate OPENGENI_ACCESS_KEY outside source control and provide it through the runtime secret path.");

@@ -176,10 +176,9 @@ describe("deployment contract", () => {
     expect(missing).toContain("OPENGENI_OBJECT_STORAGE_AZURE_CONNECTION_STRING");
   });
 
-  test("renders stack plans with deploy, verify, destroy, and ledger evidence", () => {
+  test("renders stack plans with deploy, verify, and destroy commands", () => {
     const plan = stackPlanFor(deploymentProfiles["gcp-managed"]);
 
-    expect(plan.ledgerPath).toBe("docs/gcp-resource-ledger.md");
     expect(plan.terraformRoot).toBe("deploy/terraform/gcp");
     expect(plan.helmValuesFile).toBe("deploy/helm/opengeni/values.gcp-managed.example.yaml");
     expect(plan.platformDependencies.map((dependency) => dependency.id)).toEqual(["nats", "temporal"]);
@@ -221,17 +220,17 @@ describe("deployment contract", () => {
 
   test("generates private runtime artifacts from GCP Terraform outputs without hand-editing Helm paths", () => {
     const artifacts = generateRuntimeArtifacts(deploymentProfiles["gcp-managed"], {
-      project_id: { value: "opengeni-verification" },
+      project_id: { value: "opengeni-example" },
       region: { value: "us-central1" },
       temporal_host: { value: "opengeni-temporal-frontend.opengeni-platform.svc.cluster.local:7233" },
       temporal_namespace: { value: "default" },
       temporal_task_queue: { value: "opengeni-runs-ts" },
-      object_storage_bucket: { value: "opengeni-verification-ogv-files" },
+      object_storage_bucket: { value: "opengeni-example-files" },
       helm_set_values: {
         value: {
-          "global.imageRegistry": "us-central1-docker.pkg.dev/opengeni-verification/opengeni",
-          "serviceAccount.annotations.iam\\.gke\\.io/gcp-service-account": "opengeni-runtime@opengeni-verification.iam.gserviceaccount.com",
-          "config.OPENGENI_OBJECT_STORAGE_BUCKET": "opengeni-verification-ogv-files",
+          "global.imageRegistry": "us-central1-docker.pkg.dev/opengeni-example/opengeni",
+          "serviceAccount.annotations.iam\\.gke\\.io/gcp-service-account": "opengeni-runtime@opengeni-example.iam.gserviceaccount.com",
+          "config.OPENGENI_OBJECT_STORAGE_BUCKET": "opengeni-example-files",
         },
       },
     }, {
@@ -241,12 +240,12 @@ describe("deployment contract", () => {
     });
 
     expect(artifacts.missingEnvVars).toEqual([]);
-    expect(artifacts.helmValuesYaml).toContain("imageRegistry: \"us-central1-docker.pkg.dev/opengeni-verification/opengeni\"");
+    expect(artifacts.helmValuesYaml).toContain("imageRegistry: \"us-central1-docker.pkg.dev/opengeni-example/opengeni\"");
     expect(artifacts.helmValuesYaml).toContain("tag: \"test-sha\"");
     expect(artifacts.helmValuesYaml).toContain("digest: \"\"");
-    expect(artifacts.helmValuesYaml).toContain("iam.gke.io/gcp-service-account: \"opengeni-runtime@opengeni-verification.iam.gserviceaccount.com\"");
+    expect(artifacts.helmValuesYaml).toContain("iam.gke.io/gcp-service-account: \"opengeni-runtime@opengeni-example.iam.gserviceaccount.com\"");
     expect(artifacts.runtimeEnv).toContain("OPENGENI_OBJECT_STORAGE_BACKEND=gcs");
-    expect(artifacts.runtimeEnv).toContain("OPENGENI_OBJECT_STORAGE_GCS_PROJECT_ID=opengeni-verification");
+    expect(artifacts.runtimeEnv).toContain("OPENGENI_OBJECT_STORAGE_GCS_PROJECT_ID=opengeni-example");
     expect(artifacts.runtimeEnv).toContain("OPENGENI_NATS_URL=nats://opengeni-nats.opengeni-platform.svc.cluster.local:4222");
     expect(artifacts.summary.secretNames).toContain("opengeni-runtime");
   });

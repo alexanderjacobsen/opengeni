@@ -107,10 +107,8 @@ End-to-end agent runs require the full stack plus valid model and sandbox creden
 
 ## Deployment Work Notes
 
-When working on production deployment, Azure/AWS/GCP deployment, Helm, Terraform, conformance checks, preview environments, observability, or cloud-provider-agnostic infrastructure, read and keep `docs/infra-deployment-goal.md` current. Treat it as the source of truth for the active infrastructure end goal.
+When working on production deployment, Azure/AWS/GCP deployment, Helm, Terraform, conformance checks, preview environments, observability, or cloud-provider-agnostic infrastructure, treat the source as authoritative: deployment contracts in `packages/deployment`, the Helm chart under `deploy/helm/opengeni`, Terraform roots under `deploy/terraform`, stack wrappers under `deploy/stacks`, and operator docs in `docs/deployment.md`.
 
-Track every Azure resource created for deployment verification in `docs/azure-resource-ledger.md` before or immediately after creation. Do not commit Azure secrets, kubeconfigs, Terraform state, local tfvars, generated credentials, or private endpoints that are not intentionally documented examples.
-
-Track every AWS resource created for deployment verification in `docs/aws-resource-ledger.md` before or immediately after creation. Track every GCP resource created for deployment verification in `docs/gcp-resource-ledger.md` before or immediately after creation. Do not commit AWS/GCP secrets, kubeconfigs, Terraform state, local tfvars, generated credentials, service-account keys, or private endpoints that are not intentionally documented examples.
+Keep provider resource inventories, cleanup notes, cloud account identifiers, private endpoints, generated credentials, kubeconfigs, Terraform state, plans, local tfvars, service-account keys, and access keys in private operator-controlled storage outside the repository.
 
 Use official upstream charts/operators or managed services for production platform services. OpenGeni's chart should own OpenGeni API, web, worker, migrations, and integration resources. Built-in Postgres, Temporal, NATS, and MinIO templates are disposable conformance fixtures for local, CI, preview, and smoke verification only; do not present them as lightweight production alternatives.

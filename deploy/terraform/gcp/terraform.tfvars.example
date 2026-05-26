@@ -10,13 +10,13 @@ gke = {
   min_node_count      = 1
   max_node_count      = 2
   # Optional: constrain a regional cluster's node pool to specific zones for
-  # temporary verification stacks. Omit for multi-zone production resilience.
+  # short-lived evaluation stacks. Omit for multi-zone production resilience.
   # node_locations = ["us-central1-a"]
 }
 
 labels = {
-  environment = "verification"
-  cleanup     = "delete-after-validation"
+  environment = "example"
+  lifecycle   = "temporary"
 }
 
 artifact_registry_writer_members = [
@@ -52,7 +52,7 @@ object_storage = {
   mode          = "managed"
   force_destroy = true
   # Required for direct browser uploads to signed GCS URLs. Prefer exact
-  # HTTPS app origins; "*" is acceptable only for private verification stacks.
+  # HTTPS app origins; "*" is acceptable only for short-lived private evaluation stacks.
   cors_allowed_origins = ["https://opengeni.example.com"]
 
   # In external mode, set bucket to an existing GCS bucket name.

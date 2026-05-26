@@ -165,7 +165,7 @@ For Modal runs, configure the Modal sandbox variables in `.env.example`.
 
 ## Deployment
 
-The deployment foundation is tracked in `docs/infra-deployment-goal.md` and the operator guide is in `docs/deployment.md`.
+The operator guide is in `docs/deployment.md`.
 
 Current deployment artifacts include:
 
@@ -183,7 +183,7 @@ bun run deployment:preflight -- --profile azure-existing-services
 bun run deployment:stack -- --profile gcp-managed
 ```
 
-Production operators should use managed services, existing endpoints, or official upstream charts/operators for Postgres, Temporal, NATS, secret delivery, ingress/TLS, and observability. The in-chart Postgres, Temporal, NATS, and MinIO templates are only for local, CI, preview, and smoke verification. Azure, AWS, and GCP resources created during deployment verification must be tracked in their provider ledgers under `docs/`.
+Production operators should use managed services, existing endpoints, or official upstream charts/operators for Postgres, Temporal, NATS, secret delivery, ingress/TLS, and observability. The in-chart Postgres, Temporal, NATS, and MinIO templates are only for local, CI, preview, and smoke verification. Keep cloud resource inventories, generated credentials, kubeconfigs, Terraform state, and filled tfvars in private operator-controlled storage outside the repository.
 
 ## Web App
 

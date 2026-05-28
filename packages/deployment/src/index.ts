@@ -1001,7 +1001,7 @@ function platformDependencyPlans(contract: DeploymentContract): PlatformDependen
     const temporalTlsPrepCommands = contract.runtime.cloud === "aws"
       ? [
         `curl -fsSL https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem -o .agent/generated/${contract.profile}/rds-global-bundle.pem`,
-        "kubectl -n opengeni-platform create configmap opengeni-postgres-ca --from-file=ca.pem=.agent/generated/${contract.profile}/rds-global-bundle.pem --dry-run=client -o yaml | kubectl apply -f -",
+        `kubectl -n opengeni-platform create configmap opengeni-postgres-ca --from-file=ca.pem=.agent/generated/${contract.profile}/rds-global-bundle.pem --dry-run=client -o yaml | kubectl apply -f -`,
       ]
       : [];
     out.push({

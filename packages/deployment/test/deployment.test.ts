@@ -209,6 +209,14 @@ describe("deployment contract", () => {
     expect(plan.destroyCommands.at(-1)).toContain("terraform -chdir=deploy/terraform/gcp destroy");
   });
 
+  test("renders AWS Temporal TLS commands with concrete generated paths", () => {
+    const plan = stackPlanFor(deploymentProfiles["aws-managed"]);
+    const commands = plan.deployCommands.join("\n");
+
+    expect(commands).toContain(".agent/generated/aws-managed/rds-global-bundle.pem");
+    expect(commands).not.toContain("${contract.profile}");
+  });
+
   test("does not plan cloud substrate for existing-service profiles", () => {
     const plan = stackPlanFor(deploymentProfiles["aws-existing-services"]);
 

@@ -233,6 +233,64 @@ export async function streamSessionEvents(
   sessionId: string,
   after: number,
   onEvent: (event: SessionEvent) => void,
+  signalOrOptions?: AbortSignal | StreamSessionEventsOptions,
+): Promise<void> {
+  const options = normalizeStreamOptions(signalOrOptions);
+  const baseDelayMs = options.reconnectDelayMs ?? 500;
+  const maxDelayMs = options.maxReconnectDelayMs ?? 5000;
+  const signal = options.signal;
+  let cursor = after;
+  let retryDelayMs = baseDelayMs;
+
+  while (!signal?.aborted) {
+    options.onState?.("connecting");
+    try {
+      await readSessionEventStream(sessionId, cursor, (event) => {
+        cursor = Math.max(cursor, event.sequence);
+        retryDelayMs = baseDelayMs;
+        options.onState?.("live");
+        onEvent(event);
+      }, signal);
+      if (signal?.aborted) {
+        break;
+      }
+    } catch (error) {
+      if (signal?.aborted || isAbortError(error)) {
+        break;
+      }
+      if (!isRetryableStreamError(error)) {
+        options.onState?.("error");
+        throw error;
+      }
+      options.onState?.("error");
+    }
+
+    options.onState?.("connecting");
+    await waitForReconnect(retryDelayMs, signal);
+    retryDelayMs = nextReconnectDelay(retryDelayMs, baseDelayMs, maxDelayMs);
+  }
+}
+
+type StreamConnectionState = "connecting" | "live" | "error";
+
+type StreamSessionEventsOptions = {
+  signal?: AbortSignal;
+  reconnectDelayMs?: number;
+  maxReconnectDelayMs?: number;
+  onState?: (state: StreamConnectionState) => void;
+};
+
+class SessionStreamHttpError extends Error {
+  constructor(readonly status: number, text: string) {
+    super(`API ${status}: ${text}`);
+    this.name = "SessionStreamHttpError";
+  }
+}
+
+async function readSessionEventStream(
+  sessionId: string,
+  after: number,
+  onEvent: (event: SessionEvent) => void,
   signal?: AbortSignal,
 ): Promise<void> {
   const response = await fetch(streamUrl(sessionId, after), {
@@ -241,30 +299,87 @@ export async function streamSessionEvents(
   });
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`API ${response.status}: ${text}`);
+    throw new SessionStreamHttpError(response.status, text);
   }
   if (!response.body) {
     throw new Error("SSE response did not include a readable body");
   }
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
   let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
-    buffer += value;
-    let separator = buffer.indexOf("\n\n");
-    while (separator !== -1) {
-      const block = buffer.slice(0, separator);
-      buffer = buffer.slice(separator + 2);
-      const event = parseSseEvent(block);
-      if (event) {
-        onEvent(event);
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
       }
-      separator = buffer.indexOf("\n\n");
+      buffer += value;
+      let separator = buffer.indexOf("\n\n");
+      while (separator !== -1) {
+        const block = buffer.slice(0, separator);
+        buffer = buffer.slice(separator + 2);
+        const event = parseSseEvent(block);
+        if (event) {
+          onEvent(event);
+        }
+        separator = buffer.indexOf("\n\n");
+      }
     }
+  } finally {
+    reader.releaseLock();
   }
+}
+
+function normalizeStreamOptions(signalOrOptions?: AbortSignal | StreamSessionEventsOptions): StreamSessionEventsOptions {
+  if (!signalOrOptions) {
+    return {};
+  }
+  if (isAbortSignal(signalOrOptions)) {
+    return { signal: signalOrOptions };
+  }
+  return signalOrOptions;
+}
+
+function isAbortSignal(value: unknown): value is AbortSignal {
+  return typeof value === "object"
+    && value !== null
+    && "aborted" in value
+    && "addEventListener" in value;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
+function isRetryableStreamError(error: unknown): boolean {
+  if (error instanceof SessionStreamHttpError) {
+    return error.status === 408 || error.status === 409 || error.status === 425 || error.status === 429 || error.status >= 500;
+  }
+  return error instanceof TypeError;
+}
+
+function nextReconnectDelay(currentDelayMs: number, baseDelayMs: number, maxDelayMs: number): number {
+  if (maxDelayMs <= baseDelayMs) {
+    return maxDelayMs;
+  }
+  return Math.min(Math.max(currentDelayMs * 2, baseDelayMs), maxDelayMs);
+}
+
+async function waitForReconnect(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(done, Math.max(0, delayMs));
+    const onAbort = () => {
+      clearTimeout(timeout);
+      done();
+    };
+    function done() {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function parseSseEvent(block: string): SessionEvent | null {

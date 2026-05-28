@@ -2757,12 +2757,13 @@ function useSessionStream(
       onStateRef.current?.("closed");
       return;
     }
-    onStateRef.current?.("connecting");
     const abort = new AbortController();
     void streamSessionEvents(sessionId, after, (event) => {
-      onStateRef.current?.("live");
       onEventsRef.current([event]);
-    }, abort.signal).catch((error) => {
+    }, {
+      signal: abort.signal,
+      onState: (state) => onStateRef.current?.(state),
+    }).catch((error) => {
       if (!abort.signal.aborted) {
         onStateRef.current?.("error");
         toast.error("Event stream disconnected", { description: error instanceof Error ? error.message : String(error) });

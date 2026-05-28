@@ -6,8 +6,10 @@ import {
   configuredAllowedReasoningEfforts,
   getSettings,
   parseMcpServers,
+  retryStartupDependency,
   sandboxEnvironmentVariableNames,
   sandboxLifecycleHookIds,
+  startupRetryOptions,
 } from "../src";
 
 describe("sandbox preparation profiles", () => {
@@ -80,6 +82,81 @@ describe("sandbox preparation profiles", () => {
     };
     expect(configuredAllowedModels(settings)).toEqual(["custom-model", "gpt-5.5"]);
     expect(configuredAllowedReasoningEfforts(settings)).toEqual(["xhigh", "low", "medium", "high"]);
+  });
+
+  test("parses startup dependency retry settings", () => {
+    const settings = withEnv({
+      OPENGENI_STARTUP_DEPENDENCY_RETRY_ATTEMPTS: "5",
+      OPENGENI_STARTUP_DEPENDENCY_RETRY_INITIAL_DELAY_MS: "10",
+      OPENGENI_STARTUP_DEPENDENCY_RETRY_MAX_DELAY_MS: "50",
+    }, () => getSettings());
+    expect(startupRetryOptions(settings)).toEqual({
+      attempts: 5,
+      initialDelayMs: 10,
+      maxDelayMs: 50,
+    });
+  });
+
+  test("parses boolean environment values without treating false as true", () => {
+    const settings = withEnv({
+      OPENGENI_OBSERVABILITY_STRUCTURED_LOGS: "false",
+      OPENGENI_OBSERVABILITY_METRICS_ENABLED: "true",
+      OPENGENI_DISABLE_OPENAI_TRACING: "false",
+      OPENGENI_OBJECT_STORAGE_FORCE_PATH_STYLE: "0",
+      OPENGENI_AUTH_REQUIRED: "true",
+      OPENGENI_ACCESS_KEY: "test-access-key",
+      OPENGENI_AUTH_ALLOW_HEALTH: "yes",
+      OPENGENI_AUTH_ALLOW_METRICS: "no",
+    }, () => getSettings());
+
+    expect(settings.observabilityStructuredLogs).toBe(false);
+    expect(settings.observabilityMetricsEnabled).toBe(true);
+    expect(settings.disableOpenaiTracing).toBe(false);
+    expect(settings.objectStorageForcePathStyle).toBe(false);
+    expect(settings.authRequired).toBe(true);
+    expect(settings.accessKey).toBe("test-access-key");
+    expect(settings.authAllowHealth).toBe(true);
+    expect(settings.authAllowMetrics).toBe(false);
+  });
+
+  test("requires an access key when shared-key auth is enabled", () => {
+    expect(() => withEnv({
+      OPENGENI_AUTH_REQUIRED: "true",
+    }, () => getSettings())).toThrow("OPENGENI_ACCESS_KEY is required");
+  });
+
+  test("retries startup dependency operations with bounded backoff", async () => {
+    const retries: string[] = [];
+    let calls = 0;
+    const result = await retryStartupDependency("NATS", async () => {
+      calls += 1;
+      if (calls < 3) {
+        throw new Error(`not ready ${calls}`);
+      }
+      return "connected";
+    }, {
+      attempts: 4,
+      initialDelayMs: 0,
+      maxDelayMs: 0,
+      onRetry: (event) => retries.push(`${event.label}:${event.attempt}/${event.attempts}:${event.delayMs}`),
+    });
+
+    expect(result).toBe("connected");
+    expect(calls).toBe(3);
+    expect(retries).toEqual(["NATS:1/4:0", "NATS:2/4:0"]);
+  });
+
+  test("throws the final startup dependency error after all attempts fail", async () => {
+    let calls = 0;
+    await expect(retryStartupDependency("Temporal", async () => {
+      calls += 1;
+      throw new Error("still down");
+    }, {
+      attempts: 2,
+      initialDelayMs: 0,
+      maxDelayMs: 0,
+    })).rejects.toThrow("still down");
+    expect(calls).toBe(2);
   });
 
   test("collects git identity settings for sandbox pass-through", () => {
@@ -155,6 +232,14 @@ describe("sandbox preparation profiles", () => {
     });
   });
 
+  test("derives built-in document MCP URL from OPENGENI_MCP_URL", () => {
+    const settings = withEnv({
+      OPENGENI_MCP_URL: "http://opengeni-api.opengeni.svc.cluster.local:8000/v1/mcp",
+    }, () => getSettings());
+    expect(settings.mcpServers.find((server) => server.id === "opengeni")?.url).toBe("http://opengeni-api.opengeni.svc.cluster.local:8000/v1/mcp");
+    expect(settings.mcpServers.find((server) => server.id === "docs")?.url).toBe("http://opengeni-api.opengeni.svc.cluster.local:8000/v1/mcp/docs");
+  });
+
   test("does not duplicate a custom files MCP profile", () => {
     withEnv({
       OPENGENI_MCP_SERVERS: '[{"id":"files","name":"Custom Files","url":"http://127.0.0.1:8787/mcp","allowedTools":["custom_download"]}]',
@@ -190,11 +275,13 @@ describe("sandbox preparation profiles", () => {
 
   test("parses object storage settings and rejects incomplete credentials", () => {
     withEnv({
+      OPENGENI_OBJECT_STORAGE_BACKEND: "s3-compatible",
       OPENGENI_OBJECT_STORAGE_ENDPOINT: "http://127.0.0.1:9000",
       OPENGENI_OBJECT_STORAGE_ACCESS_KEY_ID: "minioadmin",
       OPENGENI_OBJECT_STORAGE_SECRET_ACCESS_KEY: "minioadmin",
     }, () => {
       const settings = getSettings();
+      expect(settings.objectStorageBackend).toBe("s3-compatible");
       expect(settings.objectStorageEndpoint).toBe("http://127.0.0.1:9000");
       expect(settings.objectStorageBucket).toBe("opengeni-files");
       expect(settings.objectStorageForcePathStyle).toBe(true);
@@ -205,6 +292,78 @@ describe("sandbox preparation profiles", () => {
       OPENGENI_OBJECT_STORAGE_ACCESS_KEY_ID: "minioadmin",
     }, () => {
       expect(() => getSettings()).toThrow("both be set or both omitted");
+    });
+  });
+
+  test("parses Azure Blob object storage settings", () => {
+    withEnv({
+      OPENGENI_OBJECT_STORAGE_BACKEND: "azure-blob",
+      OPENGENI_OBJECT_STORAGE_BUCKET: "opengeni-files",
+      OPENGENI_OBJECT_STORAGE_AZURE_ACCOUNT_NAME: "opengeni",
+      OPENGENI_OBJECT_STORAGE_AZURE_ACCOUNT_KEY: "storage-key",
+    }, () => {
+      const settings = getSettings();
+      expect(settings.objectStorageBackend).toBe("azure-blob");
+      expect(settings.objectStorageBucket).toBe("opengeni-files");
+      expect(settings.objectStorageAzureAccountName).toBe("opengeni");
+      expect(settings.objectStorageAzureAccountKey).toBe("storage-key");
+    });
+
+    withEnv({
+      OPENGENI_OBJECT_STORAGE_BACKEND: "azure-blob",
+    }, () => {
+      expect(() => getSettings()).toThrow("Azure Blob storage requires");
+    });
+
+    withEnv({
+      OPENGENI_OBJECT_STORAGE_BACKEND: "azure-blob",
+      OPENGENI_OBJECT_STORAGE_ENDPOINT: "http://127.0.0.1:9000",
+      OPENGENI_OBJECT_STORAGE_ACCESS_KEY_ID: "minioadmin",
+      OPENGENI_OBJECT_STORAGE_SECRET_ACCESS_KEY: "minioadmin",
+      OPENGENI_OBJECT_STORAGE_AZURE_CONNECTION_STRING: "UseDevelopmentStorage=true",
+    }, () => {
+      expect(() => getSettings()).toThrow("Azure Blob storage uses OPENGENI_OBJECT_STORAGE_AZURE");
+    });
+  });
+
+  test("parses native AWS S3 object storage without static key assumptions", () => {
+    withEnv({
+      OPENGENI_OBJECT_STORAGE_BACKEND: "aws-s3",
+      OPENGENI_OBJECT_STORAGE_BUCKET: "opengeni-files",
+      OPENGENI_OBJECT_STORAGE_REGION: "us-east-1",
+    }, () => {
+      const settings = getSettings();
+      expect(settings.objectStorageBackend).toBe("aws-s3");
+      expect(settings.objectStorageBucket).toBe("opengeni-files");
+      expect(settings.objectStorageRegion).toBe("us-east-1");
+      expect(settings.objectStorageAccessKeyId).toBeUndefined();
+    });
+  });
+
+  test("parses GCS object storage settings and validates inline credentials JSON", () => {
+    withEnv({
+      OPENGENI_OBJECT_STORAGE_BACKEND: "gcs",
+      OPENGENI_OBJECT_STORAGE_BUCKET: "opengeni-files",
+      OPENGENI_OBJECT_STORAGE_GCS_PROJECT_ID: "opengeni-test",
+    }, () => {
+      const settings = getSettings();
+      expect(settings.objectStorageBackend).toBe("gcs");
+      expect(settings.objectStorageBucket).toBe("opengeni-files");
+      expect(settings.objectStorageGcsProjectId).toBe("opengeni-test");
+    });
+
+    withEnv({
+      OPENGENI_OBJECT_STORAGE_BACKEND: "gcs",
+      OPENGENI_OBJECT_STORAGE_GCS_CREDENTIALS_JSON: "not-json",
+    }, () => {
+      expect(() => getSettings()).toThrow("GCS_CREDENTIALS_JSON must be valid JSON");
+    });
+
+    withEnv({
+      OPENGENI_OBJECT_STORAGE_BACKEND: "gcs",
+      OPENGENI_OBJECT_STORAGE_ENDPOINT: "http://127.0.0.1:9000",
+    }, () => {
+      expect(() => getSettings()).toThrow("GCS object storage uses OPENGENI_OBJECT_STORAGE_GCS");
     });
   });
 

@@ -28,9 +28,9 @@ This repository is early, but it now includes the baseline files expected for pu
 
 ## Public Preview / Security Boundary
 
-OpenGeni is intended to be self-hosted behind a trusted product, gateway, VPN, or reverse proxy. The base API does not yet ship built-in authentication, tenancy, RBAC, API keys, or scoped client permissions.
+OpenGeni is intended to be self-hosted behind a trusted product, gateway, VPN, or reverse proxy. The base API includes a deliberately small shared-key access boundary for early self-hosted deployments and smoke tests: set `OPENGENI_AUTH_REQUIRED=true` and provide `OPENGENI_ACCESS_KEY` through a secret. The browser stores that key only client-side and sends it as `Authorization: Bearer ...`; automation can also use `X-OpenGeni-Access-Key`.
 
-Do not expose the API or worker control plane directly to the public internet without an external access-control layer. Sandbox preparation profiles and env allowlists can make host credentials available to agent sandboxes, so review `.env` before running live sessions.
+This is not a replacement for product-grade authentication, tenancy, RBAC, audit policy, quotas, or per-user scoped permissions. Do not expose the API or worker control plane directly to the public internet without at least the shared-key boundary and, for production, an external access-control layer. Sandbox preparation profiles and env allowlists can make host credentials available to agent sandboxes, so review `.env` before running live sessions.
 
 ## Architecture
 
@@ -77,7 +77,7 @@ Temporal coordinates the work, but token streams and tool output do not go throu
 - Temporal worker
 - Postgres with Drizzle and pgvector
 - NATS Core realtime bus
-- MinIO for local S3-compatible file storage
+- MinIO for local S3-compatible file storage and Azure Blob, AWS S3, or GCS for production object storage
 - OpenAI Agents SDK
 - Docker and Modal sandbox backends
 
@@ -128,6 +128,7 @@ Copy `.env.example` to `.env` and configure at least:
 - `OPENGENI_DATABASE_URL`
 - `OPENGENI_NATS_URL`
 - `OPENGENI_TEMPORAL_HOST`
+- `OPENGENI_STARTUP_DEPENDENCY_RETRY_*` if dependencies need longer startup windows
 - `OPENGENI_OPENAI_PROVIDER`
 - OpenAI or Azure OpenAI credentials
 - `OPENGENI_SANDBOX_BACKEND`
@@ -135,16 +136,54 @@ Copy `.env.example` to `.env` and configure at least:
 
 If you are migrating from the pre-OpenGeni codebase, move the old `.env` aside and create a fresh one from `.env.example`; old `INFRA_AGENT_*` names are no longer read.
 
-For local MinIO, keep both object-storage endpoints:
+For local MinIO, keep S3-compatible storage and both object-storage endpoints:
 
 ```bash
+OPENGENI_OBJECT_STORAGE_BACKEND=s3-compatible
 OPENGENI_OBJECT_STORAGE_ENDPOINT=http://127.0.0.1:9000
-OPENGENI_OBJECT_STORAGE_SANDBOX_ENDPOINT=http://host.docker.internal:9000
+OPENGENI_OBJECT_STORAGE_SANDBOX_ENDPOINT=http://minio:9000
+OPENGENI_DOCKER_NETWORK=opengeni_default
 ```
 
-The first endpoint is for the host, browser, and API. The sandbox endpoint is for Docker agent containers, where `127.0.0.1` points at the sandbox container instead of host MinIO. Presigned URLs generated for one host are not safely interchangeable with the other because the host is part of the S3 signature.
+The first endpoint is for the host, browser, and API. The sandbox endpoint is for Docker agent containers joined to the local Compose network, where `minio:9000` resolves to the MinIO service. Presigned URLs generated for one host are not safely interchangeable with the other because the host is part of the S3 signature.
+
+`bun run dev` auto-selects alternate Docker Compose host ports when common defaults such as `5432` are already in use, and it rewrites the in-memory runtime URLs for that run. Set `OPENGENI_*_HOST_PORT` values in `.env` when you need fixed local ports.
+
+For production deployments, use the native provider object store instead of running MinIO manually:
+
+```bash
+OPENGENI_OBJECT_STORAGE_BACKEND=azure-blob
+OPENGENI_OBJECT_STORAGE_BUCKET=opengeni-files
+OPENGENI_OBJECT_STORAGE_AZURE_CONNECTION_STRING=...
+```
+
+`OPENGENI_OBJECT_STORAGE_BUCKET` maps to the Azure Blob container. The API uses SAS URLs for browser upload/download and server-side reads for document indexing. Docker/local sandboxes mount Azure Blob through rclone; Modal sandboxes receive attached Azure Blob files through sandbox file materialization before the agent starts.
+
+AWS S3 uses `OPENGENI_OBJECT_STORAGE_BACKEND=aws-s3` plus `OPENGENI_OBJECT_STORAGE_REGION`; prefer IRSA/EKS Pod Identity over static keys. GCS uses `OPENGENI_OBJECT_STORAGE_BACKEND=gcs` plus `OPENGENI_OBJECT_STORAGE_GCS_PROJECT_ID`; prefer GKE Workload Identity over service-account JSON. For AWS S3 and GCS file resources, OpenGeni materializes attached files in sandboxes through short-lived signed downloads.
 
 For Modal runs, configure the Modal sandbox variables in `.env.example`.
+
+## Deployment
+
+The operator guide is in `docs/deployment.md`.
+
+Current deployment artifacts include:
+
+- A repo-owned deployment contract in `packages/deployment`.
+- A Helm chart for API, web, worker, migrations, and disposable local/smoke fixtures at `deploy/helm/opengeni`.
+- An Azure reference Terraform substrate at `deploy/terraform/azure`.
+- AWS and GCP reference Terraform substrates at `deploy/terraform/aws` and `deploy/terraform/gcp`.
+- Stack-wrapper plans that can install official upstream NATS and Temporal Helm charts outside the OpenGeni application chart.
+- Runtime artifact generators for provider-specific non-secret Helm values and private runtime env files.
+- A preflight/profile command:
+
+```bash
+bun run deployment:profiles
+bun run deployment:preflight -- --profile azure-existing-services
+bun run deployment:stack -- --profile gcp-managed
+```
+
+Production operators should use managed services, existing endpoints, or official upstream charts/operators for Postgres, Temporal, NATS, secret delivery, ingress/TLS, and observability. The in-chart Postgres, Temporal, NATS, and MinIO templates are only for local, CI, and smoke verification. Keep cloud resource inventories, generated credentials, kubeconfigs, Terraform state, and filled tfvars in private operator-controlled storage outside the repository.
 
 ## Web App
 
@@ -253,7 +292,7 @@ Integration and E2E tests use Bun's test runner. Deterministic SDK-level tests u
 - Public clients should treat the API as the source of truth.
 - Browser streaming uses `GET /v1/sessions/:id/events/stream`.
 - Agent activities are side-effectful. Do not add automatic Temporal retries around full agent segments unless each model, tool, and sandbox boundary has been made idempotent.
-- Docker sandbox file resources use native S3-compatible in-container mounts. Attach file resources before the first run when using the Docker backend.
+- Docker sandbox file resources from local S3-compatible storage are materialized into the sandbox before the run. Attach file resources before the first run when using the Docker backend.
 - Sandbox preparation profiles are explicit. Model provider credentials are not automatically exposed inside sandboxes unless configured.
 
 ## Open Source Release Notes

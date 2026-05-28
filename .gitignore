@@ -14,3 +14,10 @@ coverage/
 *.tsbuildinfo
 bun.lockb
 *.traineddata
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
+terraform.tfvars.json
+.agent/

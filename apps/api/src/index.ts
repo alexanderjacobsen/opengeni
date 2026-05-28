@@ -1,7 +1,8 @@
-import { getSettings } from "@opengeni/config";
+import { getSettings, retryStartupDependency, startupRetryOptions } from "@opengeni/config";
 import type { ScheduledTask, ScheduledTaskOverlapPolicy, ScheduledTaskScheduleSpec } from "@opengeni/contracts";
 import { createDb } from "@opengeni/db";
 import { createNatsEventBus } from "@opengeni/events";
+import { createObservability, logStartupDependencyRetry } from "@opengeni/observability";
 import { Connection, Client as TemporalClient, ScheduleNotFoundError, ScheduleOverlapPolicy } from "@temporalio/client";
 import type { ScheduleOptions, ScheduleSpec, ScheduleUpdateOptions } from "@temporalio/client";
 import { createApp, type DocumentIndexClient, type SessionWorkflowClient } from "./app";
@@ -97,15 +98,40 @@ export async function createTemporalWorkflowClient(settings: ReturnType<typeof g
 
 export async function startApi() {
   const settings = getSettings();
+  const observability = createObservability(settings, { component: "api" });
   const dbClient = createDb(settings.databaseUrl);
-  const bus = await createNatsEventBus(settings.natsUrl);
-  const workflowClient = await createTemporalWorkflowClient(settings);
+  let bus: Awaited<ReturnType<typeof createNatsEventBus>> | undefined;
+  let workflowClient: Awaited<ReturnType<typeof createTemporalWorkflowClient>> | undefined;
+  const retryOptions = startupRetryOptions(settings);
+  const onRetry = (event: Parameters<typeof logStartupDependencyRetry>[1]) => logStartupDependencyRetry(observability, event);
+  try {
+    bus = await retryStartupDependency("NATS", () => createNatsEventBus(settings.natsUrl), {
+      ...retryOptions,
+      onRetry,
+    });
+    workflowClient = await retryStartupDependency("Temporal", () => createTemporalWorkflowClient(settings), {
+      ...retryOptions,
+      onRetry,
+    });
+  } catch (error) {
+    await Promise.allSettled([
+      bus?.close(),
+      workflowClient?.close(),
+      dbClient.close(),
+    ]);
+    throw error;
+  }
+  if (!bus || !workflowClient) {
+    await dbClient.close();
+    throw new Error("OpenGeni API startup dependencies were not initialized");
+  }
   const app = createApp({
     settings,
     db: dbClient.db,
     bus,
     workflowClient: workflowClient.client,
     documentIndexer: workflowClient.documentIndexer,
+    observability,
   });
   const server = Bun.serve({
     hostname: settings.apiHost,
@@ -113,7 +139,10 @@ export async function startApi() {
     idleTimeout: 255,
     fetch: app.fetch,
   });
-  console.log(`OpenGeni API listening on http://${settings.apiHost}:${settings.apiPort}`);
+  observability.info("OpenGeni API listening", {
+    host: settings.apiHost,
+    port: settings.apiPort,
+  });
   return {
     server,
     close: async () => {

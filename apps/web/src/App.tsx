@@ -68,6 +68,7 @@ import {
   fetchGitHubStatus,
   fetchScheduledTaskRuns,
   fetchScheduledTasks,
+  getStoredAccessKey,
   reindexDocument,
   fetchSession,
   pauseScheduledTask,
@@ -76,11 +77,13 @@ import {
   sendInterrupt,
   sendUserMessage,
   searchDocumentBase,
+  setStoredAccessKey,
   startGitHubManifest,
-  streamUrl,
+  streamSessionEvents,
   triggerScheduledTask,
   updateScheduledTask,
   uploadFileAsset,
+  clearStoredAccessKey,
 } from "./api";
 import type {
   ClientConfig,
@@ -103,30 +106,6 @@ import type {
 } from "./types";
 import { cn } from "@/lib/utils";
 import { Streamdown, type StreamdownComponents } from "./vendor/streamdown-runtime.js";
-
-const streamEventTypes = [
-  "session.created",
-  "session.status.changed",
-  "session.requiresAction",
-  "user.message",
-  "user.interrupt",
-  "user.approvalDecision",
-  "turn.started",
-  "turn.completed",
-  "turn.failed",
-  "turn.cancelled",
-  "agent.message.delta",
-  "agent.message.completed",
-  "agent.reasoning.delta",
-  "agent.toolCall.created",
-  "agent.toolCall.output",
-  "agent.updated",
-  "sandbox.operation.started",
-  "sandbox.operation.completed",
-  "sandbox.operation.failed",
-  "sandbox.command.output.delta",
-  "artifact.created",
-];
 
 const examples = [
   "Inspect the repository and summarize the infrastructure layout.",
@@ -207,7 +186,12 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [repoBusy, setRepoBusy] = useState(false);
   const [githubAppBusy, setGithubAppBusy] = useState(false);
+  const [hasAccessKey, setHasAccessKey] = useState(() => getStoredAccessKey() !== null);
+  const [accessKeyDraft, setAccessKeyDraft] = useState("");
+  const [accessKeyVersion, setAccessKeyVersion] = useState(0);
   const lastSequence = useMemo(() => events.reduce((max, event) => Math.max(max, event.sequence), 0), [events]);
+  const authRequired = clientConfig?.auth.required === true;
+  const authReady = !authRequired || hasAccessKey;
 
   useEffect(() => {
     void fetchClientConfig()
@@ -219,10 +203,19 @@ export function App() {
         }
       })
       .catch((error) => toast.error("Failed to load client config", { description: String(error) }));
-    void refreshGitHub();
   }, []);
 
   useEffect(() => {
+    if (!clientConfig || !authReady) {
+      return;
+    }
+    void refreshGitHub();
+  }, [clientConfig, authReady, accessKeyVersion]);
+
+  useEffect(() => {
+    if (!authReady) {
+      return;
+    }
     if (!sessionId) {
       setSession(null);
       setEvents([]);
@@ -231,9 +224,9 @@ export function App() {
     }
     void fetchSession(sessionId).then(setSession).catch((error) => toast.error("Failed to load session", { description: String(error) }));
     void fetchEvents(sessionId).then(setEvents).catch((error) => toast.error("Failed to load events", { description: String(error) }));
-  }, [sessionId]);
+  }, [sessionId, authReady, accessKeyVersion]);
 
-  useSessionStream(sessionId, lastSequence, (incoming) => {
+  useSessionStream(authReady ? sessionId : null, lastSequence, accessKeyVersion, (incoming) => {
     setEvents((current) => mergeEvents(current, incoming));
     setSession((current) => current ? applySessionStatusEvents(current, incoming) : current);
   }, setConnectionState);
@@ -370,6 +363,26 @@ export function App() {
     setManualReposOpen(true);
   }
 
+  function saveAccessKey() {
+    const key = accessKeyDraft.trim();
+    if (!key) {
+      toast.error("Enter an access key");
+      return;
+    }
+    setStoredAccessKey(key);
+    setHasAccessKey(true);
+    setAccessKeyDraft("");
+    setAccessKeyVersion((version) => version + 1);
+  }
+
+  function forgetAccessKey() {
+    clearStoredAccessKey();
+    setHasAccessKey(false);
+    setSession(null);
+    setEvents([]);
+    setAccessKeyVersion((version) => version + 1);
+  }
+
   return (
     <main className="flex h-dvh min-h-screen flex-col overflow-x-hidden bg-[color:var(--color-bg)] text-[color:var(--color-fg)]">
       <Toaster richColors theme="dark" />
@@ -423,6 +436,11 @@ export function App() {
         ) : null}
 
         <div className="ml-auto flex items-center gap-2">
+          {authRequired ? (
+            <Button type="button" variant="ghost" size="icon-sm" onClick={forgetAccessKey} aria-label="Clear access key">
+              <LockIcon className="size-4" />
+            </Button>
+          ) : null}
           {session && activeView === "agent" ? <ConnectionPill state={connectionState} /> : null}
           {session && activeView === "agent" ? <StatusBadge status={session.status} /> : null}
           {session && activeView === "agent" ? (
@@ -438,6 +456,43 @@ export function App() {
           ) : null}
         </div>
       </header>
+
+      {authRequired && !hasAccessKey ? (
+        <section className="flex flex-1 items-center justify-center px-4">
+          <form
+            className="w-full max-w-sm rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-surface)] p-5 shadow-sm"
+            onSubmit={(event) => {
+              event.preventDefault();
+              saveAccessKey();
+            }}
+          >
+            <div className="mb-4 flex items-center gap-3">
+              <span className="flex size-9 items-center justify-center rounded-md bg-[color:var(--color-brand-strong)]/20 text-[color:var(--color-brand)]">
+                <LockIcon className="size-4" />
+              </span>
+              <div>
+                <h1 className="text-base font-semibold">Access key required</h1>
+                <p className="text-sm text-[color:var(--color-fg-subtle)]">Enter the deployment key for this OpenGeni instance.</p>
+              </div>
+            </div>
+            <Label htmlFor="access-key">Access key</Label>
+            <Input
+              id="access-key"
+              type="password"
+              value={accessKeyDraft}
+              onChange={(event) => setAccessKeyDraft(event.target.value)}
+              autoComplete="current-password"
+              className="mt-2"
+              autoFocus
+            />
+            <Button type="submit" className="mt-4 w-full">
+              <CheckIcon className="size-4" />
+              Continue
+            </Button>
+          </form>
+        </section>
+      ) : (
+        <>
 
       {activeView === "documents" ? (
         <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-4 py-5 sm:px-6 lg:px-8">
@@ -558,6 +613,8 @@ export function App() {
             </aside>
           ) : null}
         </div>
+      )}
+        </>
       )}
     </main>
   );
@@ -2687,6 +2744,7 @@ function ScheduledTaskRepositoryPicker(props: {
 function useSessionStream(
   sessionId: string | null,
   after: number,
+  accessKeyVersion: number,
   onEvents: (events: SessionEvent[]) => void,
   onState?: (state: ConnectionState) => void,
 ) {
@@ -2699,24 +2757,23 @@ function useSessionStream(
       onStateRef.current?.("closed");
       return;
     }
-    onStateRef.current?.("connecting");
-    const source = new EventSource(streamUrl(sessionId, after));
-    source.onopen = () => onStateRef.current?.("live");
-    source.onerror = () => onStateRef.current?.("error");
-    const handler = (event: MessageEvent) => {
-      onEventsRef.current([JSON.parse(event.data) as SessionEvent]);
-    };
-    for (const type of streamEventTypes) {
-      source.addEventListener(type, handler);
-    }
-    return () => {
-      for (const type of streamEventTypes) {
-        source.removeEventListener(type, handler);
+    const abort = new AbortController();
+    void streamSessionEvents(sessionId, after, (event) => {
+      onEventsRef.current([event]);
+    }, {
+      signal: abort.signal,
+      onState: (state) => onStateRef.current?.(state),
+    }).catch((error) => {
+      if (!abort.signal.aborted) {
+        onStateRef.current?.("error");
+        toast.error("Event stream disconnected", { description: error instanceof Error ? error.message : String(error) });
       }
-      source.close();
+    });
+    return () => {
+      abort.abort();
       onStateRef.current?.("closed");
     };
-  }, [sessionId]);
+  }, [sessionId, accessKeyVersion]);
 }
 
 function buildResources(manualRepos: RepoDraft[], repos: GitHubRepository[], selected: Set<number>, selectedRefs: Record<number, string>): ResourceRef[] {

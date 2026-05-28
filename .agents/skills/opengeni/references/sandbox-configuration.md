@@ -110,7 +110,7 @@ Always trace resource flow end to end:
 
 ## Object Storage For File Mounts
 
-OpenGeni uses object storage for uploaded bytes. The API and browser use the host-visible endpoint. Sandboxes often need a different endpoint because `127.0.0.1` inside a container points at the container, not the host.
+OpenGeni uses object storage for uploaded bytes. The API and browser use the host-visible endpoint. Sandboxes often need a different endpoint because `127.0.0.1` inside a container points at the container, not the host. Local/self-contained modes usually use `s3-compatible` MinIO. Production modes should use `azure-blob`, `aws-s3`, or `gcs`.
 
 Typical local shape:
 
@@ -126,7 +126,9 @@ When debugging file mounts, verify:
 
 - Object storage is configured and reachable by API.
 - Upload was completed and file status is ready.
-- Sandbox endpoint is reachable from the sandbox backend.
+- For `s3-compatible`, the sandbox endpoint is reachable from the sandbox backend.
+- For `azure-blob`, Docker/local sandboxes can use Azure Blob manifest mounts; Modal uses signed download materialization.
+- For `aws-s3` and `gcs`, file resources use short-lived signed download materialization instead of assuming static storage keys in the sandbox.
 - Bucket, prefix, credentials, region/provider, path-style settings match current runtime code.
 - The resource mount path is valid and does not conflict with another resource.
 

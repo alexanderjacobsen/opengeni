@@ -3,6 +3,19 @@ import { z } from "zod";
 
 const envName = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const registryId = /^[A-Za-z0-9_-]+$/;
+const EnvBoolean = z.preprocess((value) => {
+  if (typeof value !== "string") {
+    return value;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (["true", "1", "yes", "y", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["false", "0", "no", "n", "off"].includes(normalized)) {
+    return false;
+  }
+  return value;
+}, z.boolean());
 
 export const sandboxPreparationProfiles: Record<string, { env: string[]; hooks: string[] }> = {
   none: {
@@ -44,6 +57,17 @@ const SettingsSchema = z.object({
   temporalHost: z.string().default("127.0.0.1:7233"),
   temporalNamespace: z.string().default("default"),
   temporalTaskQueue: z.string().default("opengeni-runs-ts"),
+  startupDependencyRetryAttempts: z.coerce.number().int().positive().default(30),
+  startupDependencyRetryInitialDelayMs: z.coerce.number().int().positive().default(1000),
+  startupDependencyRetryMaxDelayMs: z.coerce.number().int().positive().default(5000),
+  observabilityStructuredLogs: EnvBoolean.default(false),
+  observabilityMetricsEnabled: EnvBoolean.default(true),
+  observabilityOtlpEndpoint: z.string().url().optional(),
+  observabilityOtlpHeaders: z.string().default(""),
+  authRequired: EnvBoolean.default(false),
+  accessKey: z.string().optional(),
+  authAllowHealth: EnvBoolean.default(true),
+  authAllowMetrics: EnvBoolean.default(false),
   apiHost: z.string().default("0.0.0.0"),
   apiPort: z.coerce.number().int().positive().default(8000),
   opengeniMcpUrl: z.string().url().optional(),
@@ -62,10 +86,11 @@ const SettingsSchema = z.object({
   azureOpenaiApiVersion: z.string().optional(),
   azureOpenaiApiKey: z.string().optional(),
   azureOpenaiAdToken: z.string().optional(),
-  disableOpenaiTracing: z.coerce.boolean().default(false),
+  disableOpenaiTracing: EnvBoolean.default(false),
   sandboxBackend: SandboxBackend.default("docker"),
   dockerImage: z.string().default("opengeni-sandbox:local"),
   dockerExposedPorts: z.string().default(""),
+  dockerNetwork: z.string().optional(),
   modalAppName: z.string().default("opengeni-sandbox"),
   modalImageRef: z.string().optional(),
   modalTimeoutSeconds: z.coerce.number().int().positive().default(900),
@@ -76,12 +101,21 @@ const SettingsSchema = z.object({
   sandboxEnvAllowlist: z.string().default(""),
   objectStorageEndpoint: z.string().url().optional(),
   objectStorageSandboxEndpoint: z.string().url().optional(),
+  objectStorageBackend: z.enum(["s3-compatible", "aws-s3", "azure-blob", "gcs"]).default("s3-compatible"),
   objectStorageBucket: z.string().min(1).default("opengeni-files"),
   objectStorageRegion: z.string().min(1).default("us-east-1"),
   objectStorageS3Provider: z.string().min(1).default("Minio"),
   objectStorageAccessKeyId: z.string().optional(),
   objectStorageSecretAccessKey: z.string().optional(),
-  objectStorageForcePathStyle: z.coerce.boolean().default(true),
+  objectStorageForcePathStyle: EnvBoolean.default(true),
+  objectStorageAzureConnectionString: z.string().optional(),
+  objectStorageAzureAccountName: z.string().optional(),
+  objectStorageAzureAccountKey: z.string().optional(),
+  objectStorageAzureEndpoint: z.string().url().optional(),
+  objectStorageGcsProjectId: z.string().optional(),
+  objectStorageGcsCredentialsJson: z.string().optional(),
+  objectStorageGcsKeyFilename: z.string().optional(),
+  objectStorageGcsApiEndpoint: z.string().url().optional(),
   documentParser: z.string().min(1).default("liteparse"),
   documentChunkSize: z.coerce.number().int().positive().default(1200),
   documentChunkOverlap: z.coerce.number().int().nonnegative().default(160),
@@ -129,6 +163,17 @@ export function getSettings(): Settings {
     temporalHost: optional("OPENGENI_TEMPORAL_HOST"),
     temporalNamespace: optional("OPENGENI_TEMPORAL_NAMESPACE"),
     temporalTaskQueue: optional("OPENGENI_TEMPORAL_TASK_QUEUE"),
+    startupDependencyRetryAttempts: optional("OPENGENI_STARTUP_DEPENDENCY_RETRY_ATTEMPTS"),
+    startupDependencyRetryInitialDelayMs: optional("OPENGENI_STARTUP_DEPENDENCY_RETRY_INITIAL_DELAY_MS"),
+    startupDependencyRetryMaxDelayMs: optional("OPENGENI_STARTUP_DEPENDENCY_RETRY_MAX_DELAY_MS"),
+    observabilityStructuredLogs: optional("OPENGENI_OBSERVABILITY_STRUCTURED_LOGS"),
+    observabilityMetricsEnabled: optional("OPENGENI_OBSERVABILITY_METRICS_ENABLED"),
+    observabilityOtlpEndpoint: optional("OPENGENI_OTEL_EXPORTER_OTLP_ENDPOINT") ?? optional("OTEL_EXPORTER_OTLP_ENDPOINT"),
+    observabilityOtlpHeaders: optional("OPENGENI_OTEL_EXPORTER_OTLP_HEADERS") ?? optional("OTEL_EXPORTER_OTLP_HEADERS"),
+    authRequired: optional("OPENGENI_AUTH_REQUIRED"),
+    accessKey: optional("OPENGENI_ACCESS_KEY"),
+    authAllowHealth: optional("OPENGENI_AUTH_ALLOW_HEALTH"),
+    authAllowMetrics: optional("OPENGENI_AUTH_ALLOW_METRICS"),
     apiHost: optional("OPENGENI_API_HOST"),
     apiPort: optional("OPENGENI_API_PORT"),
     opengeniMcpUrl: optional("OPENGENI_MCP_URL"),
@@ -151,6 +196,7 @@ export function getSettings(): Settings {
     sandboxBackend: optional("OPENGENI_SANDBOX_BACKEND"),
     dockerImage: optional("OPENGENI_DOCKER_IMAGE"),
     dockerExposedPorts: optional("OPENGENI_DOCKER_EXPOSED_PORTS"),
+    dockerNetwork: optional("OPENGENI_DOCKER_NETWORK"),
     modalAppName: optional("OPENGENI_MODAL_APP_NAME"),
     modalImageRef: optional("OPENGENI_MODAL_IMAGE_REF"),
     modalTimeoutSeconds: optional("OPENGENI_MODAL_TIMEOUT_SECONDS"),
@@ -161,12 +207,21 @@ export function getSettings(): Settings {
     sandboxEnvAllowlist: optional("OPENGENI_SANDBOX_ENV_ALLOWLIST"),
     objectStorageEndpoint: optional("OPENGENI_OBJECT_STORAGE_ENDPOINT"),
     objectStorageSandboxEndpoint: optional("OPENGENI_OBJECT_STORAGE_SANDBOX_ENDPOINT"),
+    objectStorageBackend: optional("OPENGENI_OBJECT_STORAGE_BACKEND"),
     objectStorageBucket: optional("OPENGENI_OBJECT_STORAGE_BUCKET"),
     objectStorageRegion: optional("OPENGENI_OBJECT_STORAGE_REGION"),
     objectStorageS3Provider: optional("OPENGENI_OBJECT_STORAGE_S3_PROVIDER"),
     objectStorageAccessKeyId: optional("OPENGENI_OBJECT_STORAGE_ACCESS_KEY_ID"),
     objectStorageSecretAccessKey: optional("OPENGENI_OBJECT_STORAGE_SECRET_ACCESS_KEY"),
     objectStorageForcePathStyle: optional("OPENGENI_OBJECT_STORAGE_FORCE_PATH_STYLE"),
+    objectStorageAzureConnectionString: optional("OPENGENI_OBJECT_STORAGE_AZURE_CONNECTION_STRING"),
+    objectStorageAzureAccountName: optional("OPENGENI_OBJECT_STORAGE_AZURE_ACCOUNT_NAME"),
+    objectStorageAzureAccountKey: optional("OPENGENI_OBJECT_STORAGE_AZURE_ACCOUNT_KEY"),
+    objectStorageAzureEndpoint: optional("OPENGENI_OBJECT_STORAGE_AZURE_ENDPOINT"),
+    objectStorageGcsProjectId: optional("OPENGENI_OBJECT_STORAGE_GCS_PROJECT_ID"),
+    objectStorageGcsCredentialsJson: optional("OPENGENI_OBJECT_STORAGE_GCS_CREDENTIALS_JSON"),
+    objectStorageGcsKeyFilename: optional("OPENGENI_OBJECT_STORAGE_GCS_KEY_FILENAME"),
+    objectStorageGcsApiEndpoint: optional("OPENGENI_OBJECT_STORAGE_GCS_API_ENDPOINT"),
     documentParser: optional("OPENGENI_DOCUMENT_PARSER"),
     documentChunkSize: optional("OPENGENI_DOCUMENT_CHUNK_SIZE"),
     documentChunkOverlap: optional("OPENGENI_DOCUMENT_CHUNK_OVERLAP"),
@@ -225,6 +280,50 @@ export function collectGitIdentityEnvironment(settings: Settings): Record<string
     GIT_COMMITTER_NAME: settings.gitCommitterName ?? settings.gitAuthorName,
     GIT_COMMITTER_EMAIL: settings.gitCommitterEmail ?? settings.gitAuthorEmail,
   }).filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].trim().length > 0));
+}
+
+export type StartupRetryOptions = {
+  attempts?: number;
+  initialDelayMs?: number;
+  maxDelayMs?: number;
+  onRetry?: (event: {
+    label: string;
+    attempt: number;
+    attempts: number;
+    delayMs: number;
+    error: unknown;
+  }) => void;
+};
+
+export function startupRetryOptions(settings: Settings): Required<Omit<StartupRetryOptions, "onRetry">> {
+  return {
+    attempts: settings.startupDependencyRetryAttempts,
+    initialDelayMs: settings.startupDependencyRetryInitialDelayMs,
+    maxDelayMs: settings.startupDependencyRetryMaxDelayMs,
+  };
+}
+
+export async function retryStartupDependency<T>(
+  label: string,
+  operation: () => Promise<T>,
+  options: StartupRetryOptions = {},
+): Promise<T> {
+  const attempts = Math.max(1, Math.floor(options.attempts ?? 30));
+  const initialDelayMs = Math.max(0, Math.floor(options.initialDelayMs ?? 1000));
+  const maxDelayMs = Math.max(initialDelayMs, Math.floor(options.maxDelayMs ?? 5000));
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (attempt >= attempts) {
+        throw error;
+      }
+      const delayMs = Math.min(maxDelayMs, initialDelayMs * 2 ** (attempt - 1));
+      options.onRetry?.({ label, attempt, attempts, delayMs, error });
+      await delay(delayMs);
+    }
+  }
+  throw new Error(`unreachable startup retry state for ${label}`);
 }
 
 export function sandboxEnvironmentVariableNames(settings: Settings): string[] {
@@ -289,7 +388,8 @@ export function parseMcpServers(raw: string | undefined): unknown[] | undefined 
 
 function ensureBuiltInMcpServers(settings: Settings): Settings["mcpServers"] {
   const existing = settings.mcpServers.filter((server) => server.id !== "opengeni");
-  const firstPartyMcpUrl = settings.opengeniMcpUrl ?? `http://127.0.0.1:${settings.apiPort}/v1/mcp`;
+  const firstPartyMcpUrl = firstPartyMcpServerUrl(settings);
+  const firstPartyDocsMcpUrl = firstPartyDocumentsMcpServerUrl(firstPartyMcpUrl);
   const hasFiles = existing.some((server) => server.id === "files");
   const hasDocs = existing.some((server) => server.id === "docs");
   return [
@@ -309,7 +409,7 @@ function ensureBuiltInMcpServers(settings: Settings): Settings["mcpServers"] {
     ...(hasDocs ? [] : [{
       id: "docs",
       name: "Document Search",
-      url: `http://127.0.0.1:${settings.apiPort}/v1/mcp/docs`,
+      url: firstPartyDocsMcpUrl,
       allowedTools: ["search_documents", "fetch_document_chunk", "list_document_bases"],
       cacheToolsList: false,
     }]),
@@ -317,7 +417,20 @@ function ensureBuiltInMcpServers(settings: Settings): Settings["mcpServers"] {
   ];
 }
 
+function firstPartyMcpServerUrl(settings: Settings): string {
+  return settings.opengeniMcpUrl ?? `http://127.0.0.1:${settings.apiPort}/v1/mcp`;
+}
+
+function firstPartyDocumentsMcpServerUrl(mcpUrl: string): string {
+  const url = new URL(mcpUrl);
+  url.pathname = `${url.pathname.replace(/\/+$/, "")}/docs`;
+  return url.toString();
+}
+
 function validateSettings(settings: Settings): void {
+  if (settings.authRequired && !settings.accessKey) {
+    throw new Error("OPENGENI_ACCESS_KEY is required when OPENGENI_AUTH_REQUIRED=true");
+  }
   if (settings.openaiProvider === "azure") {
     if (!settings.azureOpenaiBaseUrl && !settings.azureOpenaiEndpoint) {
       throw new Error("Azure OpenAI requires OPENGENI_AZURE_OPENAI_BASE_URL or OPENGENI_AZURE_OPENAI_ENDPOINT");
@@ -335,11 +448,41 @@ function validateSettings(settings: Settings): void {
   if (Boolean(settings.modalTokenId) !== Boolean(settings.modalTokenSecret)) {
     throw new Error("OPENGENI_MODAL_TOKEN_ID and OPENGENI_MODAL_TOKEN_SECRET must both be set or both omitted");
   }
-  if (Boolean(settings.objectStorageAccessKeyId) !== Boolean(settings.objectStorageSecretAccessKey)) {
-    throw new Error("OPENGENI_OBJECT_STORAGE_ACCESS_KEY_ID and OPENGENI_OBJECT_STORAGE_SECRET_ACCESS_KEY must both be set or both omitted");
-  }
-  if ((settings.objectStorageEndpoint || settings.objectStorageSandboxEndpoint) && (!settings.objectStorageAccessKeyId || !settings.objectStorageSecretAccessKey)) {
-    throw new Error("Object storage endpoints require OPENGENI_OBJECT_STORAGE_ACCESS_KEY_ID and OPENGENI_OBJECT_STORAGE_SECRET_ACCESS_KEY");
+  if (settings.objectStorageBackend === "s3-compatible" || settings.objectStorageBackend === "aws-s3") {
+    if (Boolean(settings.objectStorageAccessKeyId) !== Boolean(settings.objectStorageSecretAccessKey)) {
+      throw new Error("OPENGENI_OBJECT_STORAGE_ACCESS_KEY_ID and OPENGENI_OBJECT_STORAGE_SECRET_ACCESS_KEY must both be set or both omitted");
+    }
+    if (settings.objectStorageBackend === "s3-compatible" && (settings.objectStorageEndpoint || settings.objectStorageSandboxEndpoint) && (!settings.objectStorageAccessKeyId || !settings.objectStorageSecretAccessKey)) {
+      throw new Error("S3-compatible object storage endpoints require OPENGENI_OBJECT_STORAGE_ACCESS_KEY_ID and OPENGENI_OBJECT_STORAGE_SECRET_ACCESS_KEY");
+    }
+    if (settings.objectStorageAzureConnectionString || settings.objectStorageAzureAccountName || settings.objectStorageAzureAccountKey || settings.objectStorageAzureEndpoint) {
+      throw new Error("S3 object storage uses OPENGENI_OBJECT_STORAGE_* S3 settings, not OPENGENI_OBJECT_STORAGE_AZURE_* settings");
+    }
+    if (settings.objectStorageGcsProjectId || settings.objectStorageGcsCredentialsJson || settings.objectStorageGcsKeyFilename || settings.objectStorageGcsApiEndpoint) {
+      throw new Error("S3 object storage uses OPENGENI_OBJECT_STORAGE_* S3 settings, not OPENGENI_OBJECT_STORAGE_GCS_* settings");
+    }
+  } else if (settings.objectStorageBackend === "azure-blob") {
+    if (settings.objectStorageEndpoint || settings.objectStorageSandboxEndpoint || settings.objectStorageAccessKeyId || settings.objectStorageSecretAccessKey) {
+      throw new Error("Azure Blob storage uses OPENGENI_OBJECT_STORAGE_AZURE_* settings, not S3-compatible object storage settings");
+    }
+    if (settings.objectStorageGcsProjectId || settings.objectStorageGcsCredentialsJson || settings.objectStorageGcsKeyFilename || settings.objectStorageGcsApiEndpoint) {
+      throw new Error("Azure Blob storage uses OPENGENI_OBJECT_STORAGE_AZURE_* settings, not OPENGENI_OBJECT_STORAGE_GCS_* settings");
+    }
+    const hasConnectionString = Boolean(settings.objectStorageAzureConnectionString);
+    const hasSharedKey = Boolean(settings.objectStorageAzureAccountName) && Boolean(settings.objectStorageAzureAccountKey);
+    if (!hasConnectionString && !hasSharedKey) {
+      throw new Error("Azure Blob storage requires OPENGENI_OBJECT_STORAGE_AZURE_CONNECTION_STRING or OPENGENI_OBJECT_STORAGE_AZURE_ACCOUNT_NAME plus OPENGENI_OBJECT_STORAGE_AZURE_ACCOUNT_KEY");
+    }
+  } else {
+    if (settings.objectStorageEndpoint || settings.objectStorageSandboxEndpoint || settings.objectStorageAccessKeyId || settings.objectStorageSecretAccessKey) {
+      throw new Error("GCS object storage uses OPENGENI_OBJECT_STORAGE_GCS_* settings, not S3-compatible object storage settings");
+    }
+    if (settings.objectStorageAzureConnectionString || settings.objectStorageAzureAccountName || settings.objectStorageAzureAccountKey || settings.objectStorageAzureEndpoint) {
+      throw new Error("GCS object storage uses OPENGENI_OBJECT_STORAGE_GCS_* settings, not OPENGENI_OBJECT_STORAGE_AZURE_* settings");
+    }
+    if (settings.objectStorageGcsCredentialsJson) {
+      parseGcsCredentialsJson(settings.objectStorageGcsCredentialsJson);
+    }
   }
   if (settings.documentChunkOverlap >= settings.documentChunkSize) {
     throw new Error("OPENGENI_DOCUMENT_CHUNK_OVERLAP must be smaller than OPENGENI_DOCUMENT_CHUNK_SIZE");
@@ -377,4 +520,17 @@ function uniqueEnvNames(raw: string[], fieldName: string): string[] {
 
 function uniqueValues(raw: string[]): string[] {
   return [...new Set(raw.filter(Boolean))];
+}
+
+function parseGcsCredentialsJson(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`OPENGENI_OBJECT_STORAGE_GCS_CREDENTIALS_JSON must be valid JSON: ${message}`);
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

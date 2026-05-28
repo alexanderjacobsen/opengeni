@@ -3,6 +3,8 @@ import { Client, Connection } from "@temporalio/client";
 import { NativeConnection, Worker } from "@temporalio/worker";
 import { startTestServices, type TestServices, waitFor } from "@opengeni/testing";
 
+const temporalWorkflowTestTimeoutMs = 30_000;
+
 describe("Temporal workflow integration", () => {
   let services: TestServices;
   let connection: Connection;
@@ -50,7 +52,7 @@ describe("Temporal workflow integration", () => {
       worker.shutdown();
       await run;
     }
-  });
+  }, temporalWorkflowTestTimeoutMs);
 
   test("waits for approval before resuming a requires_action segment", async () => {
     const taskQueue = `workflow-test-${crypto.randomUUID()}`;
@@ -83,7 +85,7 @@ describe("Temporal workflow integration", () => {
       worker.shutdown();
       await run;
     }
-  });
+  }, temporalWorkflowTestTimeoutMs);
 
   test("does not retry failed agent activities", async () => {
     const taskQueue = `workflow-test-${crypto.randomUUID()}`;
@@ -117,7 +119,7 @@ describe("Temporal workflow integration", () => {
       worker.shutdown();
       await run;
     }
-  });
+  }, temporalWorkflowTestTimeoutMs);
 
   test("idle interrupt marks the session idle without cancelling a turn", async () => {
     const taskQueue = `workflow-test-${crypto.randomUUID()}`;
@@ -151,7 +153,7 @@ describe("Temporal workflow integration", () => {
       worker.shutdown();
       await run;
     }
-  });
+  }, temporalWorkflowTestTimeoutMs);
 
   test("interrupt during an active run cancels the active turn and continues queued work", async () => {
     const taskQueue = `workflow-test-${crypto.randomUUID()}`;
@@ -201,7 +203,7 @@ describe("Temporal workflow integration", () => {
       worker.shutdown();
       await run;
     }
-  });
+  }, temporalWorkflowTestTimeoutMs);
 
   test("interrupt while awaiting approval cancels the blocked turn and continues queued work", async () => {
     const taskQueue = `workflow-test-${crypto.randomUUID()}`;
@@ -243,7 +245,7 @@ describe("Temporal workflow integration", () => {
       worker.shutdown();
       await run;
     }
-  });
+  }, temporalWorkflowTestTimeoutMs);
 
   test("dispatches document index workflow activity", async () => {
     const taskQueue = `workflow-test-${crypto.randomUUID()}`;
@@ -283,7 +285,7 @@ describe("Temporal workflow integration", () => {
       worker.shutdown();
       await run;
     }
-  });
+  }, temporalWorkflowTestTimeoutMs);
 
   test("scheduled task fire workflow starts a session child workflow", async () => {
     const taskQueue = `workflow-test-${crypto.randomUUID()}`;
@@ -333,7 +335,7 @@ describe("Temporal workflow integration", () => {
       worker.shutdown();
       await run;
     }
-  });
+  }, temporalWorkflowTestTimeoutMs);
 
   test("scheduled task fire workflow signals a reusable session workflow", async () => {
     const taskQueue = `workflow-test-${crypto.randomUUID()}`;
@@ -382,7 +384,7 @@ describe("Temporal workflow integration", () => {
       worker.shutdown();
       await run;
     }
-  });
+  }, temporalWorkflowTestTimeoutMs);
 });
 
 function queuedTurn(triggerEventId: string): { id: string; triggerEventId: string } {

@@ -19,6 +19,7 @@ import {
   setSessionStatus,
 } from "@opengeni/db";
 import { createNatsEventBus, type EventBus } from "@opengeni/events";
+import { createObservability } from "@opengeni/observability";
 import { createProductionAgentRuntime, type OpenGeniRuntime } from "@opengeni/runtime";
 import { createActivities } from "../../apps/worker/src/activities";
 import { sandboxEnvironmentForRun } from "../../apps/worker/src/activities/environment";
@@ -236,6 +237,99 @@ describe("worker activities integration", () => {
     const events = await listSessionEvents(dbClient.db, session.id, 0, 50);
     expect(events.some((event) => event.type === "turn.failed")).toBe(true);
     expect((await getSession(dbClient.db, session.id))?.status).toBe("failed");
+  });
+
+  test("records worker observability when setup fails before a turn starts", async () => {
+    const exported: Array<{ body: any }> = [];
+    const settings = testSettings({
+      databaseUrl: services.databaseUrl,
+      natsUrl: services.natsUrl,
+      observabilityOtlpEndpoint: "http://collector:4318",
+    });
+    const observability = createObservability(settings, {
+      component: "worker",
+      exporter: async (_url, body) => {
+        exported.push({ body });
+      },
+    });
+    const activities = createActivities({
+      settings,
+      db: dbClient.db,
+      bus,
+      runtime: createProductionAgentRuntime({
+        model: new ScriptedModel([{ outputText: "unused" }]),
+      }),
+      observability,
+    });
+
+    await expect(activities.runAgentSegment({
+      sessionId: crypto.randomUUID(),
+      triggerEventId: crypto.randomUUID(),
+      workflowId: "workflow-missing-session",
+    })).rejects.toThrow("Session not found");
+    await Bun.sleep(0);
+
+    expect(exported).toHaveLength(1);
+    const span = exported[0]!.body.resourceSpans[0].scopeSpans[0].spans[0];
+    expect(span.name).toBe("worker.run_agent_segment");
+    expect(span.status.code).toBe(2);
+    expect(observability.prometheusMetrics()).toContain('status="failed"');
+  });
+
+  test("does not publish turn failure before turn start when status update fails", async () => {
+    const session = await createSession(dbClient.db, {
+      initialMessage: "run",
+      resources: [],
+      metadata: {},
+      model: "scripted-model",
+      sandboxBackend: "none",
+    });
+    const [trigger] = await appendSessionEvents(dbClient.db, session.id, [
+      { type: "user.message", payload: { text: "run" } },
+    ]);
+    const turnId = await createTurn(dbClient.db, {
+      sessionId: session.id,
+      temporalWorkflowId: "workflow-status-update-fails",
+      triggerEventId: trigger!.id,
+      source: "user",
+      prompt: "run",
+      resources: [],
+      tools: [],
+      model: "scripted-model",
+      reasoningEffort: "high",
+      sandboxBackend: "none",
+      metadata: {},
+    });
+    const failingDb = new Proxy(dbClient.db, {
+      get(target, prop, receiver) {
+        if (prop === "update") {
+          return () => {
+            throw new Error("status update failed");
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as typeof dbClient.db;
+    const activities = createActivities({
+      settings: testSettings({ databaseUrl: services.databaseUrl, natsUrl: services.natsUrl }),
+      db: failingDb,
+      bus,
+      runtime: createProductionAgentRuntime({
+        model: new ScriptedModel([{ outputText: "unused" }]),
+      }),
+    });
+
+    await expect(activities.runAgentSegment({
+      sessionId: session.id,
+      triggerEventId: trigger!.id,
+      workflowId: "workflow-status-update-fails",
+      turnId,
+    })).rejects.toThrow("status update failed");
+
+    const eventTypes = (await listSessionEvents(dbClient.db, session.id, 0, 50)).map((event) => event.type);
+    expect(eventTypes).not.toContain("turn.started");
+    expect(eventTypes).not.toContain("turn.failed");
   });
 
   test("marks approval reruns running before resuming the agent", async () => {

@@ -14,29 +14,38 @@ describe("browser e2e", () => {
   let webPort: number;
 
   beforeAll(async () => {
-    services = await startTestServices({ temporal: true });
-    await services.migrate();
-    apiPort = await freePort();
-    webPort = await freePort();
-    const env = stackEnv(services, apiPort, "slow");
-    api = await startProcess(["bun", "apps/api/src/index.ts"], {
-      cwd: repoRoot,
-      env,
-      ready: async () => (await fetch(`http://127.0.0.1:${apiPort}/healthz`).catch(() => null))?.ok === true,
-      timeoutMs: 45_000,
-    });
-    worker = await startProcess(["bun", "packages/testing/src/e2e-worker.ts"], {
-      cwd: repoRoot,
-      env,
-    });
-    await waitFor(() => workerReady(worker), { timeoutMs: 90_000, describe: () => worker.logs() });
-    web = await startProcess(["bun", "run", "vite", "dev", "--port", String(webPort), "--host", "127.0.0.1"], {
-      cwd: `${repoRoot}/apps/web`,
-      env: { VITE_API_BASE_URL: `http://127.0.0.1:${apiPort}` },
-      ready: async () => (await fetch(`http://127.0.0.1:${webPort}`).catch(() => null))?.ok === true,
-      timeoutMs: 45_000,
-    });
-    browser = await chromium.launch();
+    try {
+      browser = await chromium.launch();
+      services = await startTestServices({ temporal: true });
+      await services.migrate();
+      apiPort = await freePort();
+      webPort = await freePort();
+      const env = stackEnv(services, apiPort, "slow");
+      api = await startProcess(["bun", "apps/api/src/index.ts"], {
+        cwd: repoRoot,
+        env,
+        ready: async () => (await fetch(`http://127.0.0.1:${apiPort}/healthz`).catch(() => null))?.ok === true,
+        timeoutMs: 45_000,
+      });
+      worker = await startProcess(["bun", "packages/testing/src/e2e-worker.ts"], {
+        cwd: repoRoot,
+        env,
+      });
+      await waitFor(() => workerReady(worker), { timeoutMs: 90_000, describe: () => worker.logs() });
+      web = await startProcess(["bun", "run", "vite", "dev", "--port", String(webPort), "--strictPort", "--host", "127.0.0.1"], {
+        cwd: `${repoRoot}/apps/web`,
+        env: { VITE_API_BASE_URL: `http://127.0.0.1:${apiPort}` },
+        ready: async () => (await fetch(`http://127.0.0.1:${webPort}`).catch(() => null))?.ok === true,
+        timeoutMs: 45_000,
+      });
+    } catch (error) {
+      await browser?.close().catch(() => undefined);
+      await web?.stop().catch(() => undefined);
+      await worker?.stop().catch(() => undefined);
+      await api?.stop().catch(() => undefined);
+      await services?.down().catch(() => undefined);
+      throw error;
+    }
   }, 240_000);
 
   afterAll(async () => {

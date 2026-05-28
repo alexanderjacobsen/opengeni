@@ -58,7 +58,7 @@ describe("real Docker sandbox e2e", () => {
     expect(events.some((event) => event.type === "agent.message.completed")).toBe(true);
   }, 240_000);
 
-  test("mounts uploaded file resources through native S3 sandbox manifest entries", async () => {
+  test("materializes uploaded file resources inside the real Docker sandbox", async () => {
     const upload = await fetch(`http://127.0.0.1:${apiPort}/v1/files/uploads`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -104,7 +104,7 @@ describe("real Docker sandbox e2e", () => {
       .some((event) => JSON.stringify(event.payload ?? {}).includes("file-mounted-ok"))).toBe(true);
   }, 240_000);
 
-  test("views uploaded image resources directly from mounted S3 paths", async () => {
+  test("views uploaded image resources from materialized sandbox files", async () => {
     const imageBytes = Uint8Array.from(Buffer.from(
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
       "base64",
@@ -198,6 +198,7 @@ function stackEnv(services: TestServices, apiPort: number): Record<string, strin
     OPENGENI_OPENAI_MODEL: "scripted-model",
     OPENGENI_SANDBOX_BACKEND: "docker",
     OPENGENI_DOCKER_IMAGE: "opengeni-sandbox:local",
+    OPENGENI_DOCKER_NETWORK: services.dockerNetwork,
     OPENGENI_SANDBOX_PREPARATION_PROFILES: "none",
     OPENGENI_OBJECT_STORAGE_ENDPOINT: services.objectStorageEndpoint!,
     OPENGENI_OBJECT_STORAGE_SANDBOX_ENDPOINT: services.objectStorageSandboxEndpoint!,

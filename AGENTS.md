@@ -42,6 +42,7 @@ Manual equivalent:
    - `OPENGENI_DATABASE_URL`
    - `OPENGENI_NATS_URL`
    - `OPENGENI_TEMPORAL_HOST`
+   - `OPENGENI_STARTUP_DEPENDENCY_RETRY_*` when dependencies need longer startup windows
    - OpenAI or Azure OpenAI credentials
    - `OPENGENI_SANDBOX_BACKEND=docker` or `modal`
    - sandbox preparation profiles / env allowlist when needed
@@ -61,6 +62,10 @@ Default URLs:
 - Web: `http://127.0.0.1:3000`
 - NATS monitor: `http://127.0.0.1:8222`
 - Temporal gRPC: `127.0.0.1:7233`
+
+`bun run dev` may auto-select alternate Docker Compose host ports when defaults are already in use; it wires those selected ports into the API and worker environment for that run.
+
+MinIO is the local S3-compatible object storage default for Docker Compose and optional self-contained Kubernetes smoke tests. Production deployments should use provider-native storage instead of deploying MinIO manually: `azure-blob` for Azure Blob, `aws-s3` for AWS S3, and `gcs` for Google Cloud Storage.
 
 ## Architecture Notes
 
@@ -87,6 +92,8 @@ Explicit `OPENGENI_GIT_*` settings can set sandbox git author/committer identity
 
 Do not expect model provider credentials to automatically appear in the sandbox unless explicitly allowed.
 
+The API and sandbox file-resource object-storage boundary supports `s3-compatible`, `azure-blob`, `aws-s3`, and `gcs`. Azure Blob-backed Docker/local sandboxes use native Azure Blob manifest mounts. Modal Azure Blob, AWS S3, and GCS file resources use short-lived signed download materialization.
+
 ## Verification
 
 Unit tests and typechecks do not require Temporal, NATS, Postgres, a sandbox backend, or live model credentials:
@@ -97,3 +104,11 @@ bun test
 ```
 
 End-to-end agent runs require the full stack plus valid model and sandbox credentials.
+
+## Deployment Work Notes
+
+When working on production deployment, Azure/AWS/GCP deployment, Helm, Terraform, conformance checks, preview environments, observability, or cloud-provider-agnostic infrastructure, treat the source as authoritative: deployment contracts in `packages/deployment`, the Helm chart under `deploy/helm/opengeni`, Terraform roots under `deploy/terraform`, stack wrappers under `deploy/stacks`, and operator docs in `docs/deployment.md`.
+
+Keep provider resource inventories, cleanup notes, cloud account identifiers, private endpoints, generated credentials, kubeconfigs, Terraform state, plans, local tfvars, service-account keys, and access keys in private operator-controlled storage outside the repository.
+
+Use official upstream charts/operators or managed services for production platform services. OpenGeni's chart should own OpenGeni API, web, worker, migrations, and integration resources. Built-in Postgres, Temporal, NATS, and MinIO templates are disposable conformance fixtures for local, CI, and smoke verification only; do not present them as lightweight production alternatives.

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { ScheduleNotFoundError, ScheduleOverlapPolicy } from "@temporalio/client";
-import { allowedCorsOrigin, normalizeResources, replaySessionEvents, validateGitHubRepositorySelection, workflowIdForSession } from "../src/app";
+import { HTTPException } from "hono/http-exception";
+import { allowedCorsOrigin, httpStatusForError, normalizeResources, replaySessionEvents, routeLabel, validateGitHubRepositorySelection, workflowIdForSession } from "../src/app";
 import { shouldCreateScheduleAfterUpdateError, temporalOverlapPolicy, temporalScheduleSpec } from "../src/index";
 import type { SessionEvent } from "@opengeni/contracts";
 
@@ -99,6 +100,21 @@ describe("API helpers", () => {
     expect(allowedCorsOrigin(pattern, "http://127.0.0.1:3000")).toBe(true);
     expect(allowedCorsOrigin(pattern, "http://localhost.evil.com")).toBe(false);
     expect(allowedCorsOrigin(pattern, "https://evil.com/http://localhost:3000")).toBe(false);
+  });
+
+  test("normalizes dynamic route labels for metrics", () => {
+    expect(routeLabel("/v1/sessions/session-1/events/stream")).toBe("/v1/sessions/:id/events/stream");
+    expect(routeLabel("/v1/sessions/session-1/turns/turn-1")).toBe("/v1/sessions/:id/turns/:turnId");
+    expect(routeLabel("/v1/files/uploads/upload-1/complete")).toBe("/v1/files/uploads/:id/complete");
+    expect(routeLabel("/v1/document-bases/base-1/documents")).toBe("/v1/document-bases/:id/documents");
+    expect(routeLabel("/v1/documents/document-1/reindex")).toBe("/v1/documents/:id/reindex");
+    expect(routeLabel("/v1/scheduled-tasks/task-1/runs")).toBe("/v1/scheduled-tasks/:id/runs");
+    expect(routeLabel("/v1/unregistered/resource-1")).toBe("/v1/unknown");
+  });
+
+  test("preserves HTTPException status codes in error metrics", () => {
+    expect(httpStatusForError(new HTTPException(401))).toBe(401);
+    expect(httpStatusForError(new Error("boom"))).toBe(500);
   });
 
   test("replays SSE history across all pages", async () => {

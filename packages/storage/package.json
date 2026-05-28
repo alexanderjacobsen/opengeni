@@ -11,6 +11,8 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1044.0",
     "@aws-sdk/s3-request-presigner": "^3.1044.0",
+    "@azure/storage-blob": "^12.29.1",
+    "@google-cloud/storage": "^7.19.0",
     "@opengeni/config": "workspace:*",
     "@opengeni/contracts": "workspace:*"
   },

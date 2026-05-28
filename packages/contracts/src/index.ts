@@ -517,6 +517,15 @@ export const ClientConfig = z.object({
     enabled: z.boolean(),
     maxSizeBytes: z.number().int().positive(),
   }),
+  auth: z.object({
+    required: z.boolean(),
+    headerName: z.literal("authorization"),
+    scheme: z.literal("bearer"),
+  }).default({
+    required: false,
+    headerName: "authorization",
+    scheme: "bearer",
+  }),
 });
 export type ClientConfig = z.infer<typeof ClientConfig>;
 

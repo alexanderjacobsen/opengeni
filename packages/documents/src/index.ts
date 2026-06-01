@@ -229,11 +229,7 @@ export function documentOpenAIEmbeddingConfig(settings?: Settings): {
   }
   if (settings.openaiProvider === "azure") {
     const baseURL = settings.azureOpenaiBaseUrl ?? azureDeploymentBaseUrl(settings);
-    const defaultQuery = settings.azureOpenaiBaseUrl
-      ? undefined
-      : settings.azureOpenaiApiVersion
-        ? { "api-version": settings.azureOpenaiApiVersion }
-        : undefined;
+    const defaultQuery = settings.azureOpenaiApiVersion ? { "api-version": settings.azureOpenaiApiVersion } : undefined;
     return {
       apiKey: settings.azureOpenaiApiKey ?? settings.azureOpenaiAdToken ?? "azure-ad-token",
       baseURL,

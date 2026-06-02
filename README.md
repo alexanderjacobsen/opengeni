@@ -83,7 +83,7 @@ Temporal coordinates the work, but token streams and tool output do not go throu
 
 ## Agent Guides
 
-Pair this README with the CloudGeni guide for product integration context and the Infrastructure Agents guide for operating infrastructure-focused agents with repositories, sandbox tools, Terraform/Checkov skills, GitHub App access, and cloud credentials.
+Pair this README with the [CloudGeni Infrastructure Agents Guide](https://github.com/Cloudgeni-ai/infrastructure-agents-guide) for architecture patterns and operating guidance around infrastructure-focused agents, including repositories, sandbox tools, Terraform/Checkov skills, GitHub App access, and cloud credentials.
 
 ## Quick Start
 

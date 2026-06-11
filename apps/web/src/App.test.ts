@@ -14,8 +14,21 @@ import {
   scheduleFromFormState,
   selectedAvailableCapabilityToolIds,
   summarizePackContents,
+  workspaceAgentPath,
+  workspaceSessionPath,
 } from "./App";
 import type { CapabilityCatalogItem, GitHubRepository, ResourceRef, ScheduledTask, ScheduledTaskScheduleSpec, Session, SessionEvent } from "./types";
+
+describe("workspace route helpers", () => {
+  test("builds canonical workspace-scoped console URLs", () => {
+    expect(workspaceAgentPath("workspace-1")).toBe("/workspaces/workspace-1/agent");
+    expect(workspaceSessionPath("workspace-1", "session-1")).toBe("/workspaces/workspace-1/sessions/session-1");
+  });
+
+  test("does not build legacy unscoped session URLs", () => {
+    expect(workspaceSessionPath("workspace-1", "session-1")).not.toBe("/sessions/session-1");
+  });
+});
 
 describe("projectConversation", () => {
   test("keeps assistant messages and activity groups in event order", () => {

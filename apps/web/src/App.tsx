@@ -34,7 +34,29 @@ import {
   WrenchIcon,
   XIcon,
 } from "lucide-react";
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Link,
+  Navigate,
+  Outlet,
+  RouterProvider,
+  createRoute,
+  createRootRoute,
+  createRouter,
+  useNavigate,
+  useRouterState,
+} from "@tanstack/react-router";
+import { TanStackRouterDevtools } from "@tanstack/react-router-devtools";
+import {
+  createContext,
+  type Dispatch,
+  type ReactNode,
+  type SetStateAction,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Toaster, toast } from "sonner";
 
 import { Composer } from "@/components/Composer";
@@ -193,16 +215,159 @@ type ConversationActivityTurn = {
 
 type ConversationTurn = ConversationUserTurn | ConversationAssistantTurn | ConversationActivityTurn;
 
+type AppContextValue = {
+  clientConfig: ClientConfig;
+  authSession: AuthSession | null;
+  accessContext: AccessContext;
+  workspaces: Workspace[];
+  accessKeyVersion: number;
+  keyAuthRequired: boolean;
+  model: string;
+  setModel: Dispatch<SetStateAction<string>>;
+  reasoningEffort: IntelligenceEffort;
+  setReasoningEffort: Dispatch<SetStateAction<IntelligenceEffort>>;
+  inspectorOpen: boolean;
+  setInspectorOpen: Dispatch<SetStateAction<boolean>>;
+  session: Session | null;
+  setSession: Dispatch<SetStateAction<Session | null>>;
+  events: SessionEvent[];
+  setEvents: Dispatch<SetStateAction<SessionEvent[]>>;
+  connectionState: ConnectionState;
+  setConnectionState: Dispatch<SetStateAction<ConnectionState>>;
+  manualRepos: RepoDraft[];
+  setManualRepos: Dispatch<SetStateAction<RepoDraft[]>>;
+  manualReposOpen: boolean;
+  setManualReposOpen: Dispatch<SetStateAction<boolean>>;
+  selectedRepoIds: Set<number>;
+  setSelectedRepoIds: Dispatch<SetStateAction<Set<number>>>;
+  selectedRepoRefs: Record<number, string>;
+  setSelectedRepoRefs: Dispatch<SetStateAction<Record<number, string>>>;
+  githubRepos: GitHubRepository[];
+  githubStatus: { configured: boolean; missing: string[]; installUrl: string | null } | null;
+  githubAppOpen: boolean;
+  setGithubAppOpen: Dispatch<SetStateAction<boolean>>;
+  githubOrg: string;
+  setGithubOrg: Dispatch<SetStateAction<string>>;
+  openGeniToolEnabled: boolean;
+  setOpenGeniToolEnabled: Dispatch<SetStateAction<boolean>>;
+  documentSearchEnabled: boolean;
+  setDocumentSearchEnabled: Dispatch<SetStateAction<boolean>>;
+  selectedCapabilityToolIds: Set<string>;
+  setSelectedCapabilityToolIds: Dispatch<SetStateAction<Set<string>>>;
+  busy: boolean;
+  repoBusy: boolean;
+  githubAppBusy: boolean;
+  selectedInstallationId: number | null;
+  repositoryGroups: ReturnType<typeof groupRepositories>;
+  customMcpServers: McpServerOption[];
+  currentResources: ResourceRef[];
+  addManualRepository: () => void;
+  forgetAccessKey: () => void;
+  handleManagedSignOut: () => Promise<void>;
+  refreshGitHub: (workspaceId: string, signal?: AbortSignal) => Promise<void>;
+  refreshWorkspaceMcpServers: (workspaceId: string, signal?: AbortSignal) => Promise<void>;
+  startGitHubAppManifestFlow: (workspaceId: string) => Promise<void>;
+  toggleGitHubRepository: (repo: GitHubRepository) => void;
+  startSession: (workspaceId: string, submission: TurnSubmission) => Promise<Session | null>;
+  submitFollowUp: (workspaceId: string, sessionId: string, submission: TurnSubmission) => Promise<void>;
+  interruptSession: (workspaceId: string, sessionId: string) => Promise<void>;
+  resetSessionView: () => void;
+  resetWorkspaceIntegrations: () => void;
+};
+
+const AppContext = createContext<AppContextValue | null>(null);
+
+const rootRoute = createRootRoute({
+  component: RootRouteComponent,
+  notFoundComponent: NotFoundRoute,
+});
+const indexRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/",
+  component: RootIndexRoute,
+});
+const workspaceRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "workspaces/$workspaceId",
+  component: WorkspaceShellRoute,
+});
+const workspaceIndexRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "/",
+  component: WorkspaceIndexRoute,
+});
+const workspaceAgentRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "agent",
+  component: AgentHomeRoute,
+});
+const workspaceSessionRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "sessions/$sessionId",
+  component: SessionRoute,
+});
+const workspaceDocumentsRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "documents",
+  component: DocumentsRoute,
+});
+const workspaceCapabilitiesRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "capabilities",
+  component: CapabilitiesRoute,
+});
+const workspaceSchedulesRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "schedules",
+  component: SchedulesRoute,
+});
+const workspaceAccountRoute = createRoute({
+  getParentRoute: () => workspaceRoute,
+  path: "account",
+  component: AccountRoute,
+});
+const routeTree = rootRoute.addChildren([
+  indexRoute,
+  workspaceRoute.addChildren([
+    workspaceIndexRoute,
+    workspaceAgentRoute,
+    workspaceSessionRoute,
+    workspaceDocumentsRoute,
+    workspaceCapabilitiesRoute,
+    workspaceSchedulesRoute,
+    workspaceAccountRoute,
+  ]),
+]);
+const router = createRouter({ routeTree });
+
+declare module "@tanstack/react-router" {
+  interface Register {
+    router: typeof router;
+  }
+}
+
 export function App() {
-  const [sessionId, setSessionId] = useState(() => sessionIdFromPath());
-  const [activeView, setActiveView] = useState<"agent" | "documents" | "capabilities" | "account">("agent");
+  return <RouterProvider router={router} />;
+}
+
+export function workspaceAgentPath(workspaceId: string): string {
+  return `/workspaces/${encodeURIComponent(workspaceId)}/agent`;
+}
+
+export function workspaceSessionPath(workspaceId: string, sessionId: string): string {
+  return `/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}`;
+}
+
+function RootRouteComponent() {
   const [session, setSession] = useState<Session | null>(null);
   const [events, setEvents] = useState<SessionEvent[]>([]);
   const [clientConfig, setClientConfig] = useState<ClientConfig | null>(null);
+  const [configError, setConfigError] = useState<string | null>(null);
   const [authSession, setAuthSession] = useState<AuthSession | null | undefined>(undefined);
   const [accessContext, setAccessContext] = useState<AccessContext | null>(null);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
-  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(null);
+  const [accessLoading, setAccessLoading] = useState(false);
+  const [accessError, setAccessError] = useState<string | null>(null);
   const [model, setModel] = useState("gpt-5.5");
   const [reasoningEffort, setReasoningEffort] = useState<IntelligenceEffort>("low");
   const [inspectorOpen, setInspectorOpen] = useState(true);
@@ -221,144 +386,123 @@ export function App() {
   const [workspaceMcpServers, setWorkspaceMcpServers] = useState<McpServerOption[]>([]);
   const [selectedCapabilityToolIds, setSelectedCapabilityToolIds] = useState<Set<string>>(() => new Set());
   const previousCapabilityToolIds = useRef<Set<string>>(new Set());
+  const githubRefreshId = useRef(0);
+  const mcpRefreshId = useRef(0);
   const [busy, setBusy] = useState(false);
   const [repoBusy, setRepoBusy] = useState(false);
   const [githubAppBusy, setGithubAppBusy] = useState(false);
   const [hasAccessKey, setHasAccessKey] = useState(() => getStoredAccessKey() !== null);
   const [accessKeyDraft, setAccessKeyDraft] = useState("");
   const [accessKeyVersion, setAccessKeyVersion] = useState(0);
-  const lastSequence = useMemo(() => events.reduce((max, event) => Math.max(max, event.sequence), 0), [events]);
   const keyAuthRequired = clientConfig?.auth.mode === "deploymentKey" || clientConfig?.auth.mode === "configuredToken";
   const managedAuthRequired = clientConfig?.auth.mode === "managedSession";
   const keyAuthReady = !keyAuthRequired || hasAccessKey;
-  const managedAuthReady = !managedAuthRequired || authSession !== null;
+  const managedAuthReady = !managedAuthRequired || Boolean(authSession);
   const authReady = keyAuthReady && managedAuthReady;
-  const workspaceId = selectedWorkspaceId ?? accessContext?.defaultWorkspaceId ?? workspaces[0]?.id ?? null;
-  const activeWorkspace = workspaceId ? workspaces.find((workspace) => workspace.id === workspaceId) ?? null : null;
-  const workspaceReady = authReady && workspaceId !== null;
+  const defaultWorkspaceId = accessContext?.defaultWorkspaceId ?? workspaces[0]?.id ?? accessContext?.workspaceGrants[0]?.workspaceId ?? null;
+  const navigate = useNavigate();
 
   useEffect(() => {
+    let cancelled = false;
     void fetchClientConfig()
       .then((config) => {
+        if (cancelled) {
+          return;
+        }
         setClientConfig(config);
+        setConfigError(null);
         setModel(config.defaultModel);
         if (isUiReasoningEffort(config.defaultReasoningEffort)) {
           setReasoningEffort(config.defaultReasoningEffort);
         }
       })
-      .catch((error) => toast.error("Failed to load client config", { description: String(error) }));
+      .catch((error) => {
+        if (cancelled) {
+          return;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        setConfigError(message);
+        toast.error("Failed to load client config", { description: message });
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
-    if (clientConfig?.auth.mode !== "managedSession") {
+    if (!clientConfig) {
+      return;
+    }
+    if (clientConfig.auth.mode !== "managedSession") {
       setAuthSession(null);
       return;
     }
+    let cancelled = false;
+    setAuthSession(undefined);
     void fetchAuthSession()
-      .then(setAuthSession)
-      .catch(() => setAuthSession(null));
+      .then((nextSession) => {
+        if (!cancelled) {
+          setAuthSession(nextSession);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setAuthSession(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [clientConfig]);
 
   useEffect(() => {
     if (!clientConfig || !authReady) {
-      return;
-    }
-    void Promise.all([fetchAccessContext(), fetchWorkspaces()])
-      .then(([context, nextWorkspaces]) => {
-        setAccessContext(context);
-        setWorkspaces(nextWorkspaces);
-        setSelectedWorkspaceId((current) => {
-          if (current && nextWorkspaces.some((workspace) => workspace.id === current)) {
-            return current;
-          }
-          return context.defaultWorkspaceId ?? nextWorkspaces[0]?.id ?? context.workspaceGrants[0]?.workspaceId ?? null;
-        });
-      })
-      .catch((error) => toast.error("Failed to load workspace access", { description: String(error) }));
-  }, [clientConfig, authReady, accessKeyVersion]);
-
-  useEffect(() => {
-    if (!clientConfig || !workspaceReady || !workspaceId) {
-      return;
-    }
-    void refreshGitHub();
-  }, [clientConfig, workspaceReady, workspaceId, accessKeyVersion]);
-
-  useEffect(() => {
-    if (!workspaceReady || !workspaceId) {
-      setWorkspaceMcpServers([]);
-      return;
-    }
-    void refreshWorkspaceMcpServers()
-      .catch((error) => toast.error("Failed to load workspace MCP tools", { description: String(error) }));
-  }, [workspaceReady, workspaceId, accessKeyVersion]);
-
-  useEffect(() => {
-    if (!workspaceReady || !workspaceId) {
-      return;
-    }
-    if (!sessionId) {
-      setSession(null);
-      setEvents([]);
-      setConnectionState("closed");
+      setAccessContext(null);
+      setWorkspaces([]);
+      setAccessLoading(false);
+      setAccessError(null);
       return;
     }
     let cancelled = false;
-    setSession(null);
-    setEvents([]);
-    void (async () => {
-      try {
-        const [nextSession, nextEvents] = await Promise.all([
-          fetchSession(workspaceId, sessionId),
-          fetchEvents(workspaceId, sessionId),
-        ]);
+    setAccessLoading(true);
+    setAccessError(null);
+    void Promise.all([fetchAccessContext(), fetchWorkspaces()])
+      .then(([context, nextWorkspaces]) => {
         if (cancelled) {
           return;
         }
-        setSession(nextSession);
-        setEvents(nextEvents);
-        if (isTerminalSessionStatus(nextSession.status)) {
-          forgetSession(workspaceId, nextSession.id);
-        }
-      } catch (error) {
+        setAccessContext(context);
+        setWorkspaces(nextWorkspaces);
+      })
+      .catch((error) => {
         if (cancelled) {
           return;
         }
-        setSession(null);
-        setEvents([]);
-        setConnectionState("closed");
-        if (isApiErrorStatus(error, 404)) {
-          forgetSession(workspaceId, sessionId);
-          setSessionId(null);
-          if (sessionIdFromPath() === sessionId) {
-            window.history.replaceState({}, "", "/");
-          }
-          toast.error("Session no longer exists", { description: "It was removed from recent sessions." });
-          return;
+        toast.error("Failed to load workspace access", { description: String(error) });
+        setAccessContext(null);
+        setWorkspaces([]);
+        setAccessError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setAccessLoading(false);
         }
-        toast.error("Failed to load session", { description: String(error) });
-      }
-    })();
+      });
     return () => {
       cancelled = true;
     };
-  }, [sessionId, workspaceReady, workspaceId, accessKeyVersion]);
-
-  useSessionStream(workspaceReady ? workspaceId : null, workspaceReady ? sessionId : null, lastSequence, accessKeyVersion, (incoming) => {
-    setEvents((current) => mergeEvents(current, incoming));
-    setSession((current) => current ? applySessionStatusEvents(current, incoming) : current);
-  }, setConnectionState);
+  }, [clientConfig, authReady, accessKeyVersion]);
 
   const selectedInstalledRepositories = githubRepos.filter((repo) => selectedRepoIds.has(repo.id));
   const selectedInstallationId = selectedInstalledRepositories[0]?.installationId ?? null;
   const repositoryGroups = useMemo(() => groupRepositories(githubRepos), [githubRepos]);
-  const conversation = useMemo(() => session ? projectConversation(session, events) : [], [session, events]);
-  const approvals = events.flatMap((event) => event.type === "session.requiresAction" ? approvalItems(event.payload) : []);
-  const canSendFollowUp = session?.status === "idle";
-  const sessionRunning = session?.status === "running" || session?.status === "queued";
   const customMcpServers = useMemo(
     () => mergeMcpServerOptions(enabledCustomMcpServers(clientConfig), workspaceMcpServers),
     [clientConfig, workspaceMcpServers],
+  );
+  const currentResources = useMemo(
+    () => buildResources(manualRepos, githubRepos, selectedRepoIds, selectedRepoRefs),
+    [manualRepos, githubRepos, selectedRepoIds, selectedRepoRefs],
   );
 
   useEffect(() => {
@@ -370,97 +514,89 @@ export function App() {
     previousCapabilityToolIds.current = new Set(availableIds);
   }, [clientConfig, customMcpServers]);
 
-  async function refreshGitHub() {
-    if (!workspaceId) {
-      return;
-    }
+  async function refreshGitHub(workspaceId: string, signal?: AbortSignal) {
+    const refreshId = githubRefreshId.current + 1;
+    githubRefreshId.current = refreshId;
     setRepoBusy(true);
     try {
-      const status = await fetchGitHubStatus(workspaceId);
+      const status = await fetchGitHubStatus(workspaceId, signal);
+      if (signal?.aborted || githubRefreshId.current !== refreshId) {
+        return;
+      }
       setGithubStatus(status);
       setGithubAppOpen(!status.configured);
       if (status.configured) {
-        setGithubRepos(await fetchGitHubRepositories(workspaceId));
+        const repositories = await fetchGitHubRepositories(workspaceId, signal);
+        if (signal?.aborted || githubRefreshId.current !== refreshId) {
+          return;
+        }
+        setGithubRepos(repositories);
+      } else {
+        setGithubRepos([]);
       }
     } catch (error) {
+      if (isAbortError(error) || signal?.aborted || githubRefreshId.current !== refreshId) {
+        return;
+      }
       setGithubStatus({ configured: false, missing: [], installUrl: null });
+      setGithubRepos([]);
       toast.error("GitHub status unavailable", { description: String(error) });
     } finally {
-      setRepoBusy(false);
+      if (githubRefreshId.current === refreshId) {
+        setRepoBusy(false);
+      }
     }
   }
 
-  async function refreshClientConfig() {
-    const config = await fetchClientConfig();
-    setClientConfig(config);
-    setModel((current) => config.allowedModels.includes(current) ? current : config.defaultModel);
-    if (isUiReasoningEffort(config.defaultReasoningEffort)) {
-      setReasoningEffort((current) => config.allowedReasoningEfforts.includes(current) ? current : config.defaultReasoningEffort as IntelligenceEffort);
-    }
-  }
-
-  async function refreshWorkspaceMcpServers() {
-    if (!workspaceId) {
+  async function refreshWorkspaceMcpServers(workspaceId: string, signal?: AbortSignal) {
+    const refreshId = mcpRefreshId.current + 1;
+    mcpRefreshId.current = refreshId;
+    const catalog = await fetchCapabilities(workspaceId, signal);
+    if (signal?.aborted || mcpRefreshId.current !== refreshId) {
       return;
     }
-    const catalog = await fetchCapabilities(workspaceId);
     setWorkspaceMcpServers(enabledWorkspaceCapabilityMcpServers(catalog.items));
   }
 
-  async function submitInitial(submission: TurnSubmission) {
-    if (!workspaceId) {
-      toast.error("Select a workspace before starting a session");
-      return;
-    }
+  async function startSession(workspaceId: string, submission: TurnSubmission): Promise<Session | null> {
     setBusy(true);
     try {
-      const selectedResources = buildResources(manualRepos, githubRepos, selectedRepoIds, selectedRepoRefs);
       const selectedTools = buildTools(submission.tools, documentSearchEnabled, openGeniToolEnabled, [...selectedCapabilityToolIds]);
       const created = await createSession({
         workspaceId,
         initialMessage: submission.text,
-        resources: [...selectedResources, ...(submission.resources ?? [])],
+        resources: [...currentResources, ...(submission.resources ?? [])],
         tools: selectedTools,
         model,
         reasoningEffort,
       });
       rememberSession(created);
       setSession(created);
-      setSessionId(created.id);
-      window.history.pushState({}, "", `/sessions/${created.id}`);
+      setEvents([]);
+      setConnectionState("closed");
+      return created;
     } catch (error) {
       toast.error("Failed to start session", { description: error instanceof Error ? error.message : String(error) });
+      return null;
     } finally {
       setBusy(false);
     }
   }
 
-  function selectSession(id: string) {
-    setActiveView("agent");
-    setSessionId(id);
-    window.history.pushState({}, "", `/sessions/${id}`);
-  }
-
-  function goHome() {
-    setActiveView("agent");
-    setSessionId(null);
-    window.history.pushState({}, "", "/");
-  }
-
-  async function submitFollowUp(submission: TurnSubmission) {
-    if (!workspaceId || !session || !submission.text.trim()) {
+  async function submitFollowUp(workspaceId: string, sessionId: string, submission: TurnSubmission) {
+    if (!submission.text.trim()) {
       return;
     }
     setBusy(true);
     try {
-      await sendUserMessage(workspaceId, session.id, {
+      await sendUserMessage(workspaceId, sessionId, {
         ...submission,
         text: submission.text.trim(),
         tools: buildTools(submission.tools, documentSearchEnabled, openGeniToolEnabled, [...selectedCapabilityToolIds]),
         model,
         reasoningEffort,
       });
-      setSession(await fetchSession(workspaceId, session.id));
+      setSession(await fetchSession(workspaceId, sessionId));
     } catch (error) {
       toast.error("Failed to send follow-up", { description: error instanceof Error ? error.message : String(error) });
     } finally {
@@ -468,14 +604,15 @@ export function App() {
     }
   }
 
-  async function interruptSession() {
-    if (!workspaceId || !session || !sessionRunning) {
+  async function interruptSession(workspaceId: string, sessionId: string) {
+    const current = session?.id === sessionId ? session : null;
+    if (!current || (current.status !== "running" && current.status !== "queued")) {
       return;
     }
     setBusy(true);
     try {
-      await sendInterrupt(workspaceId, session.id, "user requested cancellation");
-      setSession(await fetchSession(workspaceId, session.id));
+      await sendInterrupt(workspaceId, sessionId, "user requested cancellation");
+      setSession(await fetchSession(workspaceId, sessionId));
     } catch (error) {
       toast.error("Failed to interrupt session", { description: error instanceof Error ? error.message : String(error) });
     } finally {
@@ -483,11 +620,7 @@ export function App() {
     }
   }
 
-  async function startGitHubAppManifestFlow() {
-    if (!workspaceId) {
-      toast.error("Select a workspace before setting up GitHub");
-      return;
-    }
+  async function startGitHubAppManifestFlow(workspaceId: string) {
     setGithubAppBusy(true);
     try {
       const result = await startGitHubManifest(workspaceId, githubOrg.trim() || undefined);
@@ -532,6 +665,7 @@ export function App() {
     setStoredAccessKey(key);
     setHasAccessKey(true);
     setAccessKeyDraft("");
+    setAccessError(null);
     setAccessKeyVersion((version) => version + 1);
   }
 
@@ -540,6 +674,9 @@ export function App() {
     setHasAccessKey(false);
     setSession(null);
     setEvents([]);
+    setAccessContext(null);
+    setWorkspaces([]);
+    setAccessError(null);
     setAccessKeyVersion((version) => version + 1);
   }
 
@@ -562,340 +699,678 @@ export function App() {
     setAuthSession(null);
     setAccessContext(null);
     setWorkspaces([]);
-    setSelectedWorkspaceId(null);
     setSession(null);
     setEvents([]);
-    setSessionId(null);
+    setAccessError(null);
     setAccessKeyVersion((version) => version + 1);
-    window.history.pushState({}, "", "/");
+    await navigate({ to: "/", replace: true });
   }
+
+  function resetSessionView() {
+    setSession(null);
+    setEvents([]);
+    setConnectionState("closed");
+  }
+
+  function resetWorkspaceIntegrations() {
+    setGithubStatus(null);
+    setGithubRepos([]);
+    setWorkspaceMcpServers([]);
+  }
+
+  const appContext = clientConfig && accessContext ? {
+    clientConfig,
+    authSession: authSession ?? null,
+    accessContext,
+    workspaces,
+    accessKeyVersion,
+    keyAuthRequired: keyAuthRequired === true,
+    model,
+    setModel,
+    reasoningEffort,
+    setReasoningEffort,
+    inspectorOpen,
+    setInspectorOpen,
+    session,
+    setSession,
+    events,
+    setEvents,
+    connectionState,
+    setConnectionState,
+    manualRepos,
+    setManualRepos,
+    manualReposOpen,
+    setManualReposOpen,
+    selectedRepoIds,
+    setSelectedRepoIds,
+    selectedRepoRefs,
+    setSelectedRepoRefs,
+    githubRepos,
+    githubStatus,
+    githubAppOpen,
+    setGithubAppOpen,
+    githubOrg,
+    setGithubOrg,
+    openGeniToolEnabled,
+    setOpenGeniToolEnabled,
+    documentSearchEnabled,
+    setDocumentSearchEnabled,
+    selectedCapabilityToolIds,
+    setSelectedCapabilityToolIds,
+    busy,
+    repoBusy,
+    githubAppBusy,
+    selectedInstallationId,
+    repositoryGroups,
+    customMcpServers,
+    currentResources,
+    addManualRepository,
+    forgetAccessKey,
+    handleManagedSignOut,
+    refreshGitHub,
+    refreshWorkspaceMcpServers,
+    startGitHubAppManifestFlow,
+    toggleGitHubRepository,
+    startSession,
+    submitFollowUp,
+    interruptSession,
+    resetSessionView,
+    resetWorkspaceIntegrations,
+  } satisfies AppContextValue : null;
 
   return (
     <main className="flex h-dvh min-h-screen flex-col overflow-x-hidden bg-[color:var(--color-bg)] text-[color:var(--color-fg)]">
       <Toaster richColors theme="dark" />
-      <header className="sticky top-0 z-40 flex h-14 items-center gap-3 border-b border-[color:var(--color-border)] bg-[color:var(--color-bg)]/75 px-4 backdrop-blur sm:px-6">
-        <button
-          type="button"
-          onClick={goHome}
-          className="flex shrink-0 items-center gap-2 rounded-md px-1.5 py-1 text-[15px] font-medium text-[color:var(--color-fg)] hover:bg-[color:var(--color-surface-2)]"
-        >
-          <span className="flex size-6 items-center justify-center rounded-md bg-[color:var(--color-brand-strong)]/20 text-[color:var(--color-brand)]">
-            <SparkleIcon className="size-3.5" />
-          </span>
-          <span>OpenGeni Agent</span>
-        </button>
-
-        <nav className="flex items-center gap-1 rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-surface)]/45 p-1">
-          <Button
-            type="button"
-            variant={activeView === "agent" ? "secondary" : "ghost"}
-            size="sm"
-            onClick={() => setActiveView("agent")}
-            className="h-8 px-2.5 text-xs"
-          >
-            <BotIcon className="size-3.5" />
-            <span className="hidden sm:inline">Agent</span>
-          </Button>
-          <Button
-            type="button"
-            variant={activeView === "documents" ? "secondary" : "ghost"}
-            size="sm"
-            onClick={() => setActiveView("documents")}
-            className="h-8 px-2.5 text-xs"
-          >
-            <FileSearchIcon className="size-3.5" />
-            <span className="hidden sm:inline">Documents</span>
-          </Button>
-          <Button
-            type="button"
-            variant={activeView === "capabilities" ? "secondary" : "ghost"}
-            size="sm"
-            onClick={() => setActiveView("capabilities")}
-            className="h-8 px-2.5 text-xs"
-          >
-            <PlugIcon className="size-3.5" />
-            <span className="hidden sm:inline">Capabilities</span>
-          </Button>
-          <Button
-            type="button"
-            variant={activeView === "account" ? "secondary" : "ghost"}
-            size="sm"
-            onClick={() => setActiveView("account")}
-            className="h-8 px-2.5 text-xs"
-          >
-            <UserIcon className="size-3.5" />
-            <span className="hidden sm:inline">Account</span>
-          </Button>
-        </nav>
-
-        {session && activeView === "agent" ? (
-          <div className="flex min-w-0 items-center gap-2">
-            <Button type="button" variant="ghost" size="icon-sm" onClick={goHome} aria-label="Back to sessions">
-              <ArrowLeftIcon className="size-4" />
-            </Button>
-            <div className="hidden min-w-0 sm:block">
-              <div className="truncate text-sm font-medium">{session.initialMessage}</div>
-              <div className="truncate text-xs text-[color:var(--color-fg-subtle)]">
-                {session.model} · {String(session.metadata.reasoningEffort ?? "low")} · {session.sandboxBackend}
-              </div>
-            </div>
-          </div>
-        ) : null}
-
-        {workspaces.length > 1 ? (
-          <label className="hidden min-w-0 items-center gap-2 sm:flex">
-            <span className="sr-only">Workspace</span>
-            <select
-              value={workspaceId ?? ""}
-              onChange={(event) => {
-                const nextWorkspaceId = event.target.value || null;
-                setSelectedWorkspaceId(nextWorkspaceId);
-                setSession(null);
-                setEvents([]);
-                setSessionId(null);
-                window.history.pushState({}, "", "/");
-              }}
-              className="h-8 max-w-52 rounded-md border border-[color:var(--color-border)] bg-[color:var(--color-surface)] px-2 text-xs text-[color:var(--color-fg)]"
-            >
-              {workspaces.map((workspace) => (
-                <option key={workspace.id} value={workspace.id}>{workspace.name}</option>
-              ))}
-            </select>
-          </label>
-        ) : activeWorkspace ? (
-          <div className="hidden max-w-52 truncate rounded-md border border-[color:var(--color-border)] bg-[color:var(--color-surface)] px-2 py-1.5 text-xs text-[color:var(--color-fg-muted)] sm:block">
-            {activeWorkspace.name}
-          </div>
-        ) : null}
-
-        <div className="ml-auto flex items-center gap-2">
-          {keyAuthRequired ? (
-            <Button type="button" variant="ghost" size="icon-sm" onClick={forgetAccessKey} aria-label="Clear access key">
-              <LockIcon className="size-4" />
-            </Button>
-          ) : null}
-          {session && activeView === "agent" ? <ConnectionPill state={connectionState} /> : null}
-          {session && activeView === "agent" ? <StatusBadge status={session.status} /> : null}
-          {session && activeView === "agent" ? (
-            <Button
-              type="button"
-              variant={inspectorOpen ? "secondary" : "ghost"}
-              size="icon-sm"
-              onClick={() => setInspectorOpen((open) => !open)}
-              aria-label="Toggle debug inspector"
-            >
-              <PanelRightIcon className="size-4" />
-            </Button>
-          ) : null}
-        </div>
-      </header>
-
-      {keyAuthRequired && !hasAccessKey ? (
-        <section className="flex flex-1 items-center justify-center px-4">
-          <form
-            className="w-full max-w-sm rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-surface)] p-5 shadow-sm"
-            onSubmit={(event) => {
-              event.preventDefault();
-              saveAccessKey();
-            }}
-          >
-            <div className="mb-4 flex items-center gap-3">
-              <span className="flex size-9 items-center justify-center rounded-md bg-[color:var(--color-brand-strong)]/20 text-[color:var(--color-brand)]">
-                <LockIcon className="size-4" />
-              </span>
-              <div>
-                <h1 className="text-base font-semibold">Access key required</h1>
-                <p className="text-sm text-[color:var(--color-fg-subtle)]">
-                  Enter the {clientConfig?.auth.mode === "configuredToken" ? "configured bearer token" : "deployment key"} for this OpenGeni instance.
-                </p>
-              </div>
-            </div>
-            <Label htmlFor="access-key">Access key</Label>
-            <Input
-              id="access-key"
-              type="password"
-              value={accessKeyDraft}
-              onChange={(event) => setAccessKeyDraft(event.target.value)}
-              autoComplete="current-password"
-              className="mt-2"
-              autoFocus
-            />
-            <Button type="submit" className="mt-4 w-full">
-              <CheckIcon className="size-4" />
-              Continue
-            </Button>
-          </form>
-        </section>
+      {!clientConfig && !configError ? (
+        <LoadingPanel label="Loading OpenGeni" />
+      ) : configError ? (
+        <ProblemPanel title="Client configuration unavailable" description={configError} />
+      ) : keyAuthRequired && !hasAccessKey ? (
+        <AccessKeyPanel
+          authMode={clientConfig?.auth.mode}
+          accessKeyDraft={accessKeyDraft}
+          setAccessKeyDraft={setAccessKeyDraft}
+          onSubmit={saveAccessKey}
+        />
       ) : managedAuthRequired && authSession === undefined ? (
-        <section className="grid flex-1 place-items-center px-4 text-center">
-          <div className="max-w-sm rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-surface)] p-5 text-sm text-[color:var(--color-fg-muted)]">
-            <Loader2Icon className="mx-auto mb-3 size-5 animate-spin text-[color:var(--color-fg)]" />
-            Checking session
-          </div>
-        </section>
+        <LoadingPanel label="Checking session" />
       ) : managedAuthRequired && !authSession ? (
         <ManagedAuthPanel onSubmit={handleManagedAuth} />
-      ) : !workspaceReady ? (
-        <section className="grid flex-1 place-items-center px-4 text-center">
-          <div className="max-w-sm rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-surface)] p-5 text-sm text-[color:var(--color-fg-muted)]">
-            <Loader2Icon className="mx-auto mb-3 size-5 animate-spin text-[color:var(--color-fg)]" />
-            Loading workspace
-          </div>
-        </section>
+      ) : accessError && !accessLoading ? (
+        <ProblemPanel
+          title="Workspace access unavailable"
+          description={accessError}
+          action={(
+            <Button type="button" variant="secondary" onClick={() => setAccessKeyVersion((version) => version + 1)}>
+              Retry
+            </Button>
+          )}
+        />
+      ) : accessLoading || !appContext ? (
+        <LoadingPanel label="Loading workspace access" />
+      ) : !defaultWorkspaceId ? (
+        <ProblemPanel title="No workspace access" description="This subject does not have access to any OpenGeni workspace." />
       ) : (
-        <>
-
-      {activeView === "account" ? (
-        <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col px-4 py-5 sm:px-6 lg:px-8">
-          <AccountConsole
-            workspaceId={workspaceId ?? ""}
-            accountId={accessContext?.defaultAccountId ?? activeWorkspace?.accountId ?? ""}
-            authSession={authSession ?? null}
-            accessContext={accessContext}
-            clientConfig={clientConfig}
-            onSignOut={() => void handleManagedSignOut().catch((error) => toast.error("Sign out failed", { description: String(error) }))}
-          />
-        </div>
-      ) : activeView === "capabilities" ? (
-        <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-4 py-5 sm:px-6 lg:px-8">
-          <CapabilitiesWorkspace workspaceId={workspaceId ?? ""} onRuntimeChanged={() => void refreshWorkspaceMcpServers()} />
-        </div>
-      ) : activeView === "documents" ? (
-        <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-4 py-5 sm:px-6 lg:px-8">
-          <DocumentsWorkspace workspaceId={workspaceId ?? ""} fileUploadsEnabled={clientConfig?.fileUploads.enabled === true} />
-        </div>
-      ) : !session ? (
-        <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col px-4 pt-10 pb-16 sm:px-6 sm:pt-16">
-          <section className="flex flex-col items-center gap-2 text-center">
-            <h1 className="text-balance text-2xl font-semibold tracking-tight sm:text-3xl">
-              What should the agent do?
-            </h1>
-            <p className="max-w-md text-sm text-[color:var(--color-fg-muted)]">
-              Start a durable sandbox session with live streams, approvals, interrupts, and follow-ups.
-            </p>
-          </section>
-
-          <div className="mt-8">
-            <Composer
-              workspaceId={workspaceId ?? ""}
-              autoFocus
-              pending={busy}
-              fileUploadsEnabled={clientConfig?.fileUploads.enabled === true}
-              placeholder="Describe a task for the agent..."
-              submitLabel={busy ? "Starting" : "Send"}
-              examples={examples}
-              controlsStart={
-                <div className="flex min-w-0 items-center gap-1.5">
-                  <ModelPicker
-                    config={clientConfig}
-                    model={model}
-                    effort={reasoningEffort}
-                    disabled={busy}
-                    onModelChange={setModel}
-                    onEffortChange={setReasoningEffort}
-                  />
-                  <RepositoryContextPicker
-                    configured={githubStatus?.configured === true}
-                    installUrl={githubStatus?.installUrl ?? null}
-                    repositories={githubRepos}
-                    groups={repositoryGroups}
-                    selectedRepoIds={selectedRepoIds}
-                    selectedRepoRefs={selectedRepoRefs}
-                    selectedInstallationId={selectedInstallationId}
-                    manualRepos={manualRepos}
-                    manualOpen={manualReposOpen}
-                    githubAppOpen={githubAppOpen}
-                    org={githubOrg}
-                    pending={busy}
-                    repoBusy={repoBusy}
-                    githubAppBusy={githubAppBusy}
-                    onRefresh={refreshGitHub}
-                    onToggleRepo={toggleGitHubRepository}
-                    onRefChange={(repoId, ref) => setSelectedRepoRefs((current) => ({ ...current, [repoId]: ref }))}
-                    onManualOpenChange={setManualReposOpen}
-                    onManualAdd={addManualRepository}
-                    onManualUpdate={(id, patch) => setManualRepos((current) => current.map((repo) => repo.id === id ? { ...repo, ...patch } : repo))}
-                    onManualRemove={(id) => setManualRepos((current) => current.filter((repo) => repo.id !== id))}
-                    onGitHubAppOpenChange={setGithubAppOpen}
-                    onOrgChange={setGithubOrg}
-                    onStartGitHubApp={startGitHubAppManifestFlow}
-                  />
-                  <DocumentSearchToolToggle
-                    enabled={documentSearchEnabled}
-                    disabled={busy}
-                    onToggle={() => setDocumentSearchEnabled((enabled) => !enabled)}
-                  />
-                  <OpenGeniToolToggle
-                    enabled={openGeniToolEnabled}
-                    disabled={busy}
-                    onToggle={() => setOpenGeniToolEnabled((enabled) => !enabled)}
-                  />
-                  <EnabledMcpToolPicker
-                    servers={customMcpServers}
-                    selectedIds={selectedCapabilityToolIds}
-                    disabled={busy}
-                    onChange={setSelectedCapabilityToolIds}
-                  />
-                </div>
-              }
-              onSubmit={submitInitial}
-            />
-            <RecentSessions workspaceId={workspaceId} onSelect={selectSession} />
-            <ScheduledTasksPanel
-              workspaceId={workspaceId ?? ""}
-              clientConfig={clientConfig}
-              resources={buildResources(manualRepos, githubRepos, selectedRepoIds, selectedRepoRefs)}
-              githubConfigured={githubStatus?.configured === true}
-              githubRepos={githubRepos}
-              repositoryGroups={repositoryGroups}
-              repoBusy={repoBusy}
-              onRefreshRepositories={refreshGitHub}
-              model={model}
-              reasoningEffort={reasoningEffort}
-              onSelectSession={selectSession}
-            />
-          </div>
-        </div>
-      ) : (
-        <div className={cn("grid min-h-0 w-full min-w-0 flex-1 grid-cols-1 overflow-hidden", inspectorOpen && "lg:grid-cols-[minmax(0,1fr)_minmax(0,390px)]")}>
-          <SessionChatPane
-            conversation={conversation}
-            approvals={approvals}
-            busy={busy}
-            canSendFollowUp={canSendFollowUp}
-            session={session}
-            sessionRunning={sessionRunning}
-            fileUploadsEnabled={clientConfig?.fileUploads.enabled === true}
-            documentSearchEnabled={documentSearchEnabled}
-            openGeniToolEnabled={openGeniToolEnabled}
-            customMcpServers={customMcpServers}
-            selectedCapabilityToolIds={selectedCapabilityToolIds}
-            clientConfig={clientConfig}
-            model={model}
-            reasoningEffort={reasoningEffort}
-            onDocumentSearchToggle={() => setDocumentSearchEnabled((enabled) => !enabled)}
-            onOpenGeniToolToggle={() => setOpenGeniToolEnabled((enabled) => !enabled)}
-            onCapabilityToolIdsChange={setSelectedCapabilityToolIds}
-            onModelChange={setModel}
-            onReasoningEffortChange={setReasoningEffort}
-            onSubmit={submitFollowUp}
-            onInterrupt={interruptSession}
-            onNewSession={goHome}
-            onApprove={(approvalId) => workspaceId ? void sendApproval(workspaceId, session.id, approvalId, "approve") : undefined}
-            onReject={(approvalId) => workspaceId ? void sendApproval(workspaceId, session.id, approvalId, "reject") : undefined}
-          />
-
-          {inspectorOpen ? (
-            <aside className="min-h-0 w-full min-w-0 overflow-hidden border-t border-[color:var(--color-border)] bg-[color:var(--color-surface)]/35 lg:border-t-0 lg:border-l">
-              <SessionInspector session={session} events={events} connectionState={connectionState} />
-            </aside>
-          ) : null}
-        </div>
-      )}
-        </>
+        <AppContext.Provider value={appContext}>
+          <Outlet />
+          {import.meta.env.DEV ? <TanStackRouterDevtools position="bottom-right" /> : null}
+        </AppContext.Provider>
       )}
     </main>
   );
+}
+
+function RootIndexRoute() {
+  const context = useAppContext();
+  const workspaceId = context.accessContext.defaultWorkspaceId ?? context.workspaces[0]?.id ?? context.accessContext.workspaceGrants[0]?.workspaceId;
+  if (!workspaceId) {
+    return <ProblemPanel title="No workspace access" description="This subject does not have access to any OpenGeni workspace." />;
+  }
+  return <Navigate to="/workspaces/$workspaceId/agent" params={{ workspaceId }} replace />;
+}
+
+function WorkspaceIndexRoute() {
+  const { workspaceId } = workspaceRoute.useParams();
+  return <Navigate to="/workspaces/$workspaceId/agent" params={{ workspaceId }} replace />;
+}
+
+function WorkspaceShellRoute() {
+  const context = useAppContext();
+  const navigate = useNavigate();
+  const { workspaceId } = workspaceRoute.useParams();
+  const pathname = useRouterState({ select: (state) => state.location.pathname });
+  const activeWorkspace = context.workspaces.find((workspace) => workspace.id === workspaceId) ?? null;
+  const isSessionRoute = pathname.includes(`/workspaces/${workspaceId}/sessions/`);
+  const previousWorkspaceId = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!activeWorkspace) {
+      return;
+    }
+    const abortController = new AbortController();
+    if (previousWorkspaceId.current !== workspaceId) {
+      context.resetSessionView();
+    }
+    previousWorkspaceId.current = workspaceId;
+    context.resetWorkspaceIntegrations();
+    context.setSelectedRepoIds(new Set());
+    context.setSelectedRepoRefs({});
+    void context.refreshGitHub(workspaceId, abortController.signal);
+    void context.refreshWorkspaceMcpServers(workspaceId, abortController.signal)
+      .catch((error) => {
+        if (!isAbortError(error)) {
+          toast.error("Failed to load workspace MCP tools", { description: String(error) });
+        }
+      });
+    return () => abortController.abort();
+  }, [workspaceId, context.accessKeyVersion, activeWorkspace?.id]);
+
+  if (!activeWorkspace) {
+    return (
+      <>
+        <WorkspaceHeader workspaceId={workspaceId} activeWorkspace={null} isSessionRoute={false} onChangeWorkspace={changeWorkspace} />
+        <ProblemPanel
+          title="Workspace unavailable"
+          description="The URL workspace is not available to this subject."
+          action={<Button asChild type="button" variant="secondary"><Link to="/">Open default workspace</Link></Button>}
+        />
+      </>
+    );
+  }
+
+  return (
+    <>
+      <WorkspaceHeader workspaceId={workspaceId} activeWorkspace={activeWorkspace} isSessionRoute={isSessionRoute} onChangeWorkspace={changeWorkspace} />
+      <Outlet />
+    </>
+  );
+
+  async function changeWorkspace(nextWorkspaceId: string) {
+    context.resetSessionView();
+    await navigate({ to: "/workspaces/$workspaceId/agent", params: { workspaceId: nextWorkspaceId } });
+  }
+}
+
+function WorkspaceHeader(props: {
+  workspaceId: string;
+  activeWorkspace: Workspace | null;
+  isSessionRoute: boolean;
+  onChangeWorkspace: (workspaceId: string) => void;
+}) {
+  const context = useAppContext();
+  return (
+    <header className="sticky top-0 z-40 flex h-14 items-center gap-2 border-b border-[color:var(--color-border)] bg-[color:var(--color-bg)]/75 px-3 backdrop-blur sm:gap-3 sm:px-6">
+      <Button asChild type="button" variant="ghost" size="sm" className="h-9 shrink-0 px-1.5 text-[15px] font-medium">
+        <Link to="/workspaces/$workspaceId/agent" params={{ workspaceId: props.workspaceId }}>
+          <span className="flex size-6 items-center justify-center rounded-md bg-[color:var(--color-brand-strong)]/20 text-[color:var(--color-brand)]">
+            <SparkleIcon className="size-3.5" />
+          </span>
+          <span className="hidden sm:inline">OpenGeni Agent</span>
+        </Link>
+      </Button>
+
+      <nav className="flex min-w-0 items-center gap-1 overflow-x-auto rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-surface)]/45 p-1">
+        <NavButton to="/workspaces/$workspaceId/agent" workspaceId={props.workspaceId} icon={<BotIcon className="size-3.5" />} label="Agent" />
+        <NavButton to="/workspaces/$workspaceId/documents" workspaceId={props.workspaceId} icon={<FileSearchIcon className="size-3.5" />} label="Documents" />
+        <NavButton to="/workspaces/$workspaceId/capabilities" workspaceId={props.workspaceId} icon={<PlugIcon className="size-3.5" />} label="Capabilities" />
+        <NavButton to="/workspaces/$workspaceId/schedules" workspaceId={props.workspaceId} icon={<CalendarClockIcon className="size-3.5" />} label="Schedules" />
+        <NavButton to="/workspaces/$workspaceId/account" workspaceId={props.workspaceId} icon={<UserIcon className="size-3.5" />} label="Account" />
+      </nav>
+
+      {context.session && props.isSessionRoute ? (
+        <div className="hidden min-w-0 items-center gap-2 lg:flex">
+          <Button asChild type="button" variant="ghost" size="icon-sm" aria-label="Back to agent">
+            <Link to="/workspaces/$workspaceId/agent" params={{ workspaceId: props.workspaceId }}>
+              <ArrowLeftIcon className="size-4" />
+            </Link>
+          </Button>
+          <div className="min-w-0">
+            <div className="truncate text-sm font-medium">{context.session.initialMessage}</div>
+            <div className="truncate text-xs text-[color:var(--color-fg-subtle)]">
+              {context.session.model} · {String(context.session.metadata.reasoningEffort ?? "low")} · {context.session.sandboxBackend}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      <label className="ml-auto flex min-w-28 max-w-44 items-center gap-2 sm:min-w-40 sm:max-w-64">
+        <span className="sr-only">Workspace</span>
+        <select
+          value={props.activeWorkspace?.id ?? props.workspaceId}
+          onChange={(event) => props.onChangeWorkspace(event.target.value)}
+          className="h-8 w-full rounded-md border border-[color:var(--color-border)] bg-[color:var(--color-surface)] px-2 text-xs text-[color:var(--color-fg)]"
+        >
+          {context.workspaces.map((workspace) => (
+            <option key={workspace.id} value={workspace.id}>{workspaceLabel(workspace, context.workspaces)}</option>
+          ))}
+        </select>
+      </label>
+
+      <div className="flex shrink-0 items-center gap-2">
+        {context.keyAuthRequired ? (
+          <Button type="button" variant="ghost" size="icon-sm" onClick={context.forgetAccessKey} aria-label="Clear access key">
+            <LockIcon className="size-4" />
+          </Button>
+        ) : null}
+        {context.session && props.isSessionRoute ? <ConnectionPill state={context.connectionState} /> : null}
+        {context.session && props.isSessionRoute ? <StatusBadge status={context.session.status} /> : null}
+        {context.session && props.isSessionRoute ? (
+          <Button
+            type="button"
+            variant={context.inspectorOpen ? "secondary" : "ghost"}
+            size="icon-sm"
+            onClick={() => context.setInspectorOpen((open) => !open)}
+            aria-label="Toggle debug inspector"
+          >
+            <PanelRightIcon className="size-4" />
+          </Button>
+        ) : null}
+      </div>
+    </header>
+  );
+}
+
+function NavButton(props: {
+  to:
+    | "/workspaces/$workspaceId/agent"
+    | "/workspaces/$workspaceId/documents"
+    | "/workspaces/$workspaceId/capabilities"
+    | "/workspaces/$workspaceId/schedules"
+    | "/workspaces/$workspaceId/account";
+  workspaceId: string;
+  icon: ReactNode;
+  label: string;
+}) {
+  return (
+    <Link
+      to={props.to}
+      params={{ workspaceId: props.workspaceId }}
+      activeProps={{ "data-active": "true" }}
+      className={cn(
+        "inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-md px-2.5 text-xs font-medium text-[color:var(--color-fg-muted)] transition-colors hover:bg-[color:var(--color-surface-2)] hover:text-[color:var(--color-fg)]",
+        "data-[active=true]:bg-[color:var(--color-surface-2)] data-[active=true]:text-[color:var(--color-fg)]",
+      )}
+    >
+      {props.icon}
+      <span className="hidden sm:inline">{props.label}</span>
+    </Link>
+  );
+}
+
+function AgentHomeRoute() {
+  const context = useAppContext();
+  const navigate = useNavigate();
+  const { workspaceId } = workspaceAgentRoute.useParams();
+
+  useEffect(() => {
+    context.resetSessionView();
+  }, [workspaceId]);
+
+  async function submitInitial(submission: TurnSubmission) {
+    const created = await context.startSession(workspaceId, submission);
+    if (created) {
+      await navigate({ to: "/workspaces/$workspaceId/sessions/$sessionId", params: { workspaceId, sessionId: created.id } });
+    }
+  }
+
+  return (
+    <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col px-4 pt-10 pb-16 sm:px-6 sm:pt-16">
+      <section className="flex flex-col items-center gap-2 text-center">
+        <h1 className="text-balance text-2xl font-semibold tracking-tight sm:text-3xl">
+          What should the agent do?
+        </h1>
+        <p className="max-w-md text-sm text-[color:var(--color-fg-muted)]">
+          Start a durable sandbox session with live streams, approvals, interrupts, and follow-ups.
+        </p>
+      </section>
+
+      <div className="mt-8">
+        <Composer
+          workspaceId={workspaceId}
+          autoFocus
+          pending={context.busy}
+          fileUploadsEnabled={context.clientConfig.fileUploads.enabled === true}
+          placeholder="Describe a task for the agent..."
+          submitLabel={context.busy ? "Starting" : "Send"}
+          examples={examples}
+          controlsStart={<AgentControlStrip workspaceId={workspaceId} />}
+          onSubmit={(submission) => void submitInitial(submission)}
+        />
+        <RecentSessions
+          workspaceId={workspaceId}
+          onSelect={(id) => void navigate({ to: "/workspaces/$workspaceId/sessions/$sessionId", params: { workspaceId, sessionId: id } })}
+        />
+      </div>
+    </div>
+  );
+}
+
+function SessionRoute() {
+  const context = useAppContext();
+  const { workspaceId, sessionId } = workspaceSessionRoute.useParams();
+  const navigate = useNavigate();
+  const [loadError, setLoadError] = useState<unknown>(null);
+  const [loading, setLoading] = useState(true);
+  const lastSequence = useMemo(() => context.events.reduce((max, event) => Math.max(max, event.sequence), 0), [context.events]);
+  const session = context.session?.workspaceId === workspaceId && context.session.id === sessionId ? context.session : null;
+  const conversation = useMemo(() => session ? projectConversation(session, context.events) : [], [session, context.events]);
+  const approvals = context.events.flatMap((event) => event.type === "session.requiresAction" ? approvalItems(event.payload) : []);
+  const canSendFollowUp = session?.status === "idle";
+  const sessionRunning = session?.status === "running" || session?.status === "queued";
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setLoadError(null);
+    context.setSession(null);
+    context.setEvents([]);
+    context.setConnectionState("closed");
+    void (async () => {
+      try {
+        const [nextSession, nextEvents] = await Promise.all([
+          fetchSession(workspaceId, sessionId),
+          fetchEvents(workspaceId, sessionId),
+        ]);
+        if (cancelled) {
+          return;
+        }
+        context.setSession(nextSession);
+        context.setEvents(nextEvents);
+        if (isTerminalSessionStatus(nextSession.status)) {
+          forgetSession(workspaceId, nextSession.id);
+        }
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        context.setSession(null);
+        context.setEvents([]);
+        context.setConnectionState("closed");
+        setLoadError(error);
+        if (isApiErrorStatus(error, 404)) {
+          forgetSession(workspaceId, sessionId);
+        } else {
+          toast.error("Failed to load session", { description: String(error) });
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId, sessionId, context.accessKeyVersion]);
+
+  useSessionStream(session ? workspaceId : null, session ? sessionId : null, lastSequence, context.accessKeyVersion, (incoming) => {
+    context.setEvents((current) => mergeEvents(current, incoming));
+    context.setSession((current) => current ? applySessionStatusEvents(current, incoming) : current);
+  }, context.setConnectionState);
+
+  if (loading || !session) {
+    if (loadError) {
+      return isApiErrorStatus(loadError, 404) ? (
+        <ProblemPanel
+          title="Session not found in this workspace"
+          description="The session ID is not available under the workspace in the URL."
+          action={<Button asChild type="button" variant="secondary"><Link to="/workspaces/$workspaceId/agent" params={{ workspaceId }}>Back to agent</Link></Button>}
+        />
+      ) : (
+        <ProblemPanel
+          title="Unable to open session"
+          description={loadError instanceof Error ? loadError.message : String(loadError)}
+          action={<Button asChild type="button" variant="secondary"><Link to="/workspaces/$workspaceId/agent" params={{ workspaceId }}>Back to agent</Link></Button>}
+        />
+      );
+    }
+    return <LoadingPanel label="Opening session" />;
+  }
+
+  return (
+    <div className={cn("grid min-h-0 w-full min-w-0 flex-1 grid-cols-1 overflow-hidden", context.inspectorOpen && "lg:grid-cols-[minmax(0,1fr)_minmax(0,390px)]")}>
+      <SessionChatPane
+        conversation={conversation}
+        approvals={approvals}
+        busy={context.busy}
+        canSendFollowUp={canSendFollowUp}
+        session={session}
+        sessionRunning={sessionRunning}
+        fileUploadsEnabled={context.clientConfig.fileUploads.enabled === true}
+        documentSearchEnabled={context.documentSearchEnabled}
+        openGeniToolEnabled={context.openGeniToolEnabled}
+        customMcpServers={context.customMcpServers}
+        selectedCapabilityToolIds={context.selectedCapabilityToolIds}
+        clientConfig={context.clientConfig}
+        model={context.model}
+        reasoningEffort={context.reasoningEffort}
+        onDocumentSearchToggle={() => context.setDocumentSearchEnabled((enabled) => !enabled)}
+        onOpenGeniToolToggle={() => context.setOpenGeniToolEnabled((enabled) => !enabled)}
+        onCapabilityToolIdsChange={context.setSelectedCapabilityToolIds}
+        onModelChange={context.setModel}
+        onReasoningEffortChange={context.setReasoningEffort}
+        onSubmit={(submission) => void context.submitFollowUp(workspaceId, session.id, submission)}
+        onInterrupt={() => void context.interruptSession(workspaceId, session.id)}
+        onNewSession={() => void navigate({ to: "/workspaces/$workspaceId/agent", params: { workspaceId } })}
+        onApprove={(approvalId) => void sendApproval(workspaceId, session.id, approvalId, "approve")}
+        onReject={(approvalId) => void sendApproval(workspaceId, session.id, approvalId, "reject")}
+      />
+
+      {context.inspectorOpen ? (
+        <aside className="min-h-0 w-full min-w-0 overflow-hidden border-t border-[color:var(--color-border)] bg-[color:var(--color-surface)]/35 lg:border-t-0 lg:border-l">
+          <SessionInspector session={session} events={context.events} connectionState={context.connectionState} />
+        </aside>
+      ) : null}
+    </div>
+  );
+}
+
+function DocumentsRoute() {
+  const context = useAppContext();
+  const { workspaceId } = workspaceDocumentsRoute.useParams();
+  return (
+    <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-4 py-5 sm:px-6 lg:px-8">
+      <DocumentsWorkspace workspaceId={workspaceId} fileUploadsEnabled={context.clientConfig.fileUploads.enabled === true} />
+    </div>
+  );
+}
+
+function CapabilitiesRoute() {
+  const context = useAppContext();
+  const { workspaceId } = workspaceCapabilitiesRoute.useParams();
+  return (
+    <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-4 py-5 sm:px-6 lg:px-8">
+      <CapabilitiesWorkspace workspaceId={workspaceId} onRuntimeChanged={() => void context.refreshWorkspaceMcpServers(workspaceId)} />
+    </div>
+  );
+}
+
+function SchedulesRoute() {
+  const context = useAppContext();
+  const navigate = useNavigate();
+  const { workspaceId } = workspaceSchedulesRoute.useParams();
+  return (
+    <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col px-4 py-5 sm:px-6 lg:px-8">
+      <ScheduledTasksPanel
+        workspaceId={workspaceId}
+        clientConfig={context.clientConfig}
+        resources={context.currentResources}
+        githubConfigured={context.githubStatus?.configured === true}
+        githubRepos={context.githubRepos}
+        repositoryGroups={context.repositoryGroups}
+        repoBusy={context.repoBusy}
+        onRefreshRepositories={() => context.refreshGitHub(workspaceId)}
+        model={context.model}
+        reasoningEffort={context.reasoningEffort}
+        onSelectSession={(id) => void navigate({ to: "/workspaces/$workspaceId/sessions/$sessionId", params: { workspaceId, sessionId: id } })}
+      />
+    </div>
+  );
+}
+
+function AccountRoute() {
+  const context = useAppContext();
+  const { workspaceId } = workspaceAccountRoute.useParams();
+  const activeWorkspace = context.workspaces.find((workspace) => workspace.id === workspaceId) ?? null;
+  return (
+    <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col px-4 py-5 sm:px-6 lg:px-8">
+      <AccountConsole
+        workspaceId={workspaceId}
+        accountId={activeWorkspace?.accountId ?? ""}
+        authSession={context.authSession}
+        accessContext={context.accessContext}
+        clientConfig={context.clientConfig}
+        onSignOut={() => void context.handleManagedSignOut().catch((error) => toast.error("Sign out failed", { description: String(error) }))}
+      />
+    </div>
+  );
+}
+
+function AgentControlStrip({ workspaceId }: { workspaceId: string }) {
+  const context = useAppContext();
+  return (
+    <div className="flex min-w-0 items-center gap-1.5">
+      <ModelPicker
+        config={context.clientConfig}
+        model={context.model}
+        effort={context.reasoningEffort}
+        disabled={context.busy}
+        onModelChange={context.setModel}
+        onEffortChange={context.setReasoningEffort}
+      />
+      <RepositoryContextPicker
+        configured={context.githubStatus?.configured === true}
+        installUrl={context.githubStatus?.installUrl ?? null}
+        repositories={context.githubRepos}
+        groups={context.repositoryGroups}
+        selectedRepoIds={context.selectedRepoIds}
+        selectedRepoRefs={context.selectedRepoRefs}
+        selectedInstallationId={context.selectedInstallationId}
+        manualRepos={context.manualRepos}
+        manualOpen={context.manualReposOpen}
+        githubAppOpen={context.githubAppOpen}
+        org={context.githubOrg}
+        pending={context.busy}
+        repoBusy={context.repoBusy}
+        githubAppBusy={context.githubAppBusy}
+        onRefresh={() => context.refreshGitHub(workspaceId)}
+        onToggleRepo={context.toggleGitHubRepository}
+        onRefChange={(repoId, ref) => context.setSelectedRepoRefs((current) => ({ ...current, [repoId]: ref }))}
+        onManualOpenChange={context.setManualReposOpen}
+        onManualAdd={context.addManualRepository}
+        onManualUpdate={(id, patch) => context.setManualRepos((current) => current.map((repo) => repo.id === id ? { ...repo, ...patch } : repo))}
+        onManualRemove={(id) => context.setManualRepos((current) => current.filter((repo) => repo.id !== id))}
+        onGitHubAppOpenChange={context.setGithubAppOpen}
+        onOrgChange={context.setGithubOrg}
+        onStartGitHubApp={() => void context.startGitHubAppManifestFlow(workspaceId)}
+      />
+      <DocumentSearchToolToggle
+        enabled={context.documentSearchEnabled}
+        disabled={context.busy}
+        onToggle={() => context.setDocumentSearchEnabled((enabled) => !enabled)}
+      />
+      <OpenGeniToolToggle
+        enabled={context.openGeniToolEnabled}
+        disabled={context.busy}
+        onToggle={() => context.setOpenGeniToolEnabled((enabled) => !enabled)}
+      />
+      <EnabledMcpToolPicker
+        servers={context.customMcpServers}
+        selectedIds={context.selectedCapabilityToolIds}
+        disabled={context.busy}
+        onChange={context.setSelectedCapabilityToolIds}
+      />
+    </div>
+  );
+}
+
+function AccessKeyPanel(props: {
+  authMode: ClientConfig["auth"]["mode"] | undefined;
+  accessKeyDraft: string;
+  setAccessKeyDraft: (value: string) => void;
+  onSubmit: () => void;
+}) {
+  return (
+    <section className="flex flex-1 items-center justify-center px-4">
+      <form
+        className="w-full max-w-sm rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-surface)] p-5 shadow-sm"
+        onSubmit={(event) => {
+          event.preventDefault();
+          props.onSubmit();
+        }}
+      >
+        <div className="mb-4 flex items-center gap-3">
+          <span className="flex size-9 items-center justify-center rounded-md bg-[color:var(--color-brand-strong)]/20 text-[color:var(--color-brand)]">
+            <LockIcon className="size-4" />
+          </span>
+          <div>
+            <h1 className="text-base font-semibold">Access key required</h1>
+            <p className="text-sm text-[color:var(--color-fg-subtle)]">
+              Enter the {props.authMode === "configuredToken" ? "configured bearer token" : "deployment key"} for this OpenGeni instance.
+            </p>
+          </div>
+        </div>
+        <Label htmlFor="access-key">Access key</Label>
+        <Input
+          id="access-key"
+          type="password"
+          value={props.accessKeyDraft}
+          onChange={(event) => props.setAccessKeyDraft(event.target.value)}
+          autoComplete="current-password"
+          className="mt-2"
+          autoFocus
+        />
+        <Button type="submit" className="mt-4 w-full">
+          <CheckIcon className="size-4" />
+          Continue
+        </Button>
+      </form>
+    </section>
+  );
+}
+
+function LoadingPanel({ label }: { label: string }) {
+  return (
+    <section className="grid flex-1 place-items-center px-4 text-center">
+      <div className="max-w-sm rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-surface)] p-5 text-sm text-[color:var(--color-fg-muted)]">
+        <Loader2Icon className="mx-auto mb-3 size-5 animate-spin text-[color:var(--color-fg)]" />
+        {label}
+      </div>
+    </section>
+  );
+}
+
+function ProblemPanel(props: { title: string; description: string; action?: ReactNode }) {
+  return (
+    <section className="grid flex-1 place-items-center px-4 text-center">
+      <div className="w-full max-w-md rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-surface)] p-5">
+        <AlertTriangleIcon className="mx-auto mb-3 size-5 text-amber-300" />
+        <h1 className="text-base font-semibold">{props.title}</h1>
+        <p className="mt-2 text-sm leading-5 text-[color:var(--color-fg-muted)]">{props.description}</p>
+        {props.action ? <div className="mt-4 flex justify-center">{props.action}</div> : null}
+      </div>
+    </section>
+  );
+}
+
+function NotFoundRoute() {
+  return <ProblemPanel title="Page not found" description="This OpenGeni console route does not exist. Workspace-scoped URLs are required." />;
+}
+
+function useAppContext(): AppContextValue {
+  const value = useContext(AppContext);
+  if (!value) {
+    throw new Error("OpenGeni app context is not ready");
+  }
+  return value;
+}
+
+function workspaceLabel(workspace: Workspace, workspaces: Workspace[]): string {
+  const hasMultipleAccounts = new Set(workspaces.map((candidate) => candidate.accountId)).size > 1;
+  if (!hasMultipleAccounts) {
+    return workspace.name;
+  }
+  return `${workspace.name} / ${workspace.accountId.slice(0, 8)}`;
 }
 
 function submitGitHubManifest(actionUrl: string, manifest: Record<string, unknown>): void {
@@ -4860,11 +5335,6 @@ function mergeEvents(current: SessionEvent[], incoming: SessionEvent[]): Session
   return [...byId.values()].sort((a, b) => a.sequence - b.sequence);
 }
 
-function sessionIdFromPath(): string | null {
-  const match = window.location.pathname.match(/^\/sessions\/([0-9a-f-]+)/i);
-  return match?.[1] ?? null;
-}
-
 function statusTone(status: SessionStatus): string {
   if (status === "running" || status === "queued") return "bg-[color:var(--color-status-running)]";
   if (status === "idle") return "bg-[color:var(--color-status-success)]";
@@ -4971,6 +5441,10 @@ function scheduleLabel(schedule: ScheduledTaskScheduleSpec): string {
 
 function isUiReasoningEffort(value: ReasoningEffort): value is IntelligenceEffort {
   return value === "low" || value === "medium" || value === "high" || value === "xhigh";
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
 }
 
 function labelEffort(value: IntelligenceEffort): string {

@@ -65,7 +65,7 @@ describe("browser e2e", () => {
     await pageA.keyboard.press("Escape");
     await pageA.getByPlaceholder("Describe a task for the agent...").fill("run a slow browser e2e session");
     await pageA.getByRole("button", { name: "Send" }).click();
-    await waitFor(() => pageA.url().includes("/sessions/"), { timeoutMs: 15_000 });
+    await waitFor(() => /\/workspaces\/[^/]+\/sessions\/[^/]+$/.test(pageA.url()), { timeoutMs: 15_000 });
 
     await pageB.goto(pageA.url());
     await pageA.getByTestId("session-timeline").getByText("slow stream", { exact: false }).waitFor({ timeout: 20_000 });

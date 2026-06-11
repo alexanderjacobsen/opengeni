@@ -48,7 +48,10 @@ describe("deployment contract", () => {
   });
 
   test("restarts the chart-managed OTEL collector when collector config changes", () => {
-    const deployment = readFileSync("deploy/helm/opengeni/templates/otel-collector-deployment.yaml", "utf8");
+    const deployment = readFileSync(
+      new URL("../../../deploy/helm/opengeni/templates/otel-collector-deployment.yaml", import.meta.url),
+      "utf8",
+    );
 
     expect(deployment).toContain("annotations:");
     expect(deployment).toContain("checksum/config:");

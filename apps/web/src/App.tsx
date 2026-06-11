@@ -366,6 +366,7 @@ function RootRouteComponent() {
   const [accessContext, setAccessContext] = useState<AccessContext | null>(null);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [accessLoading, setAccessLoading] = useState(false);
+  const [accessError, setAccessError] = useState<string | null>(null);
   const [model, setModel] = useState("gpt-5.5");
   const [reasoningEffort, setReasoningEffort] = useState<IntelligenceEffort>("low");
   const [inspectorOpen, setInspectorOpen] = useState(true);
@@ -456,10 +457,12 @@ function RootRouteComponent() {
       setAccessContext(null);
       setWorkspaces([]);
       setAccessLoading(false);
+      setAccessError(null);
       return;
     }
     let cancelled = false;
     setAccessLoading(true);
+    setAccessError(null);
     void Promise.all([fetchAccessContext(), fetchWorkspaces()])
       .then(([context, nextWorkspaces]) => {
         if (cancelled) {
@@ -475,6 +478,7 @@ function RootRouteComponent() {
         toast.error("Failed to load workspace access", { description: String(error) });
         setAccessContext(null);
         setWorkspaces([]);
+        setAccessError(error instanceof Error ? error.message : String(error));
       })
       .finally(() => {
         if (!cancelled) {
@@ -636,6 +640,7 @@ function RootRouteComponent() {
     setStoredAccessKey(key);
     setHasAccessKey(true);
     setAccessKeyDraft("");
+    setAccessError(null);
     setAccessKeyVersion((version) => version + 1);
   }
 
@@ -646,6 +651,7 @@ function RootRouteComponent() {
     setEvents([]);
     setAccessContext(null);
     setWorkspaces([]);
+    setAccessError(null);
     setAccessKeyVersion((version) => version + 1);
   }
 
@@ -670,6 +676,7 @@ function RootRouteComponent() {
     setWorkspaces([]);
     setSession(null);
     setEvents([]);
+    setAccessError(null);
     setAccessKeyVersion((version) => version + 1);
     await navigate({ to: "/", replace: true });
   }
@@ -757,6 +764,16 @@ function RootRouteComponent() {
         <LoadingPanel label="Checking session" />
       ) : managedAuthRequired && !authSession ? (
         <ManagedAuthPanel onSubmit={handleManagedAuth} />
+      ) : accessError && !accessLoading ? (
+        <ProblemPanel
+          title="Workspace access unavailable"
+          description={accessError}
+          action={(
+            <Button type="button" variant="secondary" onClick={() => setAccessKeyVersion((version) => version + 1)}>
+              Retry
+            </Button>
+          )}
+        />
       ) : accessLoading || !appContext ? (
         <LoadingPanel label="Loading workspace access" />
       ) : !defaultWorkspaceId ? (
@@ -1027,7 +1044,9 @@ function SessionRoute() {
         context.setEvents([]);
         context.setConnectionState("closed");
         setLoadError(error);
-        if (!isApiErrorStatus(error, 404)) {
+        if (isApiErrorStatus(error, 404)) {
+          forgetSession(workspaceId, sessionId);
+        } else {
           toast.error("Failed to load session", { description: String(error) });
         }
       } finally {

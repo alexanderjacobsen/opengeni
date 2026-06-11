@@ -763,10 +763,15 @@ export async function applyMissingManifestEntries(session: SandboxSessionLike, t
   if (Object.keys(entries).length === 0 && !environmentChanged) {
     return;
   }
+  // Carry path grants through manifest rebuilds: since @openai/agents 0.11.0
+  // they gate local source materialization, and run states saved before the
+  // upgrade have manifests without grants.
+  const extraPathGrants = mergePathGrants(currentManifest.extraPathGrants, target.extraPathGrants);
   const delta = new Manifest({
     root: currentManifest.root,
     entries,
     environment: target.environment,
+    ...(extraPathGrants.length ? { extraPathGrants } : {}),
   });
   if (session.applyManifest) {
     await session.applyManifest(delta);
@@ -782,7 +787,19 @@ export async function applyMissingManifestEntries(session: SandboxSessionLike, t
       ...currentManifest.entries,
       ...entries,
     },
+    ...(extraPathGrants.length ? { extraPathGrants } : {}),
   });
+}
+
+function mergePathGrants(
+  current: Manifest["extraPathGrants"] | undefined,
+  target: Manifest["extraPathGrants"] | undefined,
+): Manifest["extraPathGrants"] {
+  const merged = new Map<string, Manifest["extraPathGrants"][number]>();
+  for (const grant of [...(current ?? []), ...(target ?? [])]) {
+    merged.set(grant.path, grant);
+  }
+  return [...merged.values()];
 }
 
 export function withSandboxFileDownloads(
@@ -874,7 +891,7 @@ export function sandboxFileDownloadsForAgent(agent: unknown): SandboxFileDownloa
     : [];
 }
 
-function ensureManifest(manifest: Manifest | { root?: string; entries?: Record<string, any>; environment?: Record<string, any> }): Manifest {
+function ensureManifest(manifest: Manifest | { root?: string; entries?: Record<string, any>; environment?: Record<string, any>; extraPathGrants?: any[] }): Manifest {
   if (manifest instanceof Manifest && typeof manifest.mountTargetsForMaterialization === "function") {
     return manifest;
   }
@@ -882,6 +899,7 @@ function ensureManifest(manifest: Manifest | { root?: string; entries?: Record<s
     ...(manifest.root ? { root: manifest.root } : {}),
     entries: manifest.entries ?? {},
     environment: manifest.environment ?? {},
+    ...(manifest.extraPathGrants?.length ? { extraPathGrants: manifest.extraPathGrants } : {}),
   });
 }
 
@@ -1052,6 +1070,16 @@ export function buildManifest(
     root: "/workspace",
     entries,
     environment,
+    // Since @openai/agents 0.11.0, local sandbox sources (including the lazy
+    // bundled-skills source) must stay within the SDK process working
+    // directory unless granted here. The bundled skills ship inside the
+    // runtime package, which is outside the worker's cwd in production, so
+    // grant it explicitly to preserve pre-0.11 behavior.
+    extraPathGrants: [{
+      path: bundledSkillsDir(),
+      readOnly: true,
+      description: "OpenGeni bundled skills",
+    }],
   });
 }
 

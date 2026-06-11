@@ -8,6 +8,8 @@ export const approvalDecision = defineSignal<[string]>("approvalDecision");
 export const interrupt = defineSignal<[string]>("interrupt");
 
 export type SessionWorkflowInput = {
+  accountId: string;
+  workspaceId: string;
   sessionId: string;
   initialEventId?: string;
 };
@@ -32,36 +34,45 @@ export async function sessionWorkflow(input: SessionWorkflowInput): Promise<void
 
   while (true) {
     const workflowId = workflowInfo().workflowId;
-    const turn = await activity.claimNextQueuedTurn({ sessionId: input.sessionId, workflowId });
+    const turn = await activity.claimNextQueuedTurn({ workspaceId: input.workspaceId, sessionId: input.sessionId, workflowId });
     if (!turn) {
       const seenWakeups = wakeups;
       const woke = await condition(() => interruptedEventId !== null || wakeups !== seenWakeups, "5s");
       if (interruptedEventId) {
         interruptedEventId = null;
-        await activity.markSessionIdle({ sessionId: input.sessionId });
+        await activity.markSessionIdle({ workspaceId: input.workspaceId, sessionId: input.sessionId });
         return;
       }
       if (woke) {
         continue;
       }
-      const finalTurn = await activity.claimNextQueuedTurn({ sessionId: input.sessionId, workflowId });
+      const finalTurn = await activity.claimNextQueuedTurn({ workspaceId: input.workspaceId, sessionId: input.sessionId, workflowId });
       if (!finalTurn) {
-        await activity.markSessionIdle({ sessionId: input.sessionId });
+        await activity.markSessionIdle({ workspaceId: input.workspaceId, sessionId: input.sessionId });
+        // A queueChanged/userMessage signal can land between the final claim and
+        // completion; Temporal blocks completion while a signal is buffered, so
+        // re-checking here guarantees the queued turn is picked up instead of
+        // stranding it (the signaler skips its start-child fallback on success).
+        if (interruptedEventId !== null || wakeups !== seenWakeups) {
+          continue;
+        }
         return;
       }
-      if (!await runTurn(input.sessionId, finalTurn.id, finalTurn.triggerEventId)) {
+      if (!await runTurn(input.accountId, input.workspaceId, input.sessionId, finalTurn.id, finalTurn.triggerEventId)) {
         return;
       }
       continue;
     }
-    if (!await runTurn(input.sessionId, turn.id, turn.triggerEventId)) {
+    if (!await runTurn(input.accountId, input.workspaceId, input.sessionId, turn.id, turn.triggerEventId)) {
       return;
     }
   }
 
-  async function runTurn(sessionId: string, turnId: string, triggerEventId: string): Promise<boolean> {
+  async function runTurn(accountId: string, workspaceId: string, sessionId: string, turnId: string, triggerEventId: string): Promise<boolean> {
     if (interruptedEventId) {
       await activity.interruptActiveTurn({
+        accountId,
+        workspaceId,
         sessionId,
         triggerEventId: interruptedEventId,
         workflowId: workflowInfo().workflowId,
@@ -73,6 +84,8 @@ export async function sessionWorkflow(input: SessionWorkflowInput): Promise<void
     const scope = new CancellationScope();
     const workflowId = workflowInfo().workflowId;
     const segment: Promise<activities.RunAgentSegmentResult> = scope.run(() => activity.runAgentSegment({
+      accountId,
+      workspaceId,
       sessionId,
       triggerEventId,
       workflowId,
@@ -89,6 +102,8 @@ export async function sessionWorkflow(input: SessionWorkflowInput): Promise<void
     if (outcome.kind === "interrupt") {
       scope.cancel();
       await activity.interruptActiveTurn({
+        accountId,
+        workspaceId,
         sessionId,
         triggerEventId: interruptedEventId!,
         workflowId: workflowInfo().workflowId,
@@ -99,6 +114,8 @@ export async function sessionWorkflow(input: SessionWorkflowInput): Promise<void
 
     if (outcome.kind === "failure") {
       await activity.failSession({
+        accountId,
+        workspaceId,
         sessionId,
         triggerEventId,
         workflowId,
@@ -115,6 +132,8 @@ export async function sessionWorkflow(input: SessionWorkflowInput): Promise<void
       await condition(() => interruptedEventId !== null || approvalQueue.length > 0);
       if (interruptedEventId) {
         await activity.interruptActiveTurn({
+          accountId,
+          workspaceId,
           sessionId,
           triggerEventId: interruptedEventId,
           workflowId,
@@ -124,7 +143,7 @@ export async function sessionWorkflow(input: SessionWorkflowInput): Promise<void
       }
       const approvalEventId = approvalQueue.shift();
       if (approvalEventId) {
-        return await runTurn(sessionId, turnId, approvalEventId);
+        return await runTurn(accountId, workspaceId, sessionId, turnId, approvalEventId);
       }
     }
     return true;

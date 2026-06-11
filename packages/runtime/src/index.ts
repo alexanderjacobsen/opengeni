@@ -1,6 +1,6 @@
 import type { Settings } from "@opengeni/config";
 import { collectSandboxEnvironment, parseExposedPorts, sandboxLifecycleHookIds } from "@opengeni/config";
-import type { ReasoningEffort, ResourceRef, SessionEventType, ToolRef } from "@opengeni/contracts";
+import { signDelegatedAccessToken, type Permission, type ReasoningEffort, type ResourceRef, type SessionEventType, type ToolRef } from "@opengeni/contracts";
 import {
   Agent,
   connectMcpServers,
@@ -30,6 +30,7 @@ import {
   file,
   gitRepo,
   inContainerMountStrategy,
+  localDir,
   s3Mount,
   skills,
   type SandboxClient,
@@ -45,9 +46,21 @@ import { fileURLToPath } from "node:url";
 
 ensureReadableStreamFrom();
 
+const SANDBOX_LIFECYCLE_COMMAND_TIMEOUT_MS = 120_000;
+
 export type NormalizedRuntimeEvent = {
   type: SessionEventType;
   payload: unknown;
+};
+
+export type ModelResponseUsage = {
+  responseId?: string;
+  usage: {
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+    inputTokensDetails?: Record<string, number> | Array<Record<string, number>>;
+  };
 };
 
 type RuntimeMcpTool = Awaited<ReturnType<MCPServer["listTools"]>>[number];
@@ -106,7 +119,7 @@ export type SandboxFileDownload = {
 export type OpenGeniRuntime = {
   configure: (settings: Settings) => void;
   buildAgent: (settings: Settings, resources: ResourceRef[], options?: BuildAgentOptions) => Agent<any, any>;
-  prepareTools: (settings: Settings, tools: ToolRef[]) => Promise<PreparedAgentTools>;
+  prepareTools: (settings: Settings, tools: ToolRef[], options?: PrepareToolsOptions) => Promise<PreparedAgentTools>;
   prepareInput: (agent: Agent<any, any>, input: AgentSegmentInput, options?: PrepareInputOptions) => Promise<PreparedAgentInput>;
   runStream: (agent: Agent<any, any>, input: PreparedAgentInput, settings: Settings, options?: RunAgentStreamOptions) => Promise<Awaited<ReturnType<typeof runAgentStream>>>;
   serializeApprovals: (interruptions: unknown[]) => unknown[];
@@ -142,7 +155,7 @@ export function configureOpenAI(settings: Settings): void {
     setDefaultOpenAIClient(new OpenAI({
       apiKey,
       baseURL,
-      defaultQuery: settings.azureOpenaiApiVersion ? { "api-version": settings.azureOpenaiApiVersion } : undefined,
+      defaultQuery: azureOpenAIDefaultQuery(settings, baseURL),
       defaultHeaders: settings.azureOpenaiAdToken && !settings.azureOpenaiApiKey
         ? { Authorization: `Bearer ${settings.azureOpenaiAdToken}` }
         : undefined,
@@ -169,6 +182,7 @@ export type BuildAgentOptions = {
 };
 
 const agentFileDownloads = new WeakMap<object, SandboxFileDownload[]>();
+const agentRepositoryCloneHooks = new WeakMap<object, SandboxLifecycleHook[]>();
 
 export function buildOpenGeniAgent(settings: Settings, resources: ResourceRef[], options: BuildAgentOptions = {}): Agent<any, any> {
   const baseConfig = {
@@ -207,6 +221,7 @@ export function buildOpenGeniAgent(settings: Settings, resources: ResourceRef[],
     ],
   });
   agentFileDownloads.set(agent, normalizeSandboxFileDownloads(options.fileResourceDownloads ?? []).filter((download) => !download.content));
+  agentRepositoryCloneHooks.set(agent, sandboxRepositoryCloneHooks(settings, resources));
   return agent;
 }
 
@@ -225,27 +240,35 @@ export type PreparedAgentTools = {
   close: () => Promise<void>;
 };
 
-export async function prepareAgentTools(settings: Settings, tools: ToolRef[]): Promise<PreparedAgentTools> {
+export type PrepareToolsOptions = {
+  accountId?: string;
+  workspaceId?: string;
+  subjectId?: string;
+  subjectLabel?: string;
+};
+
+export async function prepareAgentTools(settings: Settings, tools: ToolRef[], options: PrepareToolsOptions = {}): Promise<PreparedAgentTools> {
   if (tools.length === 0) {
     return { mcpServers: [], close: async () => {} };
   }
   const registry = new Map(settings.mcpServers.map((server) => [server.id, server]));
-  const servers = tools.map((tool) => {
+  const servers = await Promise.all(tools.map(async (tool) => {
     const config = registry.get(tool.id);
     if (!config) {
       throw new Error(`Unknown MCP server id: ${tool.id}`);
     }
+    const url = firstPartyMcpServerUrlForRun(settings, config, options.workspaceId) ?? config.url;
     return new PrefixedMcpServer(new MCPServerStreamableHttp({
-      url: config.url,
+      url,
       name: config.name ?? config.id,
       cacheToolsList: config.cacheToolsList,
-      ...firstPartyMcpRequestInit(settings, config),
+      ...await firstPartyMcpRequestInit(settings, config, options),
       ...(config.timeoutMs ? {
         timeout: config.timeoutMs,
         clientSessionTimeoutSeconds: Math.ceil(config.timeoutMs / 1000),
       } : {}),
     }), config.id, config.allowedTools);
-  });
+  }));
   const connected = await connectMcpServers(servers, {
     connectInParallel: true,
     strict: true,
@@ -258,22 +281,48 @@ export async function prepareAgentTools(settings: Settings, tools: ToolRef[]): P
   };
 }
 
-function firstPartyMcpRequestInit(settings: Settings, config: Settings["mcpServers"][number]): { requestInit: { headers: Record<string, string> } } | {} {
-  if (!settings.authRequired || !settings.accessKey || !isFirstPartyMcpServer(settings, config)) {
+async function firstPartyMcpRequestInit(settings: Settings, config: Settings["mcpServers"][number], options: PrepareToolsOptions): Promise<{ requestInit: { headers: Record<string, string> } } | {}> {
+  if (!isFirstPartyMcpServer(settings, config)) {
+    return {};
+  }
+  const headers: Record<string, string> = {};
+  if (settings.authRequired && settings.accessKey) {
+    headers["x-opengeni-access-key"] = settings.accessKey;
+  }
+  if (settings.delegationSecret && options.accountId && options.workspaceId) {
+    headers.authorization = `Bearer ${await signDelegatedAccessToken(settings.delegationSecret, {
+      accountId: options.accountId,
+      workspaceId: options.workspaceId,
+      subjectId: options.subjectId ?? "worker:first-party-mcp",
+      ...(options.subjectLabel ? { subjectLabel: options.subjectLabel } : {}),
+      permissions: firstPartyMcpPermissions,
+      exp: Math.floor(Date.now() / 1000) + 60 * 60,
+    })}`;
+  }
+  if (Object.keys(headers).length === 0) {
     return {};
   }
   return {
     requestInit: {
-      headers: {
-        authorization: `Bearer ${settings.accessKey}`,
-      },
+      headers,
     },
   };
 }
 
+const firstPartyMcpPermissions: Permission[] = [
+  "workspace:read",
+  "files:read",
+  "documents:search",
+  "scheduled_tasks:manage",
+  "scheduled_tasks:run",
+];
+
 function isFirstPartyMcpServer(settings: Settings, config: Settings["mcpServers"][number]): boolean {
   if (!["opengeni", "files", "docs"].includes(config.id)) {
     return false;
+  }
+  if (config.url.includes("{workspaceId}")) {
+    return true;
   }
   const url = normalizeUrl(config.url);
   if (!url) {
@@ -282,8 +331,38 @@ function isFirstPartyMcpServer(settings: Settings, config: Settings["mcpServers"
   return firstPartyMcpUrls(settings).some((candidate) => candidate === url);
 }
 
+function firstPartyMcpServerUrlForRun(settings: Settings, config: Settings["mcpServers"][number], workspaceId: string | undefined): string | null {
+  if (!workspaceId || !["opengeni", "files", "docs"].includes(config.id)) {
+    return null;
+  }
+  if (config.url.includes("{workspaceId}")) {
+    return config.url.replaceAll("{workspaceId}", workspaceId);
+  }
+  if (!isFirstPartyMcpServer(settings, config)) {
+    return null;
+  }
+  const rawBase = settings.opengeniMcpUrl?.includes("{workspaceId}")
+    ? settings.opengeniMcpUrl.replaceAll("{workspaceId}", workspaceId)
+    : settings.opengeniMcpUrl
+      ? scopedMcpUrlFromConfiguredBase(settings.opengeniMcpUrl, workspaceId)
+      : `http://127.0.0.1:${settings.apiPort}/v1/workspaces/${workspaceId}/mcp`;
+  const url = new URL(rawBase);
+  if (config.id === "docs") {
+    url.pathname = `${url.pathname.replace(/\/+$/, "")}/docs`;
+  }
+  return url.toString();
+}
+
+function scopedMcpUrlFromConfiguredBase(raw: string, workspaceId: string): string {
+  const url = new URL(raw);
+  url.pathname = `/v1/workspaces/${workspaceId}/mcp`;
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
 function firstPartyMcpUrls(settings: Settings): string[] {
-  const base = normalizeUrl(settings.opengeniMcpUrl ?? `http://127.0.0.1:${settings.apiPort}/v1/mcp`);
+  const base = normalizeUrl(settings.opengeniMcpUrl ?? `http://127.0.0.1:${settings.apiPort}/v1/workspaces/{workspaceId}/mcp`);
   if (!base) {
     return [];
   }
@@ -517,7 +596,10 @@ export async function runAgentStream(agent: Agent<any, any>, input: PreparedAgen
     })
     : refreshedClient;
   const client = resourceClient
-    ? withSandboxLifecycleHooks(resourceClient, sandboxLifecycleHooksForIds(sandboxLifecycleHookIds(settings)), {
+    ? withSandboxLifecycleHooks(resourceClient, [
+      ...sandboxLifecycleHooksForIds(sandboxLifecycleHookIds(settings)),
+      ...sandboxRepositoryCloneHooksForAgent(agent),
+    ], {
       environment,
       ...(overrides.onRuntimeEvent ? { onRuntimeEvent: overrides.onRuntimeEvent } : {}),
       ...(runAs ? { runAs } : {}),
@@ -681,14 +763,14 @@ export async function materializeSandboxFileDownloads(
           cmd: sandboxFileDownloadCommand(download, targetPath),
           workdir: "/workspace",
           ...(context.runAs ? { runAs: context.runAs } : {}),
-          yieldTimeMs: 1_000,
+          yieldTimeMs: SANDBOX_LIFECYCLE_COMMAND_TIMEOUT_MS,
           maxOutputTokens: 20_000,
         })
         : await session.execCommand!({
           cmd: sandboxFileDownloadCommand(download, targetPath),
           workdir: "/workspace",
           ...(context.runAs ? { runAs: context.runAs } : {}),
-          yieldTimeMs: 1_000,
+          yieldTimeMs: SANDBOX_LIFECYCLE_COMMAND_TIMEOUT_MS,
           maxOutputTokens: 20_000,
         });
       assertSandboxCommandSucceeded(result, `Sandbox file resource download ${download.fileId}`);
@@ -779,6 +861,66 @@ export function normalizeSdkEvent(event: RunStreamEvent): NormalizedRuntimeEvent
   return out;
 }
 
+export function modelResponseUsageFromSdkEvent(event: RunStreamEvent): ModelResponseUsage | null {
+  const response = modelResponseFromSdkEvent(event);
+  const usage = usageFromResponse(response);
+  if (!usage) {
+    return null;
+  }
+  const responseId = typeof response?.id === "string"
+    ? response.id
+    : typeof response?.responseId === "string"
+      ? response.responseId
+      : undefined;
+  return {
+    ...(responseId ? { responseId } : {}),
+    usage,
+  };
+}
+
+function modelResponseFromSdkEvent(event: RunStreamEvent): any {
+  if (event.type === "raw_model_stream_event") {
+    const data = (event as any).data;
+    if (data?.type === "response_done") {
+      return data.response;
+    }
+  }
+  if (isOpenAIResponsesRawModelStreamEvent(event)) {
+    const raw = (event as any).data?.event;
+    if (raw?.type === "response.completed") {
+      return raw.response;
+    }
+  }
+  return null;
+}
+
+function usageFromResponse(response: any): ModelResponseUsage["usage"] | null {
+  const raw = response?.usage;
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const usage = {
+    ...numberProp(raw, "inputTokens", "inputTokens", "input_tokens"),
+    ...numberProp(raw, "outputTokens", "outputTokens", "output_tokens"),
+    ...numberProp(raw, "totalTokens", "totalTokens", "total_tokens"),
+    ...inputTokenDetailsProp(raw),
+  };
+  return Object.keys(usage).length > 0 ? usage : null;
+}
+
+function numberProp(raw: Record<string, unknown>, outputKey: "inputTokens" | "outputTokens" | "totalTokens", camel: string, snake: string): Partial<ModelResponseUsage["usage"]> {
+  const value = raw[camel] ?? raw[snake];
+  return typeof value === "number" && Number.isFinite(value) ? { [outputKey]: value } : {};
+}
+
+function inputTokenDetailsProp(raw: Record<string, unknown>): Partial<ModelResponseUsage["usage"]> {
+  const details = raw.inputTokensDetails ?? raw.input_tokens_details;
+  if (!details || typeof details !== "object") {
+    return {};
+  }
+  return { inputTokensDetails: details as Record<string, number> | Array<Record<string, number>> };
+}
+
 export function serializeApprovals(interruptions: unknown[]): unknown[] {
   return interruptions.map((item: any) => {
     if (typeof item?.toJSON === "function") {
@@ -807,6 +949,10 @@ export function buildManifest(
       const host = url.hostname.toLowerCase();
       const repo = url.pathname.replace(/^\/+|\/+$/g, "").replace(/\.git$/, "");
       const mountPath = normalizeManifestPath(resource.mountPath ?? `repos/${repo}`);
+      if (repositoryUsesSandboxClone(settings, resource)) {
+        entries[mountPath] = dir();
+        continue;
+      }
       entries[mountPath] = gitRepo({
         host,
         repo,
@@ -1118,6 +1264,150 @@ export function withSandboxLifecycleHooks(
   return wrapped;
 }
 
+function sandboxRepositoryCloneHooksForAgent(agent: Agent<any, any>): SandboxLifecycleHook[] {
+  return agentRepositoryCloneHooks.get(agent) ?? [];
+}
+
+function sandboxRepositoryCloneHooks(settings: Settings, resources: ResourceRef[]): SandboxLifecycleHook[] {
+  const repositories = resources.filter((resource): resource is Extract<ResourceRef, { kind: "repository" }> => (
+    resource.kind === "repository" && repositoryUsesSandboxClone(settings, resource)
+  ));
+  if (repositories.length === 0) {
+    return [];
+  }
+  return [{
+    id: "repository-clone",
+    phase: "beforeAgentStart",
+    run: async (session, context) => {
+      await runRepositoryCloneHook(session, repositories, context);
+    },
+  }];
+}
+
+function repositoryUsesSandboxClone(settings: Settings, resource: Extract<ResourceRef, { kind: "repository" }>): boolean {
+  return settings.sandboxBackend === "modal" || Boolean(resource.githubInstallationId && resource.githubRepositoryId);
+}
+
+export function repositoryCloneCommand(resources: Extract<ResourceRef, { kind: "repository" }>[]): string {
+  const commands = [
+    "set -eu",
+    "export HOME=\"${HOME:-/workspace}\"",
+    "export GIT_TERMINAL_PROMPT=\"${GIT_TERMINAL_PROMPT:-0}\"",
+    "ensure_git() {",
+    "  if command -v git >/dev/null 2>&1; then",
+    "    return 0",
+    "  fi",
+    "  if command -v apt-get >/dev/null 2>&1; then",
+    "    export DEBIAN_FRONTEND=noninteractive",
+    "    apt-get update >/dev/null",
+    "    apt-get install -y --no-install-recommends ca-certificates git >/dev/null",
+    "    rm -rf /var/lib/apt/lists/*",
+    "    command -v git >/dev/null 2>&1 && return 0",
+    "  fi",
+    "  echo \"git is not installed in the sandbox and could not be bootstrapped\" >&2",
+    "  exit 127",
+    "}",
+    "ensure_git",
+    "clone_repository() {",
+    "  target=\"$1\"",
+    "  uri=\"$2\"",
+    "  ref=\"$3\"",
+    "  subpath=\"$4\"",
+    "  if [ -e \"$target\" ] && { [ -f \"$target\" ] || [ -n \"$(find \"$target\" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)\" ]; }; then",
+    "    echo \"Repository resource already present at $target\"",
+    "    return 0",
+    "  fi",
+    "  mkdir -p \"$(dirname \"$target\")\"",
+    "  tmp=\"${target}.tmp.$$\"",
+    "  rm -rf \"$tmp\"",
+    "  git init \"$tmp\" >/dev/null",
+    "  git -C \"$tmp\" remote add origin \"$uri\"",
+    "  git -C \"$tmp\" fetch --depth 1 --no-tags --filter=blob:none origin \"$ref\"",
+    "  git -C \"$tmp\" checkout --detach FETCH_HEAD >/dev/null",
+    "  if [ -n \"$subpath\" ]; then",
+    "    if [ ! -e \"$tmp/$subpath\" ]; then",
+    "      echo \"Repository subpath not found: $subpath\" >&2",
+    "      rm -rf \"$tmp\"",
+    "      exit 1",
+    "    fi",
+    "    if [ -d \"$tmp/$subpath\" ]; then",
+    "      mkdir -p \"$target\"",
+    "      cp -a \"$tmp/$subpath/.\" \"$target/\"",
+    "    else",
+    "      rmdir \"$target\" 2>/dev/null || true",
+    "      cp -a \"$tmp/$subpath\" \"$target\"",
+    "    fi",
+    "    rm -rf \"$tmp\"",
+    "  else",
+    "    rmdir \"$target\" 2>/dev/null || true",
+    "    mv \"$tmp\" \"$target\"",
+    "    git -C \"$target\" rev-parse --is-inside-work-tree >/dev/null",
+    "  fi",
+    "  if [ ! -e \"$target\" ]; then",
+    "    echo \"Repository resource was not materialized at $target\" >&2",
+    "    exit 1",
+    "  fi",
+    "  echo \"Repository resource ready at $target\"",
+    "}",
+  ];
+  for (const resource of resources) {
+    const url = new URL(resource.uri);
+    const repo = url.pathname.replace(/^\/+|\/+$/g, "").replace(/\.git$/, "");
+    const mountPath = normalizeManifestPath(resource.mountPath ?? `repos/${repo}`);
+    commands.push([
+      "clone_repository",
+      shellQuote(posixPath.join("/workspace", mountPath)),
+      shellQuote(resource.uri),
+      shellQuote(resource.ref),
+      shellQuote(resource.subpath ? normalizeManifestPath(resource.subpath) : ""),
+    ].join(" "));
+  }
+  return commands.join("\n");
+}
+
+export async function runRepositoryCloneHook(
+  session: SandboxSessionLike,
+  resources: Extract<ResourceRef, { kind: "repository" }>[],
+  context: SandboxLifecycleHookContext = { environment: {} },
+): Promise<void> {
+  const payload = { name: "repository-clone", repositoryCount: resources.length };
+  await context.onRuntimeEvent?.({ type: "sandbox.operation.started", payload });
+  try {
+    const command = repositoryCloneCommand(resources);
+    if (session.exec) {
+      const result = await session.exec({
+        cmd: command,
+        workdir: "/workspace",
+        ...(context.runAs ? { runAs: context.runAs } : {}),
+        yieldTimeMs: SANDBOX_LIFECYCLE_COMMAND_TIMEOUT_MS,
+        maxOutputTokens: 20_000,
+      });
+      assertSandboxCommandSucceeded(result, "Repository clone hook");
+    } else if (session.execCommand) {
+      const result = await session.execCommand({
+        cmd: command,
+        workdir: "/workspace",
+        ...(context.runAs ? { runAs: context.runAs } : {}),
+        yieldTimeMs: SANDBOX_LIFECYCLE_COMMAND_TIMEOUT_MS,
+        maxOutputTokens: 20_000,
+      });
+      assertSandboxCommandSucceeded(result, "Repository clone hook");
+    } else {
+      throw new Error("Sandbox session does not support command execution");
+    }
+    await context.onRuntimeEvent?.({ type: "sandbox.operation.completed", payload });
+  } catch (error) {
+    await context.onRuntimeEvent?.({
+      type: "sandbox.operation.failed",
+      payload: {
+        ...payload,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    });
+    throw error;
+  }
+}
+
 export function azureCliLoginCommand(): string {
   return [
     "export HOME=\"${HOME:-/workspace}\"",
@@ -1171,10 +1461,28 @@ function sandboxCommandOutput(result: unknown): string {
 }
 
 function assertSandboxCommandSucceeded(result: unknown, operation: string): void {
+  const output = sandboxCommandOutput(result);
+  if (sandboxCommandStillRunning(result)) {
+    throw new Error(`${operation} did not finish before the lifecycle command timeout${output ? `:\n${output}` : ""}`);
+  }
   const exitCode = sandboxCommandExitCode(result);
   if (exitCode !== null && exitCode !== 0) {
-    throw new Error(sandboxCommandOutput(result) || `${operation} failed with exit code ${exitCode}`);
+    throw new Error(output || `${operation} failed with exit code ${exitCode}`);
   }
+  if (exitCode === null) {
+    throw new Error(output || `${operation} did not return a command exit code`);
+  }
+}
+
+function sandboxCommandStillRunning(result: unknown): boolean {
+  if (typeof result === "string") {
+    return /Process running with session ID \d+/u.test(result);
+  }
+  if (!result || typeof result !== "object") {
+    return false;
+  }
+  const candidate = result as { sessionId?: unknown; session_id?: unknown };
+  return typeof candidate.sessionId === "number" || typeof candidate.session_id === "number";
 }
 
 function hasAzureServicePrincipal(environment: Record<string, string>): boolean {
@@ -1196,7 +1504,7 @@ export async function runAzureCliLoginHook(
         cmd: azureCliLoginCommand(),
         workdir: "/workspace",
         ...(context.runAs ? { runAs: context.runAs } : {}),
-        yieldTimeMs: 1_000,
+        yieldTimeMs: SANDBOX_LIFECYCLE_COMMAND_TIMEOUT_MS,
         maxOutputTokens: 20_000,
       });
       assertSandboxCommandSucceeded(result, "Azure CLI login hook");
@@ -1205,7 +1513,7 @@ export async function runAzureCliLoginHook(
         cmd: azureCliLoginCommand(),
         workdir: "/workspace",
         ...(context.runAs ? { runAs: context.runAs } : {}),
-        yieldTimeMs: 1_000,
+        yieldTimeMs: SANDBOX_LIFECYCLE_COMMAND_TIMEOUT_MS,
         maxOutputTokens: 20_000,
       });
       assertSandboxCommandSucceeded(result, "Azure CLI login hook");
@@ -1231,6 +1539,18 @@ function azureDeploymentBaseUrl(settings: Settings): string {
     throw new Error("Azure OpenAI endpoint/deployment settings are incomplete");
   }
   return `${endpoint}/openai/deployments/${settings.azureOpenaiDeployment}`;
+}
+
+export function azureOpenAIDefaultQuery(
+  settings: Pick<Settings, "azureOpenaiApiVersion">,
+  baseURL: string,
+): Record<string, string> | undefined {
+  if (!settings.azureOpenaiApiVersion) return undefined;
+  const normalized = baseURL.replace(/\/+$/, "").toLowerCase();
+  if (normalized.endsWith("/openai/v1")) {
+    return undefined;
+  }
+  return { "api-version": settings.azureOpenaiApiVersion };
 }
 
 function bundledSkillsDir(): string {

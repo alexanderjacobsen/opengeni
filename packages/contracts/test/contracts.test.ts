@@ -4,6 +4,7 @@ import {
   ClientConfig,
   ClientSessionEvent,
   CreateDocumentBaseRequest,
+  CreateCheckoutRequest,
   CreateScheduledTaskRequest,
   CreateSessionRequest,
   DocumentSearchRequest,
@@ -69,18 +70,27 @@ describe("contracts", () => {
 
   test("accepts client config payloads", () => {
     const payload = ClientConfig.parse({
+      deploymentRevision: "test-sha",
       defaultModel: "gpt-5.5",
       allowedModels: ["gpt-5.5"],
       defaultReasoningEffort: "high",
       allowedReasoningEfforts: ["low", "medium", "high"],
       mcpServers: [{ id: "opengeni", name: "OpenGeni" }],
       fileUploads: { enabled: true, maxSizeBytes: 5_000_000_000 },
-      auth: { required: true, headerName: "authorization", scheme: "bearer" },
+      productAccessMode: "managed",
+      auth: { mode: "managedSession", session: "cookie" },
     });
     expect(payload.defaultReasoningEffort).toBe("high");
+    expect(payload.deploymentRevision).toBe("test-sha");
     expect(payload.fileUploads.enabled).toBe(true);
-    expect(payload.auth.required).toBe(true);
+    expect(payload.auth.mode).toBe("managedSession");
     expect(payload.mcpServers[0]?.id).toBe("opengeni");
+  });
+
+  test("accepts checkout requests that use the caller default account", () => {
+    const payload = CreateCheckoutRequest.parse({ packageId: "topup_25" });
+    expect(payload.packageId).toBe("topup_25");
+    expect(payload.accountId).toBeUndefined();
   });
 
   test("accepts structured scheduled task definitions", () => {
@@ -139,9 +149,11 @@ describe("contracts", () => {
 
   test("accepts full realtime bus messages", () => {
     const message = SessionBusMessage.parse({
+      workspaceId: "00000000-0000-4000-8000-000000000100",
       sessionId: "00000000-0000-4000-8000-000000000001",
       events: [{
         id: "00000000-0000-4000-8000-000000000002",
+        workspaceId: "00000000-0000-4000-8000-000000000100",
         sessionId: "00000000-0000-4000-8000-000000000001",
         sequence: 1,
         type: "agent.message.delta",

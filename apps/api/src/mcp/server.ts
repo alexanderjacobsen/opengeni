@@ -1,11 +1,13 @@
 import {
   CreateScheduledTaskRequest,
+  type AccessGrant,
   type GitHubRepository,
   type ResourceRef,
   UpdateScheduledTaskRequest,
 } from "@opengeni/contracts";
 import {
   deleteScheduledTask,
+  listGitHubInstallationIdsForWorkspace,
   listScheduledTaskRuns,
   listScheduledTasks,
   requireFile,
@@ -18,6 +20,7 @@ import {
 } from "@opengeni/github";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z4 from "zod/v4";
+import { recordWorkspaceUsage, requireLimit } from "../billing/limits";
 import type { ApiRouteDeps } from "../dependencies";
 import {
   createValidatedScheduledTask,
@@ -26,7 +29,7 @@ import {
   validatedScheduledTaskUpdate,
 } from "../domain/scheduled-tasks";
 
-export function buildOpenGeniMcpServer(deps: ApiRouteDeps): McpServer {
+export function buildOpenGeniMcpServer(deps: ApiRouteDeps, grant: AccessGrant): McpServer {
   const server = new McpServer({
     name: "opengeni",
     version: "1.0.0",
@@ -40,7 +43,7 @@ export function buildOpenGeniMcpServer(deps: ApiRouteDeps): McpServer {
     if (!deps.objectStorage) {
       throw new Error("object storage is not configured");
     }
-    const file = await requireFile(deps.db, fileId);
+    const file = await requireFile(deps.db, grant.workspaceId, fileId);
     if (file.status !== "ready") {
       throw new Error(`file is ${file.status}`);
     }
@@ -69,7 +72,8 @@ export function buildOpenGeniMcpServer(deps: ApiRouteDeps): McpServer {
     inputSchema: { limit: z4.number().int().positive().optional() },
   }, async ({ limit }) => {
     try {
-      const repositories = await listGitHubAppRepositories(deps.settings);
+      const installationIds = await listGitHubInstallationIdsForWorkspace(deps.db, grant.workspaceId);
+      const repositories = await listGitHubAppRepositories(deps.settings, { installationIds });
       const visible = typeof limit === "number" ? repositories.slice(0, limit) : repositories;
       return json({ repositories: visible.map((repository) => repositoryWithScheduledTaskResource(repository)) });
     } catch (error) {
@@ -83,12 +87,12 @@ export function buildOpenGeniMcpServer(deps: ApiRouteDeps): McpServer {
   server.registerTool("scheduled_tasks_list", {
     description: "List scheduled tasks.",
     inputSchema: { limit: z4.number().int().positive().optional() },
-  }, async ({ limit }) => json({ tasks: await listScheduledTasks(deps.db, limit ?? 100) }));
+  }, async ({ limit }) => json({ tasks: await listScheduledTasks(deps.db, grant.workspaceId, limit ?? 100) }));
 
   server.registerTool("scheduled_tasks_get", {
     description: "Get one scheduled task.",
     inputSchema: { id: z4.string().uuid() },
-  }, async ({ id }) => json(await requireScheduledTask(deps.db, id)));
+  }, async ({ id }) => json(await requireScheduledTask(deps.db, grant.workspaceId, id)));
 
   server.registerTool("scheduled_tasks_create", {
     description: "Create a scheduled task.",
@@ -103,7 +107,8 @@ export function buildOpenGeniMcpServer(deps: ApiRouteDeps): McpServer {
     },
   }, async (args) => {
     const payload = CreateScheduledTaskRequest.parse(args);
-    const task = await createValidatedScheduledTask({ settings: deps.settings, db: deps.db, objectStorage: deps.objectStorage, payload });
+    await requireLimit(deps, { accountId: grant.accountId, workspaceId: grant.workspaceId, action: "schedule:create", quantity: 1 });
+    const task = await createValidatedScheduledTask({ settings: deps.settings, db: deps.db, objectStorage: deps.objectStorage, grant, payload });
     await syncCreatedScheduledTask({ db: deps.db, workflowClient: deps.workflowClient, task });
     return json(task);
   });
@@ -121,10 +126,10 @@ export function buildOpenGeniMcpServer(deps: ApiRouteDeps): McpServer {
       metadata: z4.record(z4.string(), z4.unknown()).optional(),
     },
   }, async ({ id, ...raw }) => {
-    const existing = await requireScheduledTask(deps.db, id);
+    const existing = await requireScheduledTask(deps.db, grant.workspaceId, id);
     const payload = UpdateScheduledTaskRequest.parse(raw);
     const update = await validatedScheduledTaskUpdate({ settings: deps.settings, db: deps.db, objectStorage: deps.objectStorage, existing, payload });
-    const task = await updateScheduledTask(deps.db, id, update);
+    const task = await updateScheduledTask(deps.db, grant.workspaceId, id, update);
     await syncUpdatedScheduledTask({ db: deps.db, workflowClient: deps.workflowClient, previous: existing, task });
     return json(task);
   });
@@ -133,8 +138,8 @@ export function buildOpenGeniMcpServer(deps: ApiRouteDeps): McpServer {
     description: "Pause a scheduled task.",
     inputSchema: { id: z4.string().uuid() },
   }, async ({ id }) => {
-    const existing = await requireScheduledTask(deps.db, id);
-    const task = await updateScheduledTask(deps.db, id, { status: "paused" });
+    const existing = await requireScheduledTask(deps.db, grant.workspaceId, id);
+    const task = await updateScheduledTask(deps.db, grant.workspaceId, id, { status: "paused" });
     await syncUpdatedScheduledTask({ db: deps.db, workflowClient: deps.workflowClient, previous: existing, task });
     return json(task);
   });
@@ -143,8 +148,8 @@ export function buildOpenGeniMcpServer(deps: ApiRouteDeps): McpServer {
     description: "Resume a scheduled task.",
     inputSchema: { id: z4.string().uuid() },
   }, async ({ id }) => {
-    const existing = await requireScheduledTask(deps.db, id);
-    const task = await updateScheduledTask(deps.db, id, { status: "active" });
+    const existing = await requireScheduledTask(deps.db, grant.workspaceId, id);
+    const task = await updateScheduledTask(deps.db, grant.workspaceId, id, { status: "active" });
     await syncUpdatedScheduledTask({ db: deps.db, workflowClient: deps.workflowClient, previous: existing, task });
     return json(task);
   });
@@ -153,8 +158,21 @@ export function buildOpenGeniMcpServer(deps: ApiRouteDeps): McpServer {
     description: "Trigger a scheduled task immediately.",
     inputSchema: { id: z4.string().uuid() },
   }, async ({ id }) => {
-    const task = await requireScheduledTask(deps.db, id);
-    await deps.workflowClient.triggerScheduledTask({ taskId: id });
+    const task = await requireScheduledTask(deps.db, grant.workspaceId, id);
+    await requireLimit(deps, { accountId: grant.accountId, workspaceId: grant.workspaceId, action: "agent_run:create", quantity: 1 });
+    const agentRunUsageIdempotencyKey = `agent_run.created:scheduled-trigger:${grant.workspaceId}:${task.id}:${crypto.randomUUID()}`;
+    await deps.workflowClient.triggerScheduledTask({ task, agentRunUsageIdempotencyKey });
+    await recordWorkspaceUsage(deps, {
+      accountId: grant.accountId,
+      workspaceId: grant.workspaceId,
+      subjectId: grant.subjectId,
+      eventType: "agent_run.created",
+      quantity: 1,
+      unit: "run",
+      sourceResourceType: "scheduled_task",
+      sourceResourceId: task.id,
+      idempotencyKey: agentRunUsageIdempotencyKey,
+    });
     return json(task);
   });
 
@@ -162,16 +180,16 @@ export function buildOpenGeniMcpServer(deps: ApiRouteDeps): McpServer {
     description: "Delete a scheduled task.",
     inputSchema: { id: z4.string().uuid() },
   }, async ({ id }) => {
-    const task = await requireScheduledTask(deps.db, id);
+    const task = await requireScheduledTask(deps.db, grant.workspaceId, id);
     await deps.workflowClient.deleteScheduledTaskSchedule({ temporalScheduleId: task.temporalScheduleId });
-    await deleteScheduledTask(deps.db, id);
+    await deleteScheduledTask(deps.db, grant.workspaceId, id);
     return json({ ok: true });
   });
 
   server.registerTool("scheduled_task_runs_list", {
     description: "List runs for a scheduled task.",
     inputSchema: { taskId: z4.string().uuid(), limit: z4.number().int().positive().optional() },
-  }, async ({ taskId, limit }) => json({ runs: await listScheduledTaskRuns(deps.db, taskId, limit ?? 100) }));
+  }, async ({ taskId, limit }) => json({ runs: await listScheduledTaskRuns(deps.db, grant.workspaceId, taskId, limit ?? 100) }));
 
   return server;
 }
@@ -185,8 +203,7 @@ function repositoryWithScheduledTaskResource(repository: GitHubRepository): GitH
       uri,
       ref: repository.defaultBranch,
       mountPath: repositoryMountPath(uri),
-      githubInstallationId: repository.installationId,
-      githubRepositoryId: repository.id,
+      ...(repository.private ? { githubInstallationId: repository.installationId, githubRepositoryId: repository.id } : {}),
     },
   };
 }

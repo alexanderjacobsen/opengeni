@@ -23,14 +23,57 @@ output "acr_pull_role_assignment_enabled" {
   value       = var.create_acr_pull_role_assignment
 }
 
+output "aks_network_role_assignment_enabled" {
+  description = "Whether this Terraform run manages the AKS Network Contributor role assignment on the static public IP."
+  value       = var.create_aks_network_role_assignment
+}
+
+output "aks_admin_principal_ids" {
+  description = "Azure AD principal IDs granted Azure Kubernetes Service Cluster Admin Role on the created AKS cluster."
+  value       = sort(tolist(var.aks_admin_principal_ids))
+}
+
+output "dns_zone_contributor_assignments" {
+  description = "Azure DNS zone contributor assignments managed for deployment automation."
+  value = {
+    for name, assignment in var.dns_zone_contributor_assignments : name => {
+      resource_group_name = assignment.resource_group_name
+      zone_name           = assignment.zone_name
+      principal_ids       = sort(tolist(assignment.principal_ids))
+    }
+  }
+}
+
+output "aks_control_plane_principal_id" {
+  description = "AKS control-plane identity principal id. Use this to grant public IP join permissions when Terraform cannot manage role assignments."
+  value       = azurerm_kubernetes_cluster.this.identity[0].principal_id
+}
+
 output "aks_kubelet_object_id" {
   description = "AKS kubelet identity object id. Use this to grant AcrPull when Terraform cannot manage role assignments."
   value       = azurerm_kubernetes_cluster.this.kubelet_identity[0].object_id
 }
 
+output "aks_egress_public_ip" {
+  description = "Static outbound public IP used by AKS and allowed through the managed Postgres firewall."
+  value       = azurerm_public_ip.aks_egress.ip_address
+}
+
 output "key_vault_name" {
   description = "Key Vault name for runtime secret storage."
   value       = azurerm_key_vault.this.name
+}
+
+output "observability" {
+  description = "Azure Monitor resources created when observability.enabled is true."
+  value = {
+    enabled                    = try(var.observability.enabled, false)
+    log_analytics_workspace_id = try(azurerm_log_analytics_workspace.observability[0].id, null)
+    application_insights_id    = try(azurerm_application_insights.observability[0].id, null)
+    availability_web_test_id   = try(azurerm_application_insights_standard_web_test.availability[0].id, null)
+    action_group_id            = try(azurerm_monitor_action_group.observability[0].id, null)
+    availability_alert_id      = try(azurerm_monitor_metric_alert.availability[0].id, null)
+  }
 }
 
 output "postgres_host" {

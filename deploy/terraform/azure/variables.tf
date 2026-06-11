@@ -73,6 +73,59 @@ variable "create_acr_pull_role_assignment" {
   default     = true
 }
 
+variable "create_aks_network_role_assignment" {
+  description = "Whether Terraform should grant the AKS control-plane identity Network Contributor on the static AKS public IP. Required for Kubernetes load balancers to attach the configured outbound IP."
+  type        = bool
+  default     = true
+}
+
+variable "aks_admin_principal_ids" {
+  description = "Azure AD principal IDs that Terraform should grant Azure Kubernetes Service Cluster Admin Role on the created AKS cluster. Use this for deployment automation identities that run kubectl/Helm through az aks get-credentials --admin."
+  type        = set(string)
+  default     = []
+}
+
+variable "dns_zone_contributor_assignments" {
+  description = "Azure DNS zones where deployment automation principals should receive DNS Zone Contributor. Use this when workflows manage app host records as part of reproducible environment bootstrap."
+  type = map(object({
+    resource_group_name = string
+    zone_name           = string
+    principal_ids       = set(string)
+  }))
+  default = {}
+}
+
+variable "observability" {
+  description = "Optional Azure Monitor resources for production availability probes, alerts, and workspace-backed Application Insights."
+  type = object({
+    enabled                         = optional(bool, false)
+    log_analytics_workspace_name    = optional(string)
+    application_insights_name       = optional(string)
+    action_group_name               = optional(string)
+    action_group_short_name         = optional(string, "opengenialrt")
+    alert_email_receivers           = optional(map(string), {})
+    availability_test_name          = optional(string)
+    availability_test_url           = optional(string)
+    availability_test_frequency     = optional(number, 300)
+    availability_test_timeout       = optional(number, 30)
+    availability_test_geo_locations = optional(list(string), ["emea-nl-ams-azr"])
+    availability_alert_name         = optional(string)
+    availability_alert_severity     = optional(number, 1)
+    availability_failed_locations   = optional(number, 1)
+  })
+  default = {}
+
+  validation {
+    condition     = !try(var.observability.enabled, false) || try(length(var.observability.availability_test_url) > 0, false)
+    error_message = "observability.availability_test_url is required when observability.enabled is true."
+  }
+
+  validation {
+    condition     = !try(var.observability.enabled, false) || try(length(var.observability.alert_email_receivers) > 0, false)
+    error_message = "observability.alert_email_receivers must include at least one receiver when observability.enabled is true."
+  }
+}
+
 variable "postgres" {
   description = "Postgres mode. Use managed to create Azure Database for PostgreSQL Flexible Server or external to connect an existing compatible server."
   type = object({

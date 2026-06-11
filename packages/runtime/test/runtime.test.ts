@@ -1,11 +1,29 @@
 import { describe, expect, test } from "bun:test";
 import { OPENAI_RESPONSES_RAW_MODEL_EVENT_SOURCE, RunRawModelStreamEvent } from "@openai/agents";
-import { applyMissingManifestEntries, azureCliLoginCommand, buildOpenGeniAgent, buildManifest, deserializeSandboxSessionStateEnvelope, ensureReadableStreamFrom, materializeSandboxFileDownloads, normalizeSdkEvent, prepareRunInput, prefixedMcpToolName, prepareAgentTools, runAzureCliLoginHook, sandboxCommandExitCode, sandboxFileDownloadsForAgent, sandboxRunAs, withSandboxFileDownloads, withSandboxLifecycleHooks } from "../src/index";
+import { applyMissingManifestEntries, azureCliLoginCommand, azureOpenAIDefaultQuery, buildOpenGeniAgent, buildManifest, deserializeSandboxSessionStateEnvelope, ensureReadableStreamFrom, materializeSandboxFileDownloads, repositoryCloneCommand, modelResponseUsageFromSdkEvent, normalizeSdkEvent, prepareRunInput, prefixedMcpToolName, prepareAgentTools, runAzureCliLoginHook, runRepositoryCloneHook, sandboxCommandExitCode, sandboxFileDownloadsForAgent, sandboxRunAs, withSandboxFileDownloads, withSandboxLifecycleHooks } from "../src/index";
 import { Manifest } from "@openai/agents/sandbox";
 import { startTestMcpServer, testSettings } from "@opengeni/testing";
 import type { MCPServer } from "@openai/agents";
 
 describe("runtime event normalization", () => {
+  test("does not send legacy Azure api-version query for v1 base URLs", () => {
+    const query = azureOpenAIDefaultQuery(
+      { azureOpenaiApiVersion: "2025-04-01-preview" },
+      "https://example.openai.azure.com/openai/v1/",
+    );
+
+    expect(query).toBeUndefined();
+  });
+
+  test("keeps Azure api-version query for deployment-style base URLs", () => {
+    const query = azureOpenAIDefaultQuery(
+      { azureOpenaiApiVersion: "2025-04-01-preview" },
+      "https://example.openai.azure.com/openai/deployments/gpt-5.5",
+    );
+
+    expect(query).toEqual({ "api-version": "2025-04-01-preview" });
+  });
+
   test("maps core SDK text deltas into session deltas", () => {
     const [event] = normalizeSdkEvent(new RunRawModelStreamEvent({
       type: "output_text_delta",
@@ -15,6 +33,65 @@ describe("runtime event normalization", () => {
     expect(event).toEqual({
       type: "agent.message.delta",
       payload: { text: "hello" },
+    });
+  });
+
+  test("extracts model usage from streamed response completion events", () => {
+    const usage = modelResponseUsageFromSdkEvent({
+      type: "raw_model_stream_event",
+      data: {
+        type: "response_done",
+        response: {
+          id: "resp-1",
+          usage: {
+            inputTokens: 10,
+            outputTokens: 5,
+            totalTokens: 15,
+            inputTokensDetails: { cached_tokens: 3 },
+          },
+        },
+      },
+    } as any);
+
+    expect(usage).toEqual({
+      responseId: "resp-1",
+      usage: {
+        inputTokens: 10,
+        outputTokens: 5,
+        totalTokens: 15,
+        inputTokensDetails: { cached_tokens: 3 },
+      },
+    });
+  });
+
+  test("extracts model usage from raw Responses completion events", () => {
+    const usage = modelResponseUsageFromSdkEvent(new RunRawModelStreamEvent({
+      type: "model",
+      providerData: {
+        rawModelEventSource: OPENAI_RESPONSES_RAW_MODEL_EVENT_SOURCE,
+      },
+      event: {
+        type: "response.completed",
+        response: {
+          id: "resp-2",
+          usage: {
+            input_tokens: 20,
+            output_tokens: 8,
+            total_tokens: 28,
+            input_tokens_details: { cached_tokens: 4 },
+          },
+        },
+      },
+    } as any));
+
+    expect(usage).toEqual({
+      responseId: "resp-2",
+      usage: {
+        inputTokens: 20,
+        outputTokens: 8,
+        totalTokens: 28,
+        inputTokensDetails: { cached_tokens: 4 },
+      },
     });
   });
 
@@ -378,6 +455,134 @@ describe("runtime event normalization", () => {
     });
   });
 
+  test("keeps GitHub App repository resources out of SDK git repo materialization", () => {
+    const manifest = buildManifest(testSettings(), [{
+      kind: "repository",
+      uri: "https://github.com/acme/private.git",
+      ref: "main",
+      githubInstallationId: 123,
+      githubRepositoryId: 456,
+    }]);
+    expect(manifest.entries["repos/acme/private"]).toMatchObject({ type: "dir" });
+    const serialized = JSON.stringify(manifest);
+    expect(serialized).not.toContain("git_repo");
+    expect(serialized).not.toContain("githubInstallationId");
+    expect(serialized).not.toContain("githubRepositoryId");
+    expect(serialized).not.toContain("x-access-token");
+  });
+
+  test("keeps Modal repository resources out of SDK git repo materialization", () => {
+    const manifest = buildManifest(testSettings({ sandboxBackend: "modal" }), [{
+      kind: "repository",
+      uri: "https://github.com/acme/private.git",
+      ref: "main",
+      githubInstallationId: 123,
+      githubRepositoryId: 456,
+    }]);
+
+    expect(manifest.entries["repos/acme/private"]).toMatchObject({ type: "dir" });
+    const serialized = JSON.stringify(manifest);
+    expect(serialized).not.toContain("git_repo");
+    expect(serialized).not.toContain("githubInstallationId");
+    expect(serialized).not.toContain("githubRepositoryId");
+    expect(serialized).not.toContain("x-access-token");
+  });
+
+  test("clones repository resources inside the sandbox without embedding credentials", () => {
+    const command = repositoryCloneCommand([{
+      kind: "repository",
+      uri: "https://github.com/acme/private.git",
+      ref: "main",
+      subpath: "packages/api",
+      githubInstallationId: 123,
+      githubRepositoryId: 456,
+    }]);
+
+    expect(command).toContain("git -C \"$tmp\" fetch --depth 1 --no-tags --filter=blob:none origin \"$ref\"");
+    expect(command).toContain("git -C \"$target\" rev-parse --is-inside-work-tree >/dev/null");
+    expect(command).toContain("Repository resource ready at $target");
+    expect(command).toContain("ensure_git");
+    expect(command).toContain("apt-get install -y --no-install-recommends ca-certificates git");
+    expect(command).toContain("clone_repository '/workspace/repos/acme/private' 'https://github.com/acme/private.git' 'main' 'packages/api'");
+    expect(command).not.toContain("githubInstallationId");
+    expect(command).not.toContain("githubRepositoryId");
+    expect(command).not.toContain("x-access-token");
+    expect(command).not.toContain("GH_TOKEN=");
+  });
+
+  test("runs repository clone hook as a sandbox lifecycle hook", async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const events: string[] = [];
+    await runRepositoryCloneHook({
+      execCommand: async (args: Record<string, unknown>) => {
+        calls.push(args);
+        return { status: 0, output: "" };
+      },
+    } as any, [{
+      kind: "repository",
+      uri: "https://github.com/acme/private.git",
+      ref: "main",
+      githubInstallationId: 123,
+      githubRepositoryId: 456,
+    }], {
+      environment: { GH_TOKEN: "secret-token" },
+      runAs: "sandbox",
+      onRuntimeEvent: (event) => {
+        events.push(event.type);
+      },
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.runAs).toBe("sandbox");
+    expect(calls[0]?.workdir).toBe("/workspace");
+    expect(String(calls[0]?.cmd)).toContain("git init");
+    expect(String(calls[0]?.cmd)).not.toContain("secret-token");
+    expect(events).toEqual(["sandbox.operation.started", "sandbox.operation.completed"]);
+  });
+
+  test("fails repository clone hook when sandbox command is still running", async () => {
+    const events: string[] = [];
+    await expect(runRepositoryCloneHook({
+      execCommand: async () => [
+        "Chunk ID: abc123",
+        "Wall time: 1.0000 seconds",
+        "Process running with session ID 1",
+        "Output:",
+        "",
+      ].join("\n"),
+    } as any, [{
+      kind: "repository",
+      uri: "https://github.com/acme/private.git",
+      ref: "main",
+      githubInstallationId: 123,
+      githubRepositoryId: 456,
+    }], {
+      environment: { GH_TOKEN: "secret-token" },
+      onRuntimeEvent: (event) => {
+        events.push(event.type);
+      },
+    })).rejects.toThrow("did not finish before the lifecycle command timeout");
+
+    expect(events).toEqual(["sandbox.operation.started", "sandbox.operation.failed"]);
+  });
+
+  test("keeps repository subpaths as git repo manifest subpaths", () => {
+    const manifest = buildManifest(testSettings(), [{
+      kind: "repository",
+      uri: "https://github.com/acme/private.git",
+      ref: "main",
+      mountPath: "repos/acme/private/README.md",
+      subpath: "README.md",
+    }]);
+    expect(manifest.entries["repos/acme/private/README.md"]).toMatchObject({
+      type: "git_repo",
+      host: "github.com",
+      repo: "acme/private",
+      ref: "main",
+      subpath: "README.md",
+    });
+  });
+
   test("applies only missing manifest entries to resumed sandbox sessions", async () => {
     const current = buildManifest(testSettings(), [{
       kind: "repository",
@@ -559,7 +764,7 @@ describe("runtime event normalization", () => {
 
   test("sends the shared access key to first-party MCP servers", async () => {
     const accessKey = "local-mcp-access-key";
-    const mcp = startTestMcpServer({ requiredAuthorization: `Bearer ${accessKey}` });
+    const mcp = startTestMcpServer({ requiredHeaders: { "x-opengeni-access-key": accessKey } });
     const prepared = await prepareAgentTools(testSettings({
       authRequired: true,
       accessKey,

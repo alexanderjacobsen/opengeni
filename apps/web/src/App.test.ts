@@ -4,10 +4,12 @@ import {
   applySessionStatusEvents,
   buildTools,
   formStateFromScheduledTask,
+  gitHubRepositoryResource,
   projectConversation,
+  sanitizeEventForDisplay,
   scheduleFromFormState,
 } from "./App";
-import type { ResourceRef, ScheduledTask, ScheduledTaskScheduleSpec, Session, SessionEvent } from "./types";
+import type { GitHubRepository, ResourceRef, ScheduledTask, ScheduledTaskScheduleSpec, Session, SessionEvent } from "./types";
 
 describe("projectConversation", () => {
   test("keeps assistant messages and activity groups in event order", () => {
@@ -88,6 +90,44 @@ describe("projectConversation", () => {
       resources: [{ kind: "file", fileId, mountPath: `files/${fileId}` }],
       tools: [{ kind: "mcp", id: "docs" }],
     });
+  });
+
+  test("hides archived terminal failure payloads in the main timeline projection", () => {
+    const turns = projectConversation(session({ status: "failed" }), [
+      event(1, "user.message", { text: "Inspect" }),
+      event(2, "turn.failed", {
+        error: "Failed to apply a Modal sandbox manifest: RESOURCE_EXHAUSTED",
+      }),
+      event(3, "sandbox.operation.failed", {
+        error: "/modal.client.ModalClient/SandboxTerminate RESOURCE_EXHAUSTED",
+      }),
+    ]);
+
+    expect(JSON.stringify(turns)).not.toContain("RESOURCE_EXHAUSTED");
+    expect(JSON.stringify(turns)).toContain("Historical failure payload hidden in the web console.");
+  });
+
+  test("keeps active failure payloads visible in the main timeline projection", () => {
+    const turns = projectConversation(session({ status: "running" }), [
+      event(1, "user.message", { text: "Inspect" }),
+      event(2, "turn.failed", { error: "Current run failed" }),
+    ]);
+
+    expect(JSON.stringify(turns)).toContain("Current run failed");
+  });
+
+  test("redacts active provider-internal sandbox failures in the main timeline projection", () => {
+    const turns = projectConversation(session({ status: "running" }), [
+      event(1, "user.message", { text: "Inspect" }),
+      event(2, "turn.failed", {
+        error: "Failed to apply a Modal sandbox manifest and close the sandbox. Manifest error: /modal.client.ModalClient/ContainerFilesystemExec RESOURCE_EXHAUSTED: Bandwidth exhausted or memory limit exceeded",
+      }),
+    ]);
+
+    const json = JSON.stringify(turns);
+    expect(json).not.toContain("RESOURCE_EXHAUSTED");
+    expect(json).not.toContain("ModalClient");
+    expect(json).toContain("temporary capacity limit");
   });
 });
 
@@ -213,6 +253,28 @@ describe("scheduled task form helpers", () => {
   });
 });
 
+describe("GitHub repository resources", () => {
+  test("uses normal git resources for public GitHub App repositories", () => {
+    expect(gitHubRepositoryResource(githubRepository({ private: false }), "main")).toEqual({
+      kind: "repository",
+      uri: "https://github.com/example/public.git",
+      ref: "main",
+      mountPath: "repos/example/public",
+    });
+  });
+
+  test("keeps installation metadata for private GitHub App repositories", () => {
+    expect(gitHubRepositoryResource(githubRepository({ private: true }), "main")).toEqual({
+      kind: "repository",
+      uri: "https://github.com/example/public.git",
+      ref: "main",
+      mountPath: "repos/example/public",
+      githubInstallationId: 123,
+      githubRepositoryId: 456,
+    });
+  });
+});
+
 describe("applySessionStatusEvents", () => {
   test("trusts terminal status events without requiring a session refetch", () => {
     const next = applySessionStatusEvents(session(), [
@@ -231,9 +293,47 @@ describe("applySessionStatusEvents", () => {
   });
 });
 
-function session(): Session {
+describe("sanitizeEventForDisplay", () => {
+  test("hides historical terminal failure payloads in the web console", () => {
+    const sanitized = sanitizeEventForDisplay(event(7, "turn.failed", {
+      error: "Failed to apply a Modal sandbox manifest: RESOURCE_EXHAUSTED",
+    }), "failed");
+
+    expect(JSON.stringify(sanitized.payload)).not.toContain("RESOURCE_EXHAUSTED");
+    expect(sanitized.payload).toEqual({
+      archived: true,
+      status: "failed",
+      message: "Historical failure payload hidden in the web console.",
+    });
+  });
+
+  test("keeps active failure payloads available for current-run debugging", () => {
+    const active = sanitizeEventForDisplay(event(7, "turn.failed", {
+      error: "Current run failed",
+    }), "running");
+
+    expect(active.payload).toEqual({ error: "Current run failed" });
+  });
+
+  test("redacts active provider-internal sandbox failures in debug payloads", () => {
+    const active = sanitizeEventForDisplay(event(7, "turn.failed", {
+      error: "Failed to apply a Modal sandbox manifest and close the sandbox. Manifest error: /modal.client.ModalClient/ContainerFilesystemExec RESOURCE_EXHAUSTED: Bandwidth exhausted or memory limit exceeded",
+    }), "running");
+
+    expect(JSON.stringify(active.payload)).not.toContain("RESOURCE_EXHAUSTED");
+    expect(JSON.stringify(active.payload)).not.toContain("ModalClient");
+    expect(active.payload).toEqual({
+      error: "Sandbox setup failed because the execution provider reported a temporary capacity limit. Start a new session.",
+      redacted: true,
+    });
+  });
+});
+
+function session(patch: Partial<Session> = {}): Session {
   return {
     id: "session-1",
+    accountId: "account-1",
+    workspaceId: "workspace-1",
     status: "running",
     initialMessage: "Inspect the repo",
     resources: [],
@@ -246,6 +346,7 @@ function session(): Session {
     lastSequence: 0,
     createdAt: "2026-05-07T00:00:00.000Z",
     updatedAt: "2026-05-07T00:00:00.000Z",
+    ...patch,
   };
 }
 
@@ -263,6 +364,8 @@ function scheduledTaskAgentConfig(): ScheduledTask["agentConfig"] {
 function scheduledTask(schedule: ScheduledTaskScheduleSpec, patch: Partial<ScheduledTask> = {}): ScheduledTask {
   return {
     id: "00000000-0000-4000-8000-000000000100",
+    accountId: "account-1",
+    workspaceId: "workspace-1",
     name: "Task",
     status: "active",
     schedule,
@@ -278,9 +381,26 @@ function scheduledTask(schedule: ScheduledTaskScheduleSpec, patch: Partial<Sched
   };
 }
 
+function githubRepository(patch: Partial<GitHubRepository> = {}): GitHubRepository {
+  return {
+    id: 456,
+    installationId: 123,
+    fullName: "example/public",
+    name: "public",
+    private: false,
+    htmlUrl: "https://github.com/example/public",
+    cloneUrl: "https://github.com/example/public.git",
+    defaultBranch: "main",
+    accountLogin: "example",
+    accountType: "Organization",
+    ...patch,
+  };
+}
+
 function event(sequence: number, type: string, payload: unknown): SessionEvent {
   return {
     id: `event-${sequence}`,
+    workspaceId: "workspace-1",
     sessionId: "session-1",
     turnId: "turn-1",
     sequence,

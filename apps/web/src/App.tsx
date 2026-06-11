@@ -54,11 +54,13 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   addDocumentToBase,
+  fetchAccessContext,
   createSession,
   createDocumentBase,
   createScheduledTask,
   deleteScheduledTask,
   fetchClientConfig,
+  fetchAuthSession,
   fetchDocumentBases,
   fetchDocuments,
   fetchEvents,
@@ -68,7 +70,13 @@ import {
   fetchGitHubStatus,
   fetchScheduledTaskRuns,
   fetchScheduledTasks,
+  fetchWorkspaces,
+  fetchApiKeys,
+  fetchBilling,
   getStoredAccessKey,
+  isApiErrorStatus,
+  createApiKey,
+  createBillingCheckout,
   reindexDocument,
   fetchSession,
   pauseScheduledTask,
@@ -76,16 +84,25 @@ import {
   sendApproval,
   sendInterrupt,
   sendUserMessage,
+  sendVerificationEmail,
   searchDocumentBase,
   setStoredAccessKey,
   startGitHubManifest,
   streamSessionEvents,
+  signInEmail,
+  signOutManaged,
+  signUpEmail,
   triggerScheduledTask,
   updateScheduledTask,
   uploadFileAsset,
   clearStoredAccessKey,
+  revokeApiKey,
 } from "./api";
 import type {
+  AccessContext,
+  ApiKey,
+  AuthSession,
+  BillingBalance,
   ClientConfig,
   DocumentBase,
   DocumentSearchResult,
@@ -103,6 +120,7 @@ import type {
   SessionStatus,
   ToolRef,
   TurnSubmission,
+  Workspace,
 } from "./types";
 import { cn } from "@/lib/utils";
 import { Streamdown, type StreamdownComponents } from "./vendor/streamdown-runtime.js";
@@ -164,12 +182,16 @@ type ConversationTurn = ConversationUserTurn | ConversationAssistantTurn | Conve
 
 export function App() {
   const [sessionId, setSessionId] = useState(() => sessionIdFromPath());
-  const [activeView, setActiveView] = useState<"agent" | "documents">("agent");
+  const [activeView, setActiveView] = useState<"agent" | "documents" | "account">("agent");
   const [session, setSession] = useState<Session | null>(null);
   const [events, setEvents] = useState<SessionEvent[]>([]);
   const [clientConfig, setClientConfig] = useState<ClientConfig | null>(null);
+  const [authSession, setAuthSession] = useState<AuthSession | null | undefined>(undefined);
+  const [accessContext, setAccessContext] = useState<AccessContext | null>(null);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(null);
   const [model, setModel] = useState("gpt-5.5");
-  const [reasoningEffort, setReasoningEffort] = useState<IntelligenceEffort>("high");
+  const [reasoningEffort, setReasoningEffort] = useState<IntelligenceEffort>("low");
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [connectionState, setConnectionState] = useState<ConnectionState>("closed");
   const [manualRepos, setManualRepos] = useState<RepoDraft[]>([]);
@@ -190,8 +212,14 @@ export function App() {
   const [accessKeyDraft, setAccessKeyDraft] = useState("");
   const [accessKeyVersion, setAccessKeyVersion] = useState(0);
   const lastSequence = useMemo(() => events.reduce((max, event) => Math.max(max, event.sequence), 0), [events]);
-  const authRequired = clientConfig?.auth.required === true;
-  const authReady = !authRequired || hasAccessKey;
+  const keyAuthRequired = clientConfig?.auth.mode === "deploymentKey" || clientConfig?.auth.mode === "configuredToken";
+  const managedAuthRequired = clientConfig?.auth.mode === "managedSession";
+  const keyAuthReady = !keyAuthRequired || hasAccessKey;
+  const managedAuthReady = !managedAuthRequired || authSession !== null;
+  const authReady = keyAuthReady && managedAuthReady;
+  const workspaceId = selectedWorkspaceId ?? accessContext?.defaultWorkspaceId ?? workspaces[0]?.id ?? null;
+  const activeWorkspace = workspaceId ? workspaces.find((workspace) => workspace.id === workspaceId) ?? null : null;
+  const workspaceReady = authReady && workspaceId !== null;
 
   useEffect(() => {
     void fetchClientConfig()
@@ -206,14 +234,42 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (clientConfig?.auth.mode !== "managedSession") {
+      setAuthSession(null);
+      return;
+    }
+    void fetchAuthSession()
+      .then(setAuthSession)
+      .catch(() => setAuthSession(null));
+  }, [clientConfig]);
+
+  useEffect(() => {
     if (!clientConfig || !authReady) {
       return;
     }
-    void refreshGitHub();
+    void Promise.all([fetchAccessContext(), fetchWorkspaces()])
+      .then(([context, nextWorkspaces]) => {
+        setAccessContext(context);
+        setWorkspaces(nextWorkspaces);
+        setSelectedWorkspaceId((current) => {
+          if (current && nextWorkspaces.some((workspace) => workspace.id === current)) {
+            return current;
+          }
+          return context.defaultWorkspaceId ?? nextWorkspaces[0]?.id ?? context.workspaceGrants[0]?.workspaceId ?? null;
+        });
+      })
+      .catch((error) => toast.error("Failed to load workspace access", { description: String(error) }));
   }, [clientConfig, authReady, accessKeyVersion]);
 
   useEffect(() => {
-    if (!authReady) {
+    if (!clientConfig || !workspaceReady || !workspaceId) {
+      return;
+    }
+    void refreshGitHub();
+  }, [clientConfig, workspaceReady, workspaceId, accessKeyVersion]);
+
+  useEffect(() => {
+    if (!workspaceReady || !workspaceId) {
       return;
     }
     if (!sessionId) {
@@ -222,11 +278,48 @@ export function App() {
       setConnectionState("closed");
       return;
     }
-    void fetchSession(sessionId).then(setSession).catch((error) => toast.error("Failed to load session", { description: String(error) }));
-    void fetchEvents(sessionId).then(setEvents).catch((error) => toast.error("Failed to load events", { description: String(error) }));
-  }, [sessionId, authReady, accessKeyVersion]);
+    let cancelled = false;
+    setSession(null);
+    setEvents([]);
+    void (async () => {
+      try {
+        const [nextSession, nextEvents] = await Promise.all([
+          fetchSession(workspaceId, sessionId),
+          fetchEvents(workspaceId, sessionId),
+        ]);
+        if (cancelled) {
+          return;
+        }
+        setSession(nextSession);
+        setEvents(nextEvents);
+        if (isTerminalSessionStatus(nextSession.status)) {
+          forgetSession(workspaceId, nextSession.id);
+        }
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        setSession(null);
+        setEvents([]);
+        setConnectionState("closed");
+        if (isApiErrorStatus(error, 404)) {
+          forgetSession(workspaceId, sessionId);
+          setSessionId(null);
+          if (sessionIdFromPath() === sessionId) {
+            window.history.replaceState({}, "", "/");
+          }
+          toast.error("Session no longer exists", { description: "It was removed from recent sessions." });
+          return;
+        }
+        toast.error("Failed to load session", { description: String(error) });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, workspaceReady, workspaceId, accessKeyVersion]);
 
-  useSessionStream(authReady ? sessionId : null, lastSequence, accessKeyVersion, (incoming) => {
+  useSessionStream(workspaceReady ? workspaceId : null, workspaceReady ? sessionId : null, lastSequence, accessKeyVersion, (incoming) => {
     setEvents((current) => mergeEvents(current, incoming));
     setSession((current) => current ? applySessionStatusEvents(current, incoming) : current);
   }, setConnectionState);
@@ -240,13 +333,16 @@ export function App() {
   const sessionRunning = session?.status === "running" || session?.status === "queued";
 
   async function refreshGitHub() {
+    if (!workspaceId) {
+      return;
+    }
     setRepoBusy(true);
     try {
-      const status = await fetchGitHubStatus();
+      const status = await fetchGitHubStatus(workspaceId);
       setGithubStatus(status);
       setGithubAppOpen(!status.configured);
       if (status.configured) {
-        setGithubRepos(await fetchGitHubRepositories());
+        setGithubRepos(await fetchGitHubRepositories(workspaceId));
       }
     } catch (error) {
       setGithubStatus({ configured: false, missing: [], installUrl: null });
@@ -257,11 +353,16 @@ export function App() {
   }
 
   async function submitInitial(submission: TurnSubmission) {
+    if (!workspaceId) {
+      toast.error("Select a workspace before starting a session");
+      return;
+    }
     setBusy(true);
     try {
       const selectedResources = buildResources(manualRepos, githubRepos, selectedRepoIds, selectedRepoRefs);
       const selectedTools = buildTools(submission.tools, documentSearchEnabled, openGeniToolEnabled);
       const created = await createSession({
+        workspaceId,
         initialMessage: submission.text,
         resources: [...selectedResources, ...(submission.resources ?? [])],
         tools: selectedTools,
@@ -292,19 +393,19 @@ export function App() {
   }
 
   async function submitFollowUp(submission: TurnSubmission) {
-    if (!session || !submission.text.trim()) {
+    if (!workspaceId || !session || !submission.text.trim()) {
       return;
     }
     setBusy(true);
     try {
-      await sendUserMessage(session.id, {
+      await sendUserMessage(workspaceId, session.id, {
         ...submission,
         text: submission.text.trim(),
         tools: buildTools(submission.tools, documentSearchEnabled, openGeniToolEnabled),
         model,
         reasoningEffort,
       });
-      setSession(await fetchSession(session.id));
+      setSession(await fetchSession(workspaceId, session.id));
     } catch (error) {
       toast.error("Failed to send follow-up", { description: error instanceof Error ? error.message : String(error) });
     } finally {
@@ -313,13 +414,13 @@ export function App() {
   }
 
   async function interruptSession() {
-    if (!session || !sessionRunning) {
+    if (!workspaceId || !session || !sessionRunning) {
       return;
     }
     setBusy(true);
     try {
-      await sendInterrupt(session.id, "user requested cancellation");
-      setSession(await fetchSession(session.id));
+      await sendInterrupt(workspaceId, session.id, "user requested cancellation");
+      setSession(await fetchSession(workspaceId, session.id));
     } catch (error) {
       toast.error("Failed to interrupt session", { description: error instanceof Error ? error.message : String(error) });
     } finally {
@@ -328,9 +429,13 @@ export function App() {
   }
 
   async function startGitHubAppManifestFlow() {
+    if (!workspaceId) {
+      toast.error("Select a workspace before setting up GitHub");
+      return;
+    }
     setGithubAppBusy(true);
     try {
-      const result = await startGitHubManifest(githubOrg.trim() || undefined);
+      const result = await startGitHubManifest(workspaceId, githubOrg.trim() || undefined);
       submitGitHubManifest(result.actionUrl, result.manifest);
     } catch (error) {
       toast.error("GitHub App setup failed", { description: error instanceof Error ? error.message : String(error) });
@@ -383,6 +488,33 @@ export function App() {
     setAccessKeyVersion((version) => version + 1);
   }
 
+  async function handleManagedAuth(mode: "signin" | "signup", input: { name: string; email: string; password: string }) {
+    if (mode === "signup") {
+      await signUpEmail(input);
+    } else {
+      await signInEmail({ email: input.email, password: input.password, rememberMe: true });
+    }
+    const nextSession = await fetchAuthSession();
+    setAuthSession(nextSession);
+    setAccessKeyVersion((version) => version + 1);
+    if (!nextSession && mode === "signup") {
+      toast.success("Check your email to verify the account");
+    }
+  }
+
+  async function handleManagedSignOut() {
+    await signOutManaged();
+    setAuthSession(null);
+    setAccessContext(null);
+    setWorkspaces([]);
+    setSelectedWorkspaceId(null);
+    setSession(null);
+    setEvents([]);
+    setSessionId(null);
+    setAccessKeyVersion((version) => version + 1);
+    window.history.pushState({}, "", "/");
+  }
+
   return (
     <main className="flex h-dvh min-h-screen flex-col overflow-x-hidden bg-[color:var(--color-bg)] text-[color:var(--color-fg)]">
       <Toaster richColors theme="dark" />
@@ -419,6 +551,16 @@ export function App() {
             <FileSearchIcon className="size-3.5" />
             <span className="hidden sm:inline">Documents</span>
           </Button>
+          <Button
+            type="button"
+            variant={activeView === "account" ? "secondary" : "ghost"}
+            size="sm"
+            onClick={() => setActiveView("account")}
+            className="h-8 px-2.5 text-xs"
+          >
+            <UserIcon className="size-3.5" />
+            <span className="hidden sm:inline">Account</span>
+          </Button>
         </nav>
 
         {session && activeView === "agent" ? (
@@ -429,14 +571,40 @@ export function App() {
             <div className="hidden min-w-0 sm:block">
               <div className="truncate text-sm font-medium">{session.initialMessage}</div>
               <div className="truncate text-xs text-[color:var(--color-fg-subtle)]">
-                {session.model} · {String(session.metadata.reasoningEffort ?? "high")} · {session.sandboxBackend}
+                {session.model} · {String(session.metadata.reasoningEffort ?? "low")} · {session.sandboxBackend}
               </div>
             </div>
           </div>
         ) : null}
 
+        {workspaces.length > 1 ? (
+          <label className="hidden min-w-0 items-center gap-2 sm:flex">
+            <span className="sr-only">Workspace</span>
+            <select
+              value={workspaceId ?? ""}
+              onChange={(event) => {
+                const nextWorkspaceId = event.target.value || null;
+                setSelectedWorkspaceId(nextWorkspaceId);
+                setSession(null);
+                setEvents([]);
+                setSessionId(null);
+                window.history.pushState({}, "", "/");
+              }}
+              className="h-8 max-w-52 rounded-md border border-[color:var(--color-border)] bg-[color:var(--color-surface)] px-2 text-xs text-[color:var(--color-fg)]"
+            >
+              {workspaces.map((workspace) => (
+                <option key={workspace.id} value={workspace.id}>{workspace.name}</option>
+              ))}
+            </select>
+          </label>
+        ) : activeWorkspace ? (
+          <div className="hidden max-w-52 truncate rounded-md border border-[color:var(--color-border)] bg-[color:var(--color-surface)] px-2 py-1.5 text-xs text-[color:var(--color-fg-muted)] sm:block">
+            {activeWorkspace.name}
+          </div>
+        ) : null}
+
         <div className="ml-auto flex items-center gap-2">
-          {authRequired ? (
+          {keyAuthRequired ? (
             <Button type="button" variant="ghost" size="icon-sm" onClick={forgetAccessKey} aria-label="Clear access key">
               <LockIcon className="size-4" />
             </Button>
@@ -457,7 +625,7 @@ export function App() {
         </div>
       </header>
 
-      {authRequired && !hasAccessKey ? (
+      {keyAuthRequired && !hasAccessKey ? (
         <section className="flex flex-1 items-center justify-center px-4">
           <form
             className="w-full max-w-sm rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-surface)] p-5 shadow-sm"
@@ -472,7 +640,9 @@ export function App() {
               </span>
               <div>
                 <h1 className="text-base font-semibold">Access key required</h1>
-                <p className="text-sm text-[color:var(--color-fg-subtle)]">Enter the deployment key for this OpenGeni instance.</p>
+                <p className="text-sm text-[color:var(--color-fg-subtle)]">
+                  Enter the {clientConfig?.auth.mode === "configuredToken" ? "configured bearer token" : "deployment key"} for this OpenGeni instance.
+                </p>
               </div>
             </div>
             <Label htmlFor="access-key">Access key</Label>
@@ -491,12 +661,39 @@ export function App() {
             </Button>
           </form>
         </section>
+      ) : managedAuthRequired && authSession === undefined ? (
+        <section className="grid flex-1 place-items-center px-4 text-center">
+          <div className="max-w-sm rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-surface)] p-5 text-sm text-[color:var(--color-fg-muted)]">
+            <Loader2Icon className="mx-auto mb-3 size-5 animate-spin text-[color:var(--color-fg)]" />
+            Checking session
+          </div>
+        </section>
+      ) : managedAuthRequired && !authSession ? (
+        <ManagedAuthPanel onSubmit={handleManagedAuth} />
+      ) : !workspaceReady ? (
+        <section className="grid flex-1 place-items-center px-4 text-center">
+          <div className="max-w-sm rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-surface)] p-5 text-sm text-[color:var(--color-fg-muted)]">
+            <Loader2Icon className="mx-auto mb-3 size-5 animate-spin text-[color:var(--color-fg)]" />
+            Loading workspace
+          </div>
+        </section>
       ) : (
         <>
 
-      {activeView === "documents" ? (
+      {activeView === "account" ? (
+        <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col px-4 py-5 sm:px-6 lg:px-8">
+          <AccountConsole
+            workspaceId={workspaceId ?? ""}
+            accountId={accessContext?.defaultAccountId ?? activeWorkspace?.accountId ?? ""}
+            authSession={authSession ?? null}
+            accessContext={accessContext}
+            clientConfig={clientConfig}
+            onSignOut={() => void handleManagedSignOut().catch((error) => toast.error("Sign out failed", { description: String(error) }))}
+          />
+        </div>
+      ) : activeView === "documents" ? (
         <div className="mx-auto flex w-full max-w-7xl flex-1 flex-col px-4 py-5 sm:px-6 lg:px-8">
-          <DocumentsWorkspace fileUploadsEnabled={clientConfig?.fileUploads.enabled === true} />
+          <DocumentsWorkspace workspaceId={workspaceId ?? ""} fileUploadsEnabled={clientConfig?.fileUploads.enabled === true} />
         </div>
       ) : !session ? (
         <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col px-4 pt-10 pb-16 sm:px-6 sm:pt-16">
@@ -511,6 +708,7 @@ export function App() {
 
           <div className="mt-8">
             <Composer
+              workspaceId={workspaceId ?? ""}
               autoFocus
               pending={busy}
               fileUploadsEnabled={clientConfig?.fileUploads.enabled === true}
@@ -567,8 +765,9 @@ export function App() {
               }
               onSubmit={submitInitial}
             />
-            <RecentSessions onSelect={selectSession} />
+            <RecentSessions workspaceId={workspaceId} onSelect={selectSession} />
             <ScheduledTasksPanel
+              workspaceId={workspaceId ?? ""}
               clientConfig={clientConfig}
               resources={buildResources(manualRepos, githubRepos, selectedRepoIds, selectedRepoRefs)}
               githubConfigured={githubStatus?.configured === true}
@@ -603,8 +802,9 @@ export function App() {
             onReasoningEffortChange={setReasoningEffort}
             onSubmit={submitFollowUp}
             onInterrupt={interruptSession}
-            onApprove={(approvalId) => void sendApproval(session.id, approvalId, "approve")}
-            onReject={(approvalId) => void sendApproval(session.id, approvalId, "reject")}
+            onNewSession={goHome}
+            onApprove={(approvalId) => workspaceId ? void sendApproval(workspaceId, session.id, approvalId, "approve") : undefined}
+            onReject={(approvalId) => workspaceId ? void sendApproval(workspaceId, session.id, approvalId, "reject") : undefined}
           />
 
           {inspectorOpen ? (
@@ -637,6 +837,339 @@ function submitGitHubManifest(actionUrl: string, manifest: Record<string, unknow
   form.submit();
 }
 
+function ManagedAuthPanel(props: {
+  onSubmit: (mode: "signin" | "signup", input: { name: string; email: string; password: string }) => Promise<void>;
+}) {
+  const [mode, setMode] = useState<"signin" | "signup">("signin");
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [resendBusy, setResendBusy] = useState(false);
+
+  async function submit() {
+    if (!email.trim() || password.length < 8 || (mode === "signup" && !name.trim())) {
+      toast.error("Enter valid account details");
+      return;
+    }
+    setBusy(true);
+    try {
+      await props.onSubmit(mode, { name: name.trim() || email.trim(), email: email.trim(), password });
+    } catch (error) {
+      toast.error(mode === "signup" ? "Sign up failed" : "Sign in failed", { description: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resendVerification() {
+    const normalizedEmail = email.trim();
+    if (!normalizedEmail) {
+      toast.error("Enter your email");
+      return;
+    }
+    setResendBusy(true);
+    try {
+      await sendVerificationEmail({ email: normalizedEmail });
+      toast.success("Verification email sent");
+    } catch (error) {
+      toast.error("Failed to send verification email", { description: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setResendBusy(false);
+    }
+  }
+
+  return (
+    <section className="flex flex-1 items-center justify-center px-4">
+      <form
+        className="w-full max-w-sm rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-surface)] p-5 shadow-sm"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void submit();
+        }}
+      >
+        <div className="mb-4 flex items-center gap-3">
+          <span className="flex size-9 items-center justify-center rounded-md bg-[color:var(--color-brand-strong)]/20 text-[color:var(--color-brand)]">
+            <UserIcon className="size-4" />
+          </span>
+          <div>
+            <h1 className="text-base font-semibold">{mode === "signup" ? "Create account" : "Sign in"}</h1>
+            <p className="text-sm text-[color:var(--color-fg-subtle)]">Email and password access for the managed console.</p>
+          </div>
+        </div>
+        <div className="mb-4 grid grid-cols-2 rounded-md border border-[color:var(--color-border)] bg-[color:var(--color-bg)] p-1">
+          <Button type="button" size="sm" variant={mode === "signin" ? "secondary" : "ghost"} onClick={() => setMode("signin")}>Sign in</Button>
+          <Button type="button" size="sm" variant={mode === "signup" ? "secondary" : "ghost"} onClick={() => setMode("signup")}>Sign up</Button>
+        </div>
+        {mode === "signup" ? (
+          <div className="mb-3">
+            <Label htmlFor="managed-auth-name">Name</Label>
+            <Input id="managed-auth-name" value={name} onChange={(event) => setName(event.target.value)} autoComplete="name" className="mt-2" />
+          </div>
+        ) : null}
+        <div className="mb-3">
+          <Label htmlFor="managed-auth-email">Email</Label>
+          <Input id="managed-auth-email" type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" className="mt-2" autoFocus />
+        </div>
+        <div>
+          <Label htmlFor="managed-auth-password">Password</Label>
+          <Input id="managed-auth-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={mode === "signin" ? "current-password" : "new-password"} className="mt-2" />
+        </div>
+        <Button type="submit" className="mt-4 w-full" disabled={busy}>
+          {busy ? <Loader2Icon className="size-4 animate-spin" /> : <CheckIcon className="size-4" />}
+          {mode === "signup" ? "Create account" : "Sign in"}
+        </Button>
+        <Button type="button" variant="ghost" className="mt-2 w-full" disabled={resendBusy || busy} onClick={() => void resendVerification()}>
+          {resendBusy ? <Loader2Icon className="size-4 animate-spin" /> : <RefreshCwIcon className="size-4" />}
+          Resend verification email
+        </Button>
+      </form>
+    </section>
+  );
+}
+
+const apiKeyPermissionOptions = [
+  "workspace:read",
+  "sessions:create",
+  "sessions:read",
+  "sessions:control",
+  "files:upload",
+  "files:read",
+  "documents:manage",
+  "documents:search",
+  "scheduled_tasks:manage",
+  "scheduled_tasks:run",
+  "github:use",
+  "api_keys:manage",
+] as const;
+
+const defaultApiKeyPermissions = new Set<string>([
+  "workspace:read",
+  "sessions:create",
+  "sessions:read",
+  "sessions:control",
+  "files:upload",
+  "files:read",
+  "documents:search",
+  "scheduled_tasks:run",
+  "github:use",
+]);
+
+function AccountConsole(props: {
+  workspaceId: string;
+  accountId: string;
+  authSession: AuthSession | null;
+  accessContext: AccessContext | null;
+  clientConfig: ClientConfig | null;
+  onSignOut: () => void;
+}) {
+  const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
+  const [billing, setBilling] = useState<{ balance: BillingBalance; mode: string } | null>(null);
+  const [apiKeyName, setApiKeyName] = useState("Default API key");
+  const [selectedPermissions, setSelectedPermissions] = useState<Set<string>>(() => new Set(defaultApiKeyPermissions));
+  const [createdToken, setCreatedToken] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const canManageApiKeys = hasWorkspacePermission(props.accessContext, props.workspaceId, "api_keys:manage");
+  const canManageBilling = hasAccountPermission(props.accessContext, props.accountId, "billing:manage");
+
+  useEffect(() => {
+    if (!props.workspaceId) {
+      return;
+    }
+    void refresh();
+  }, [props.workspaceId, props.accountId]);
+
+  async function refresh() {
+    const [keys, nextBilling] = await Promise.all([
+      canManageApiKeys ? fetchApiKeys(props.workspaceId) : Promise.resolve([]),
+      props.accountId ? fetchBilling(props.accountId).catch(() => null) : Promise.resolve(null),
+    ]);
+    setApiKeys(keys);
+    setBilling(nextBilling);
+  }
+
+  async function createKey() {
+    if (!apiKeyName.trim() || selectedPermissions.size === 0) {
+      toast.error("API key name and permissions are required");
+      return;
+    }
+    setBusy(true);
+    try {
+      const result = await createApiKey(props.workspaceId, {
+        name: apiKeyName.trim(),
+        permissions: [...selectedPermissions],
+      });
+      setCreatedToken(result.token);
+      setApiKeys((current) => [result.apiKey, ...current]);
+      toast.success("API key created");
+    } catch (error) {
+      toast.error("Failed to create API key", { description: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revokeKey(apiKeyId: string) {
+    setBusy(true);
+    try {
+      const revoked = await revokeApiKey(props.workspaceId, apiKeyId);
+      setApiKeys((current) => current.map((key) => key.id === revoked.id ? revoked : key));
+      toast.success("API key revoked");
+    } catch (error) {
+      toast.error("Failed to revoke API key", { description: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function startCheckout(packageId: string) {
+    setBusy(true);
+    try {
+      const checkout = await createBillingCheckout(packageId, props.accountId || undefined);
+      window.location.assign(checkout.url);
+    } catch (error) {
+      toast.error("Checkout failed", { description: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function togglePermission(permission: string) {
+    setSelectedPermissions((current) => {
+      const next = new Set(current);
+      if (next.has(permission)) {
+        next.delete(permission);
+      } else {
+        next.add(permission);
+      }
+      return next;
+    });
+  }
+
+  return (
+    <section className="grid gap-5 text-left">
+      <div className="flex flex-col gap-3 border-b border-[color:var(--color-border)] pb-4 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <div className="text-base font-semibold">Account</div>
+          <div className="mt-1 text-sm text-[color:var(--color-fg-muted)]">
+            {props.authSession?.user.email ?? props.accessContext?.subjectLabel ?? props.accessContext?.subjectId ?? "OpenGeni access"}
+          </div>
+        </div>
+        {props.clientConfig?.auth.mode === "managedSession" ? (
+          <Button type="button" variant="ghost" size="sm" onClick={props.onSignOut}>
+            <LockIcon className="size-3.5" />
+            Sign out
+          </Button>
+        ) : null}
+      </div>
+
+      <section className="grid gap-3 rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-surface)] p-4">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-medium">Credits</h2>
+            <p className="mt-1 text-xs text-[color:var(--color-fg-muted)]">
+              {billing ? `${formatMoneyMicros(billing.balance.balanceMicros, billing.balance.currency)} available` : "Billing balance unavailable"}
+            </p>
+          </div>
+          <span className="rounded-full border border-[color:var(--color-border)] px-2 py-1 text-xs text-[color:var(--color-fg-muted)]">
+            {billing?.mode ?? "unknown"}
+          </span>
+        </div>
+        {billing?.mode === "stripe" && canManageBilling ? (
+          <div className="flex flex-wrap gap-2">
+            {(["topup_25", "topup_100", "topup_500", "topup_1000"] as const).map((packageId) => (
+              <Button key={packageId} type="button" variant="secondary" size="sm" disabled={busy} onClick={() => void startCheckout(packageId)}>
+                {topupLabel(packageId)}
+              </Button>
+            ))}
+          </div>
+        ) : (
+          <p className="text-xs text-[color:var(--color-fg-subtle)]">Credit checkout is available when Stripe billing is enabled for this deployment.</p>
+        )}
+      </section>
+
+      <section className="grid gap-3 rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-surface)] p-4">
+        <div>
+          <h2 className="text-sm font-medium">API keys</h2>
+          <p className="mt-1 text-xs text-[color:var(--color-fg-muted)]">Workspace-scoped keys for calling OpenGeni from another product.</p>
+        </div>
+        {createdToken ? (
+          <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 p-3">
+            <div className="text-xs font-medium text-emerald-200">Token shown once</div>
+            <div className="mt-2 flex min-w-0 items-center gap-2">
+              <code className="min-w-0 flex-1 truncate rounded bg-[color:var(--color-bg)] px-2 py-1.5 text-xs">{createdToken}</code>
+              <Button type="button" variant="ghost" size="icon-sm" onClick={() => void navigator.clipboard.writeText(createdToken)}>
+                <CopyIcon className="size-3.5" />
+              </Button>
+            </div>
+          </div>
+        ) : null}
+        {canManageApiKeys ? (
+          <>
+            <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
+              <Input value={apiKeyName} onChange={(event) => setApiKeyName(event.target.value)} className="h-9" />
+              <Button type="button" disabled={busy} onClick={() => void createKey()}>
+                {busy ? <Loader2Icon className="size-3.5 animate-spin" /> : <PlusIcon className="size-3.5" />}
+                Create
+              </Button>
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+              {apiKeyPermissionOptions.map((permission) => (
+                <label key={permission} className="flex items-center gap-2 rounded-md border border-[color:var(--color-border)] bg-[color:var(--color-bg)]/35 px-2 py-1.5 text-xs">
+                  <input type="checkbox" checked={selectedPermissions.has(permission)} onChange={() => togglePermission(permission)} />
+                  <span>{permission}</span>
+                </label>
+              ))}
+            </div>
+          </>
+        ) : (
+          <p className="text-xs text-[color:var(--color-fg-subtle)]">This subject cannot manage API keys for the selected workspace.</p>
+        )}
+        <div className="grid gap-2">
+          {apiKeys.length === 0 ? (
+            <div className="rounded-lg border border-dashed border-[color:var(--color-border)] p-4 text-sm text-[color:var(--color-fg-subtle)]">No API keys.</div>
+          ) : apiKeys.map((apiKey) => (
+            <div key={apiKey.id} className="flex min-w-0 items-center justify-between gap-3 rounded-lg border border-[color:var(--color-border)] bg-[color:var(--color-bg)]/35 px-3 py-2">
+              <div className="min-w-0">
+                <div className="truncate text-sm font-medium">{apiKey.name}</div>
+                <div className="mt-1 truncate text-xs text-[color:var(--color-fg-subtle)]">{apiKey.prefix}... · {apiKey.revokedAt ? "revoked" : "active"}</div>
+              </div>
+              <Button type="button" variant="ghost" size="sm" disabled={busy || Boolean(apiKey.revokedAt)} onClick={() => void revokeKey(apiKey.id)}>
+                <Trash2Icon className="size-3.5" />
+                Revoke
+              </Button>
+            </div>
+          ))}
+        </div>
+      </section>
+    </section>
+  );
+}
+
+function hasWorkspacePermission(context: AccessContext | null, workspaceId: string, permission: string): boolean {
+  const grant = context?.workspaceGrants.find((candidate) => candidate.workspaceId === workspaceId);
+  return Boolean(grant && (grant.permissions.includes(permission) || grant.permissions.includes("workspace:admin")));
+}
+
+function hasAccountPermission(context: AccessContext | null, accountId: string, permission: string): boolean {
+  const grant = context?.accountGrants.find((candidate) => candidate.accountId === accountId);
+  return Boolean(grant && (grant.permissions.includes(permission) || grant.permissions.includes("account:admin")));
+}
+
+function formatMoneyMicros(amountMicros: number, currency: string): string {
+  return new Intl.NumberFormat(undefined, {
+    style: "currency",
+    currency: currency.toUpperCase(),
+  }).format(amountMicros / 1_000_000);
+}
+
+function topupLabel(packageId: "topup_25" | "topup_100" | "topup_500" | "topup_1000"): string {
+  if (packageId === "topup_25") return "$25";
+  if (packageId === "topup_100") return "$100";
+  if (packageId === "topup_500") return "$500";
+  return "$1,000";
+}
+
 export function applySessionStatusEvents(session: Session, events: SessionEvent[]): Session {
   return events.reduce((current, event) => {
     if (event.type !== "session.status.changed" || event.sessionId !== current.id) {
@@ -662,6 +1195,10 @@ function isSessionStatus(value: unknown): value is SessionStatus {
     value === "requires_action" ||
     value === "failed" ||
     value === "cancelled";
+}
+
+function isTerminalSessionStatus(value: SessionStatus): boolean {
+  return value === "failed" || value === "cancelled";
 }
 
 function RepositoryContextPicker(props: {
@@ -972,7 +1509,7 @@ function RepositoryContextPicker(props: {
   );
 }
 
-function DocumentsWorkspace({ fileUploadsEnabled }: { fileUploadsEnabled: boolean }) {
+function DocumentsWorkspace({ workspaceId, fileUploadsEnabled }: { workspaceId: string; fileUploadsEnabled: boolean }) {
   const [bases, setBases] = useState<DocumentBase[]>([]);
   const [selectedBaseId, setSelectedBaseId] = useState<string | null>(null);
   const [documents, setDocuments] = useState<IndexedDocument[]>([]);
@@ -990,7 +1527,7 @@ function DocumentsWorkspace({ fileUploadsEnabled }: { fileUploadsEnabled: boolea
 
   useEffect(() => {
     void refreshBases();
-  }, []);
+  }, [workspaceId]);
 
   useEffect(() => {
     if (!selectedBaseId) {
@@ -998,24 +1535,24 @@ function DocumentsWorkspace({ fileUploadsEnabled }: { fileUploadsEnabled: boolea
       setResults([]);
       return;
     }
-    void fetchDocuments(selectedBaseId).then(setDocuments).catch((error) => {
+    void fetchDocuments(workspaceId, selectedBaseId).then(setDocuments).catch((error) => {
       toast.error("Failed to load documents", { description: String(error) });
     });
-  }, [selectedBaseId]);
+  }, [workspaceId, selectedBaseId]);
 
   useEffect(() => {
     if (!selectedBaseId || !documents.some((document) => document.status === "queued" || document.status === "indexing")) {
       return;
     }
     const timer = window.setInterval(() => {
-      void fetchDocuments(selectedBaseId).then(setDocuments).catch(() => undefined);
+      void fetchDocuments(workspaceId, selectedBaseId).then(setDocuments).catch(() => undefined);
     }, 1200);
     return () => window.clearInterval(timer);
-  }, [selectedBaseId, documents]);
+  }, [workspaceId, selectedBaseId, documents]);
 
   async function refreshBases() {
     try {
-      const next = await fetchDocumentBases();
+      const next = await fetchDocumentBases(workspaceId);
       setBases(next);
       setSelectedBaseId((current) => current ?? next[0]?.id ?? null);
     } catch (error) {
@@ -1028,7 +1565,7 @@ function DocumentsWorkspace({ fileUploadsEnabled }: { fileUploadsEnabled: boolea
     if (!trimmed) return;
     setCreatingBase(true);
     try {
-      const base = await createDocumentBase({ name: trimmed });
+      const base = await createDocumentBase(workspaceId, { name: trimmed });
       setBases((current) => [...current, base]);
       setSelectedBaseId(base.id);
       setName("");
@@ -1044,8 +1581,8 @@ function DocumentsWorkspace({ fileUploadsEnabled }: { fileUploadsEnabled: boolea
     setUploading(true);
     try {
       for (const file of Array.from(files)) {
-        const asset = await uploadFileAsset(file);
-        const indexed = await addDocumentToBase(selectedBaseId, asset.id);
+        const asset = await uploadFileAsset(workspaceId, file);
+        const indexed = await addDocumentToBase(workspaceId, selectedBaseId, asset.id);
         setDocuments((current) => [indexed, ...current.filter((item) => item.id !== indexed.id)]);
       }
       toast.success("Document indexed");
@@ -1061,7 +1598,7 @@ function DocumentsWorkspace({ fileUploadsEnabled }: { fileUploadsEnabled: boolea
     if (!selectedBaseId || !query.trim()) return;
     setSearching(true);
     try {
-      setResults(await searchDocumentBase(selectedBaseId, query.trim()));
+      setResults(await searchDocumentBase(workspaceId, selectedBaseId, query.trim()));
     } catch (error) {
       toast.error("Document search failed", { description: error instanceof Error ? error.message : String(error) });
     } finally {
@@ -1072,7 +1609,7 @@ function DocumentsWorkspace({ fileUploadsEnabled }: { fileUploadsEnabled: boolea
   async function retryDocument(document: IndexedDocument): Promise<IndexedDocument> {
     setRetryingIds((current) => new Set(current).add(document.id));
     try {
-      const indexed = await reindexDocument(document.id);
+      const indexed = await reindexDocument(workspaceId, document.baseId, document.id);
       setDocuments((current) => [indexed, ...current.filter((item) => item.id !== indexed.id)]);
       return indexed;
     } finally {
@@ -1450,6 +1987,7 @@ function SessionChatPane(props: {
   onReasoningEffortChange: (effort: IntelligenceEffort) => void;
   onSubmit: (submission: TurnSubmission) => void;
   onInterrupt: () => void;
+  onNewSession: () => void;
   onApprove: (approvalId: string) => void;
   onReject: (approvalId: string) => void;
 }) {
@@ -1498,12 +2036,18 @@ function SessionChatPane(props: {
         data-testid="session-chat-scroll"
       >
         <div className="mx-auto w-full max-w-3xl px-4 pt-8 pb-56 sm:px-6">
-          {props.conversation.length === 0 ? (
+          {isTerminalSessionStatus(props.session.status) ? (
+            <TerminalSessionBanner session={props.session} onNewSession={props.onNewSession} />
+          ) : null}
+
+          {isTerminalSessionStatus(props.session.status) ? (
+            <TerminalSessionArchive session={props.session} eventCount={props.conversation.length} />
+          ) : props.conversation.length === 0 ? (
             <div className="grid min-h-[24rem] place-items-center rounded-lg border border-dashed border-[color:var(--color-border)] text-sm text-[color:var(--color-fg-subtle)]">
               Waiting for session activity
             </div>
           ) : (
-            <ConversationStream turns={props.conversation} />
+            <ConversationStream workspaceId={props.session.workspaceId} turns={props.conversation} />
           )}
 
           {props.approvals.length > 0 ? (
@@ -1536,6 +2080,7 @@ function SessionChatPane(props: {
       <div className="absolute inset-x-0 bottom-0 px-4 pb-4 sm:px-6">
         <div className="mx-auto w-full max-w-3xl">
           <Composer
+            workspaceId={props.session.workspaceId}
             pending={props.busy}
             disabled={!props.canSendFollowUp}
             submitDisabled={props.sessionRunning}
@@ -1562,6 +2107,17 @@ function SessionChatPane(props: {
                 >
                   {props.busy ? <Loader2Icon className="size-3.5 animate-spin" /> : <SquareIcon className="size-3.5" />}
                   <span className="text-xs font-medium">Stop</span>
+                </Button>
+              ) : isTerminalSessionStatus(props.session.status) ? (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={props.onNewSession}
+                  className="h-8 gap-1.5 px-3"
+                >
+                  <PlusIcon className="size-3.5" />
+                  <span className="text-xs font-medium">New</span>
                 </Button>
               ) : undefined
             }
@@ -1595,11 +2151,63 @@ function SessionChatPane(props: {
   );
 }
 
-function ConversationStream({ turns }: { turns: ConversationTurn[] }) {
+function TerminalSessionBanner(props: { session: Session; onNewSession: () => void }) {
+  const failed = props.session.status === "failed";
+  return (
+    <div
+      className={cn(
+        "mb-4 flex flex-col gap-3 rounded-lg border p-3 sm:flex-row sm:items-center sm:justify-between",
+        failed
+          ? "border-red-500/30 bg-red-500/10 text-red-100"
+          : "border-zinc-500/30 bg-zinc-500/10 text-zinc-100",
+      )}
+    >
+      <div className="flex min-w-0 gap-2.5">
+        <AlertTriangleIcon className={cn("mt-0.5 size-4 shrink-0", failed ? "text-red-300" : "text-zinc-300")} />
+        <div className="min-w-0">
+          <div className="text-sm font-medium">
+            This session {failed ? "failed" : "was cancelled"} and cannot be continued.
+          </div>
+          <div className="mt-1 text-xs text-[color:var(--color-fg-muted)]">
+            Historical session from {formatTimestamp(props.session.createdAt)}.
+          </div>
+        </div>
+      </div>
+      <Button type="button" size="sm" variant="secondary" onClick={props.onNewSession} className="shrink-0">
+        <ArrowLeftIcon className="size-3.5" />
+        Back to agent
+      </Button>
+    </div>
+  );
+}
+
+function TerminalSessionArchive(props: { session: Session; eventCount: number }) {
+  const failed = props.session.status === "failed";
+  return (
+    <div className="grid min-h-[18rem] place-items-center rounded-lg border border-dashed border-[color:var(--color-border)] px-4 py-10 text-center">
+      <div className="max-w-md">
+        <div className="mx-auto mb-3 flex size-10 items-center justify-center rounded-md bg-[color:var(--color-surface-2)] text-[color:var(--color-fg-muted)]">
+          <TerminalIcon className="size-4" />
+        </div>
+        <div className="text-sm font-medium">
+          {failed ? "Historical failed session" : "Historical cancelled session"}
+        </div>
+        <p className="mt-1 text-xs leading-5 text-[color:var(--color-fg-muted)]">
+          This is a saved event log from {formatTimestamp(props.session.createdAt)}, not a current run. Sanitized debug metadata is available in the inspector.
+        </p>
+        <div className="mt-3 text-[11px] uppercase tracking-wide text-[color:var(--color-fg-subtle)]">
+          {props.eventCount} timeline item{props.eventCount === 1 ? "" : "s"}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ConversationStream({ workspaceId, turns }: { workspaceId: string; turns: ConversationTurn[] }) {
   return (
     <div className="space-y-3.5" data-testid="session-timeline">
       {turns.map((turn) => turn.kind === "user"
-        ? <UserMessage key={turn.id} turn={turn} />
+        ? <UserMessage key={turn.id} workspaceId={workspaceId} turn={turn} />
         : turn.kind === "assistant"
           ? <AssistantMessage key={turn.id} turn={turn} />
           : <ActivityMessage key={turn.id} turn={turn} />)}
@@ -1607,7 +2215,7 @@ function ConversationStream({ turns }: { turns: ConversationTurn[] }) {
   );
 }
 
-function UserMessage({ turn }: { turn: ConversationUserTurn }) {
+function UserMessage({ workspaceId, turn }: { workspaceId: string; turn: ConversationUserTurn }) {
   const fileResources = turn.resources.filter((resource): resource is Extract<ResourceRef, { kind: "file" }> => resource.kind === "file");
   const repositoryResources = turn.resources.filter((resource): resource is Extract<ResourceRef, { kind: "repository" }> => resource.kind === "repository");
   return (
@@ -1615,7 +2223,7 @@ function UserMessage({ turn }: { turn: ConversationUserTurn }) {
       <div className="max-w-[82%] rounded-xl rounded-br-sm border border-[color:var(--color-border)] bg-[color:var(--color-surface-2)]/75 px-3 py-2 text-[14px] leading-6">
         {fileResources.length > 0 || repositoryResources.length > 0 || turn.tools.length > 0 ? (
           <div className="mb-2 flex flex-wrap gap-1.5">
-            {fileResources.map((resource) => <MessageFileAttachment key={`${resource.fileId}:${resource.mountPath ?? ""}`} resource={resource} />)}
+            {fileResources.map((resource) => <MessageFileAttachment key={`${resource.fileId}:${resource.mountPath ?? ""}`} workspaceId={workspaceId} resource={resource} />)}
             {repositoryResources.map((resource) => (
               <span
                 key={`${resource.uri}:${resource.ref}:${resource.mountPath ?? ""}`}
@@ -1643,13 +2251,13 @@ function UserMessage({ turn }: { turn: ConversationUserTurn }) {
   );
 }
 
-function MessageFileAttachment({ resource }: { resource: Extract<ResourceRef, { kind: "file" }> }) {
+function MessageFileAttachment({ workspaceId, resource }: { workspaceId: string; resource: Extract<ResourceRef, { kind: "file" }> }) {
   const [file, setFile] = useState<FileAsset | null>(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     let mounted = true;
-    void fetchFileAsset(resource.fileId).then((asset) => {
+    void fetchFileAsset(workspaceId, resource.fileId).then((asset) => {
       if (mounted) {
         setFile(asset);
       }
@@ -1657,12 +2265,12 @@ function MessageFileAttachment({ resource }: { resource: Extract<ResourceRef, { 
     return () => {
       mounted = false;
     };
-  }, [resource.fileId]);
+  }, [workspaceId, resource.fileId]);
 
   async function openFile() {
     setBusy(true);
     try {
-      const signed = await fetchFileDownloadUrl(resource.fileId);
+      const signed = await fetchFileDownloadUrl(workspaceId, resource.fileId);
       window.open(signed.url, "_blank", "noopener,noreferrer");
     } catch (error) {
       toast.error("Failed to open file", { description: error instanceof Error ? error.message : String(error) });
@@ -1931,7 +2539,8 @@ function SessionInspector(props: {
   events: SessionEvent[];
   connectionState: ConnectionState;
 }) {
-  const displayEvents = props.events.map(sanitizeEventForDisplay);
+  const terminalSession = isTerminalSessionStatus(props.session.status);
+  const displayEvents = props.events.map((event) => sanitizeEventForDisplay(event, props.session.status));
   const sortedEvents = [...displayEvents].sort((a, b) => b.sequence - a.sequence);
   const lifecycleEvents = [...displayEvents]
     .filter((event) => !event.type.endsWith(".delta"))
@@ -1944,8 +2553,8 @@ function SessionInspector(props: {
         <div className="flex min-w-0 items-center gap-2">
           <FileJsonIcon className="size-4 shrink-0 text-[color:var(--color-brand)]" />
           <div className="min-w-0">
-            <div className="text-sm font-medium">Debug</div>
-            <div className="truncate text-xs text-[color:var(--color-fg-subtle)]">{props.events.length} events</div>
+            <div className="text-sm font-medium">{terminalSession ? "Archived debug" : "Debug"}</div>
+            <div className="truncate text-xs text-[color:var(--color-fg-subtle)]">{props.events.length} events{terminalSession ? " · sanitized" : ""}</div>
           </div>
         </div>
         <ConnectionPill state={props.connectionState} />
@@ -1976,7 +2585,7 @@ function SessionInspector(props: {
 
               <InspectorSection title="Runtime">
                 <InfoRow label="Model" value={props.session.model} />
-                <InfoRow label="Effort" value={String(props.session.metadata.reasoningEffort ?? "high")} />
+                <InfoRow label="Effort" value={String(props.session.metadata.reasoningEffort ?? "low")} />
                 <InfoRow label="Sandbox" value={props.session.sandboxBackend} />
                 <InfoRow label="Stream" value={<ConnectionPill state={props.connectionState} />} />
               </InspectorSection>
@@ -2100,7 +2709,32 @@ function EventDebugRow({ event }: { event: SessionEvent }) {
   );
 }
 
-function sanitizeEventForDisplay(event: SessionEvent): SessionEvent {
+export function sanitizeEventForDisplay(event: SessionEvent, sessionStatus?: SessionStatus): SessionEvent {
+  if (isTerminalSessionStatus(sessionStatus ?? "idle") && (event.type === "turn.failed" || event.type === "sandbox.operation.failed")) {
+    return {
+      ...event,
+      payload: {
+        archived: true,
+        status: sessionStatus,
+        message: "Historical failure payload hidden in the web console.",
+      },
+    };
+  }
+  if (event.type === "turn.failed" || event.type === "sandbox.operation.failed") {
+    const payload = event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
+      ? event.payload as Record<string, unknown>
+      : {};
+    const message = failurePayloadMessage(payload);
+    if (message && isProviderInternalFailure(message)) {
+      return {
+        ...event,
+        payload: {
+          error: providerInternalFailureDisplayMessage(message),
+          redacted: true,
+        },
+      };
+    }
+  }
   if (event.type !== "agent.reasoning.delta") {
     return event;
   }
@@ -2151,8 +2785,8 @@ function ConnectionPill({ state }: { state: ConnectionState }) {
   );
 }
 
-function RecentSessions({ onSelect }: { onSelect: (id: string) => void }) {
-  const sessions = recentSessions();
+function RecentSessions({ workspaceId, onSelect }: { workspaceId: string | null; onSelect: (id: string) => void }) {
+  const sessions = workspaceId ? recentSessions(workspaceId) : [];
   if (sessions.length === 0) {
     return null;
   }
@@ -2253,6 +2887,7 @@ export function agentConfigFromFormState(
 }
 
 function ScheduledTasksPanel(props: {
+  workspaceId: string;
   clientConfig: ClientConfig | null;
   resources: ResourceRef[];
   githubConfigured: boolean;
@@ -2273,12 +2908,12 @@ function ScheduledTasksPanel(props: {
 
   useEffect(() => {
     void refresh();
-  }, []);
+  }, [props.workspaceId]);
 
   async function refresh() {
-    const next = await fetchScheduledTasks();
+    const next = await fetchScheduledTasks(props.workspaceId);
     setTasks(next);
-    const entries = await Promise.all(next.slice(0, 8).map(async (task) => [task.id, await fetchScheduledTaskRuns(task.id)] as const));
+    const entries = await Promise.all(next.slice(0, 8).map(async (task) => [task.id, await fetchScheduledTaskRuns(props.workspaceId, task.id)] as const));
     setRuns(Object.fromEntries(entries));
   }
 
@@ -2290,6 +2925,7 @@ function ScheduledTasksPanel(props: {
     setBusyTaskId("new");
     try {
       await createScheduledTask({
+        workspaceId: props.workspaceId,
         name: form.name.trim() || form.prompt.trim().slice(0, 64),
         schedule: scheduleFromFormState(form),
         runMode: form.runMode,
@@ -2317,7 +2953,7 @@ function ScheduledTasksPanel(props: {
     }
     setBusyTaskId(task.id);
     try {
-      await updateScheduledTask(task.id, {
+      await updateScheduledTask(props.workspaceId, task.id, {
         name: form.name.trim() || form.prompt.trim().slice(0, 64),
         schedule: scheduleFromFormState(form),
         runMode: form.runMode,
@@ -2338,14 +2974,14 @@ function ScheduledTasksPanel(props: {
     setBusyTaskId(task.id);
     try {
       if (action === "pause") {
-        await pauseScheduledTask(task.id);
+        await pauseScheduledTask(props.workspaceId, task.id);
       } else if (action === "resume") {
-        await resumeScheduledTask(task.id);
+        await resumeScheduledTask(props.workspaceId, task.id);
       } else if (action === "trigger") {
-        await triggerScheduledTask(task.id);
+        await triggerScheduledTask(props.workspaceId, task.id);
         toast.success("Scheduled task triggered");
       } else {
-        await deleteScheduledTask(task.id);
+        await deleteScheduledTask(props.workspaceId, task.id);
         setEditingTaskId(null);
         toast.success("Scheduled task deleted");
       }
@@ -2742,6 +3378,7 @@ function ScheduledTaskRepositoryPicker(props: {
 }
 
 function useSessionStream(
+  workspaceId: string | null,
   sessionId: string | null,
   after: number,
   accessKeyVersion: number,
@@ -2753,12 +3390,12 @@ function useSessionStream(
   const onStateRef = useRef(onState);
   onStateRef.current = onState;
   useEffect(() => {
-    if (!sessionId) {
+    if (!workspaceId || !sessionId) {
       onStateRef.current?.("closed");
       return;
     }
     const abort = new AbortController();
-    void streamSessionEvents(sessionId, after, (event) => {
+    void streamSessionEvents(workspaceId, sessionId, after, (event) => {
       onEventsRef.current([event]);
     }, {
       signal: abort.signal,
@@ -2773,7 +3410,7 @@ function useSessionStream(
       abort.abort();
       onStateRef.current?.("closed");
     };
-  }, [sessionId, accessKeyVersion]);
+  }, [workspaceId, sessionId, accessKeyVersion]);
 }
 
 function buildResources(manualRepos: RepoDraft[], repos: GitHubRepository[], selected: Set<number>, selectedRefs: Record<number, string>): ResourceRef[] {
@@ -2783,12 +3420,14 @@ function buildResources(manualRepos: RepoDraft[], repos: GitHubRepository[], sel
       ref: (selectedRefs[repo.id] ?? repo.defaultBranch).trim(),
       repositoryId: repo.id,
       installationId: repo.installationId,
+      private: repo.private,
     })),
     ...manualRepos.map((repo) => ({
       url: repo.url.trim(),
       ref: repo.ref.trim(),
       repositoryId: null,
       installationId: null,
+      private: false,
     })),
   ].filter((repo) => repo.url.length > 0);
   const mountPaths = new Set<string>();
@@ -2807,26 +3446,28 @@ function buildResources(manualRepos: RepoDraft[], repos: GitHubRepository[], sel
       uri: `https://${parsed.host}/${parsed.repo}.git`,
       ref: repo.ref,
       mountPath,
-      ...(repo.repositoryId ? { githubRepositoryId: repo.repositoryId } : {}),
-      ...(repo.installationId ? { githubInstallationId: repo.installationId } : {}),
+      ...(repo.private && repo.repositoryId ? { githubRepositoryId: repo.repositoryId } : {}),
+      ...(repo.private && repo.installationId ? { githubInstallationId: repo.installationId } : {}),
     };
   });
 }
 
-function gitHubRepositoryResource(repo: GitHubRepository, ref: string): Extract<ResourceRef, { kind: "repository" }> {
+export function gitHubRepositoryResource(repo: GitHubRepository, ref: string): Extract<ResourceRef, { kind: "repository" }> {
   const parsed = normalizeRepositoryUrl(repo.cloneUrl);
   return {
     kind: "repository",
     uri: `https://${parsed.host}/${parsed.repo}.git`,
     ref: ref.trim() || repo.defaultBranch,
     mountPath: `repos/${parsed.repo}`,
-    githubRepositoryId: repo.id,
-    githubInstallationId: repo.installationId,
+    ...(repo.private ? { githubRepositoryId: repo.id, githubInstallationId: repo.installationId } : {}),
   };
 }
 
 function isRepositoryResourceForGitHubRepo(resource: Extract<ResourceRef, { kind: "repository" }>, repo: GitHubRepository): boolean {
-  return resource.githubRepositoryId === repo.id && resource.githubInstallationId === repo.installationId;
+  if (repo.private) {
+    return resource.githubRepositoryId === repo.id && resource.githubInstallationId === repo.installationId;
+  }
+  return sameRepositoryUri(resource, gitHubRepositoryResource(repo, repo.defaultBranch).uri);
 }
 
 function sameRepositoryUri(resource: ResourceRef, uri: string): boolean {
@@ -2899,6 +3540,7 @@ export function projectConversation(session: Session, events: SessionEvent[]): C
   const out: ConversationTurn[] = [];
   let currentMessage: ConversationAssistantTurn | null = null;
   let currentActivity: ConversationActivityTurn | null = null;
+  const displayEvents = events.map((event) => sanitizeEventForDisplay(event, session.status));
 
   const lastMessage = (): ConversationAssistantTurn | null => {
     const item = out[out.length - 1];
@@ -2957,7 +3599,7 @@ export function projectConversation(session: Session, events: SessionEvent[]): C
     return currentActivity;
   };
 
-  for (const event of [...events].sort((a, b) => a.sequence - b.sequence)) {
+  for (const event of [...displayEvents].sort((a, b) => a.sequence - b.sequence)) {
     const payload = event.payload as Record<string, unknown>;
     if (event.type === "user.message") {
       currentMessage = null;
@@ -3041,10 +3683,11 @@ export function projectConversation(session: Session, events: SessionEvent[]): C
       const key = `sandbox:${String(payload.name ?? event.id)}`;
       const existing = findTrace(activity, key, "sandbox");
       const status = event.type.endsWith(".failed") ? "failed" : event.type.endsWith(".completed") ? "complete" : "running";
+      const errorMessage = failurePayloadMessage(payload);
       if (existing) {
         existing.status = status;
-        if (payload.error) {
-          existing.output = String(payload.error);
+        if (errorMessage) {
+          existing.output = errorMessage;
         }
       } else {
         activity.trace.push({
@@ -3054,7 +3697,7 @@ export function projectConversation(session: Session, events: SessionEvent[]): C
           status,
           title: sandboxTitle(payload),
           detail: typeof payload.command === "string" ? payload.command : undefined,
-          output: payload.error ? String(payload.error) : undefined,
+          output: errorMessage,
           occurredAt: event.occurredAt,
         });
       }
@@ -3081,7 +3724,7 @@ export function projectConversation(session: Session, events: SessionEvent[]): C
         kind: "error",
         status: "failed",
         title: "Turn failed",
-        output: String(payload.error ?? "Unknown error"),
+        output: failurePayloadMessage(payload) ?? "Unknown error",
         occurredAt: event.occurredAt,
       });
     } else if (event.type === "turn.cancelled") {
@@ -3168,6 +3811,39 @@ function reasoningSummaryText(payload: unknown): string {
 function traceKey(event: SessionEvent): string {
   const payload = event.payload as Record<string, unknown>;
   return String(payload.id ?? payload.callId ?? event.turnId ?? event.id);
+}
+
+function failurePayloadMessage(payload: Record<string, unknown>): string | undefined {
+  if (typeof payload.error === "string" && payload.error.trim().length > 0) {
+    return payload.error;
+  }
+  if (typeof payload.message === "string" && payload.message.trim().length > 0) {
+    return payload.message;
+  }
+  return undefined;
+}
+
+function isProviderInternalFailure(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return [
+    ["modal", ".client", ".modal", "client"],
+    ["container", "filesystem", "exec"],
+    ["sandbox", "terminate"],
+    ["resource", "_", "exhausted"],
+    ["failed to apply a ", "modal", " sandbox manifest"],
+    ["bandwidth exhausted", " or memory limit exceeded"],
+  ].some((parts) => normalized.includes(parts.join("")));
+}
+
+function providerInternalFailureDisplayMessage(message: string): string {
+  const normalized = message.toLowerCase();
+  if (
+    normalized.includes(["resource", "_", "exhausted"].join(""))
+    || normalized.includes(["bandwidth exhausted", " or memory limit exceeded"].join(""))
+  ) {
+    return "Sandbox setup failed because the execution provider reported a temporary capacity limit. Start a new session.";
+  }
+  return "Sandbox setup failed while preparing the execution environment. Start a new session.";
 }
 
 function toolTitle(payload: Record<string, unknown>): string {
@@ -3368,15 +4044,24 @@ function displayModel(value: string): string {
 }
 
 function rememberSession(session: Session) {
-  const items = [{ id: session.id, prompt: session.initialMessage, createdAt: session.createdAt }, ...recentSessions().filter((item) => item.id !== session.id)].slice(0, 8);
-  localStorage.setItem("opengeni-recent-sessions", JSON.stringify(items));
+  const items = [{ id: session.id, prompt: session.initialMessage, createdAt: session.createdAt }, ...recentSessions(session.workspaceId).filter((item) => item.id !== session.id)].slice(0, 8);
+  localStorage.setItem(recentSessionsStorageKey(session.workspaceId), JSON.stringify(items));
 }
 
-function recentSessions(): Array<{ id: string; prompt: string; createdAt: string }> {
+function forgetSession(workspaceId: string, sessionId: string) {
+  const items = recentSessions(workspaceId).filter((item) => item.id !== sessionId);
+  localStorage.setItem(recentSessionsStorageKey(workspaceId), JSON.stringify(items));
+}
+
+function recentSessions(workspaceId: string): Array<{ id: string; prompt: string; createdAt: string }> {
   try {
-    const parsed = JSON.parse(localStorage.getItem("opengeni-recent-sessions") ?? "[]");
+    const parsed = JSON.parse(localStorage.getItem(recentSessionsStorageKey(workspaceId)) ?? "[]");
     return Array.isArray(parsed) ? parsed.filter((item) => item?.id && item?.prompt && item?.createdAt) : [];
   } catch {
     return [];
   }
+}
+
+function recentSessionsStorageKey(workspaceId: string): string {
+  return `opengeni-recent-sessions:${workspaceId}`;
 }

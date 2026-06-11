@@ -57,6 +57,14 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
+{{- define "opengeni.migrationSecretName" -}}
+{{- if .Values.migrations.secret.existingSecret -}}
+{{- .Values.migrations.secret.existingSecret -}}
+{{- else -}}
+{{- include "opengeni.secretName" . -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "opengeni.postgresSecretName" -}}
 {{- if .Values.postgres.auth.existingSecret -}}
 {{- .Values.postgres.auth.existingSecret -}}
@@ -99,6 +107,10 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- else -}}
 {{- printf "http://%s-minio:%d" (include "opengeni.fullname" .) (.Values.minio.service.apiPort | int) -}}
 {{- end -}}
+{{- end -}}
+
+{{- define "opengeni.minioInternalEndpoint" -}}
+{{- printf "http://%s-minio:%d" (include "opengeni.fullname" .) (.Values.minio.service.apiPort | int) -}}
 {{- end -}}
 
 {{- define "opengeni.minioSandboxEndpoint" -}}

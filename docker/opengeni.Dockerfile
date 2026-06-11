@@ -20,10 +20,13 @@ COPY packages/testing/package.json packages/testing/package.json
 
 RUN bun install --frozen-lockfile
 
-COPY . .
+COPY --chown=bun:bun . .
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates git openssh-client \
+  && rm -rf /var/lib/apt/lists/*
 
 ENV NODE_ENV=production
-RUN chown -R bun:bun /app
 USER bun
 
 FROM base AS api
@@ -34,6 +37,8 @@ FROM base AS worker
 CMD ["bun", "run", "--cwd", "apps/worker", "start"]
 
 FROM base AS web-build
+ARG OPENGENI_DEPLOYMENT_REVISION=dev
+ENV VITE_OPENGENI_DEPLOYMENT_REVISION=$OPENGENI_DEPLOYMENT_REVISION
 RUN bun run --cwd apps/web build
 
 FROM web-build AS web

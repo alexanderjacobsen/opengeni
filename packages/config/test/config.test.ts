@@ -1,10 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import {
   collectGitIdentityEnvironment,
+  configuredEntitlements,
   collectSandboxEnvironment,
+  configuredStaticUsageLimits,
   configuredAllowedModels,
   configuredAllowedReasoningEfforts,
   getSettings,
+  parseStaticEntitlementsJson,
+  parseStaticUsageLimitsJson,
   parseMcpServers,
   retryStartupDependency,
   sandboxEnvironmentVariableNames,
@@ -84,6 +88,12 @@ describe("sandbox preparation profiles", () => {
     expect(configuredAllowedReasoningEfforts(settings)).toEqual(["xhigh", "low", "medium", "high"]);
   });
 
+  test("defaults managed transactional email to the verified mail subdomain sender", () => {
+    const settings = withEnv({}, () => getSettings());
+
+    expect(settings.emailFrom).toBe("OpenGeni <auth@mail.opengeni.ai>");
+  });
+
   test("parses startup dependency retry settings", () => {
     const settings = withEnv({
       OPENGENI_STARTUP_DEPENDENCY_RETRY_ATTEMPTS: "5",
@@ -123,6 +133,29 @@ describe("sandbox preparation profiles", () => {
     expect(() => withEnv({
       OPENGENI_AUTH_REQUIRED: "true",
     }, () => getSettings())).toThrow("OPENGENI_ACCESS_KEY is required");
+  });
+
+  test("requires configured mode to have an auth boundary outside local and test", () => {
+    expect(() => withEnv({
+      OPENGENI_ENVIRONMENT: "production",
+      OPENGENI_PRODUCT_ACCESS_MODE: "configured",
+      OPENGENI_DELEGATION_SECRET: "",
+      OPENGENI_AUTH_REQUIRED: "false",
+    }, () => getSettings())).toThrow("OPENGENI_PRODUCT_ACCESS_MODE=configured requires OPENGENI_DELEGATION_SECRET or OPENGENI_AUTH_REQUIRED=true outside local/test");
+
+    expect(withEnv({
+      OPENGENI_ENVIRONMENT: "production",
+      OPENGENI_PRODUCT_ACCESS_MODE: "configured",
+      OPENGENI_DELEGATION_SECRET: "configured-delegation-secret",
+    }, () => getSettings()).productAccessMode).toBe("configured");
+
+    expect(withEnv({
+      OPENGENI_ENVIRONMENT: "production",
+      OPENGENI_PRODUCT_ACCESS_MODE: "configured",
+      OPENGENI_DELEGATION_SECRET: "",
+      OPENGENI_AUTH_REQUIRED: "true",
+      OPENGENI_ACCESS_KEY: "configured-shared-key",
+    }, () => getSettings()).productAccessMode).toBe("configured");
   });
 
   test("retries startup dependency operations with bounded backoff", async () => {
@@ -218,26 +251,26 @@ describe("sandbox preparation profiles", () => {
     const settings = withEnv({}, () => getSettings());
     expect(settings.mcpServers.find((server) => server.id === "opengeni")).toMatchObject({
       name: "OpenGeni",
-      url: `http://127.0.0.1:${settings.apiPort}/v1/mcp`,
+      url: `http://127.0.0.1:${settings.apiPort}/v1/workspaces/{workspaceId}/mcp`,
     });
     expect(settings.mcpServers.find((server) => server.id === "files")).toMatchObject({
       name: "Files",
-      url: `http://127.0.0.1:${settings.apiPort}/v1/mcp`,
+      url: `http://127.0.0.1:${settings.apiPort}/v1/workspaces/{workspaceId}/mcp`,
       allowedTools: ["files_get_download_url"],
     });
     expect(settings.mcpServers.find((server) => server.id === "docs")).toMatchObject({
       name: "Document Search",
-      url: `http://127.0.0.1:${settings.apiPort}/v1/mcp/docs`,
+      url: `http://127.0.0.1:${settings.apiPort}/v1/workspaces/{workspaceId}/mcp/docs`,
       allowedTools: ["search_documents", "fetch_document_chunk", "list_document_bases"],
     });
   });
 
   test("derives built-in document MCP URL from OPENGENI_MCP_URL", () => {
     const settings = withEnv({
-      OPENGENI_MCP_URL: "http://opengeni-api.opengeni.svc.cluster.local:8000/v1/mcp",
+      OPENGENI_MCP_URL: "http://opengeni-api.opengeni.svc.cluster.local:8000/v1/workspaces/{workspaceId}/mcp",
     }, () => getSettings());
-    expect(settings.mcpServers.find((server) => server.id === "opengeni")?.url).toBe("http://opengeni-api.opengeni.svc.cluster.local:8000/v1/mcp");
-    expect(settings.mcpServers.find((server) => server.id === "docs")?.url).toBe("http://opengeni-api.opengeni.svc.cluster.local:8000/v1/mcp/docs");
+    expect(settings.mcpServers.find((server) => server.id === "opengeni")?.url).toBe("http://opengeni-api.opengeni.svc.cluster.local:8000/v1/workspaces/{workspaceId}/mcp");
+    expect(settings.mcpServers.find((server) => server.id === "docs")?.url).toBe("http://opengeni-api.opengeni.svc.cluster.local:8000/v1/workspaces/{workspaceId}/mcp/docs");
   });
 
   test("does not duplicate a custom files MCP profile", () => {
@@ -391,6 +424,51 @@ describe("sandbox preparation profiles", () => {
       OPENGENI_DOCUMENT_CHUNK_OVERLAP: "100",
     }, () => {
       expect(() => getSettings()).toThrow("must be smaller");
+    });
+  });
+
+  test("parses static usage limits and rejects empty static mode", () => {
+    const limits = parseStaticUsageLimitsJson('{"maxWorkspacesPerAccount":2,"maxFileUploadBytes":1048576}');
+    expect(limits).toEqual({ maxWorkspacesPerAccount: 2, maxFileUploadBytes: 1048576 });
+
+    withEnv({
+      OPENGENI_USAGE_LIMITS_MODE: "static",
+      OPENGENI_STATIC_USAGE_LIMITS_JSON: '{"maxApiKeysPerWorkspace":1}',
+    }, () => {
+      expect(configuredStaticUsageLimits(getSettings())).toEqual({ maxApiKeysPerWorkspace: 1 });
+    });
+
+    withEnv({ OPENGENI_USAGE_LIMITS_MODE: "static" }, () => {
+      expect(() => getSettings()).toThrow("STATIC_USAGE_LIMITS_JSON");
+    });
+  });
+
+  test("parses static and managed entitlement overlays", () => {
+    expect(parseStaticEntitlementsJson('{"github":true,"models":["gpt-5.5"]}')).toEqual({
+      github: true,
+      models: ["gpt-5.5"],
+    });
+
+    withEnv({
+      OPENGENI_ENTITLEMENTS_MODE: "static",
+      OPENGENI_STATIC_ENTITLEMENTS_JSON: '{"github":true}',
+    }, () => {
+      expect(configuredEntitlements(getSettings())).toEqual({ github: true });
+    });
+
+    withEnv({
+      OPENGENI_ENTITLEMENTS_MODE: "managed",
+      OPENGENI_STATIC_ENTITLEMENTS_JSON: '{"custom.feature":"enabled"}',
+    }, () => {
+      expect(configuredEntitlements(getSettings())).toMatchObject({
+        "managed.auth.email_password": true,
+        "managed.api_keys": true,
+        "custom.feature": "enabled",
+      });
+    });
+
+    withEnv({ OPENGENI_ENTITLEMENTS_MODE: "static" }, () => {
+      expect(() => getSettings()).toThrow("STATIC_ENTITLEMENTS_JSON");
     });
   });
 });

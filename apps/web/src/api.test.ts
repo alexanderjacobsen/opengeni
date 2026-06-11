@@ -1,16 +1,55 @@
 import { describe, expect, test } from "bun:test";
-import { authHeadersForAccessKey, resolveApiBaseUrl, streamSessionEvents } from "./api";
+import { authHeadersForAccessKey, resolveApiBaseUrl, sendVerificationEmail, shouldReloadForDeploymentRevision, streamSessionEvents } from "./api";
 import type { SessionEvent } from "./types";
 
 describe("web API auth helpers", () => {
-  test("builds bearer authorization headers from a client-side access key", () => {
+  test("builds access key headers only for configured key modes", () => {
     expect(authHeadersForAccessKey(null)).toEqual({});
-    expect(authHeadersForAccessKey("secret")).toEqual({ authorization: "Bearer secret" });
+    expect(authHeadersForAccessKey("secret")).toEqual({});
+    expect(authHeadersForAccessKey("secret", { mode: "configuredToken", headerName: "authorization", scheme: "bearer" })).toEqual({ authorization: "Bearer secret" });
+    expect(authHeadersForAccessKey("secret", { mode: "deploymentKey", headerName: "x-opengeni-access-key" })).toEqual({ "x-opengeni-access-key": "secret" });
+    expect(authHeadersForAccessKey("secret", { mode: "managedSession", session: "cookie" })).toEqual({});
   });
 
   test("defaults to same-origin API paths for deployed web builds", () => {
     expect(resolveApiBaseUrl(undefined)).toBe("");
     expect(resolveApiBaseUrl("https://opengeni.example.com/")).toBe("https://opengeni.example.com");
+  });
+
+  test("reloads once when the API revision differs from the web bundle revision", () => {
+    const storage = new Map<string, string>();
+    const fakeStorage = {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        storage.set(key, value);
+      },
+    };
+    expect(shouldReloadForDeploymentRevision({ deploymentRevision: "api-sha" }, "web-sha", fakeStorage)).toBe(true);
+    expect(shouldReloadForDeploymentRevision({ deploymentRevision: "api-sha" }, "web-sha", fakeStorage)).toBe(false);
+    expect(shouldReloadForDeploymentRevision({ deploymentRevision: "api-sha" }, "api-sha", fakeStorage)).toBe(false);
+    expect(shouldReloadForDeploymentRevision({ deploymentRevision: "api-sha" }, "", fakeStorage)).toBe(false);
+  });
+
+  test("sends managed verification resend requests through Better Auth", async () => {
+    const originalFetch = globalThis.fetch;
+    const requests: Array<{ input: Parameters<typeof fetch>[0]; init?: RequestInit }> = [];
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      requests.push({ input, init });
+      return Response.json({ status: true });
+    }) as unknown as typeof fetch;
+
+    try {
+      await expect(sendVerificationEmail({ email: "user@example.com" })).resolves.toEqual({ status: true });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    const request = requests[0];
+    expect(request).toBeDefined();
+    expect(String(request!.input)).toBe("/v1/auth/send-verification-email");
+    expect(request!.init?.method).toBe("POST");
+    expect(request!.init?.credentials).toBe("include");
+    expect(JSON.parse(String(request!.init?.body))).toEqual({ email: "user@example.com" });
   });
 });
 
@@ -36,7 +75,7 @@ describe("web API SSE helpers", () => {
     }) as unknown as typeof fetch;
 
     try {
-      await streamSessionEvents("session-id", 5, (incoming) => {
+      await streamSessionEvents("workspace-id", "session-id", 5, (incoming) => {
         received.push(incoming.sequence);
         if (incoming.sequence === 7) {
           abort.abort();
@@ -69,7 +108,7 @@ describe("web API SSE helpers", () => {
     }) as unknown as typeof fetch;
 
     try {
-      await expect(streamSessionEvents("session-id", 5, () => undefined, {
+      await expect(streamSessionEvents("workspace-id", "session-id", 5, () => undefined, {
         reconnectDelayMs: 0,
         maxReconnectDelayMs: 0,
       })).rejects.toThrow("API 401: missing key");
@@ -85,6 +124,7 @@ describe("web API SSE helpers", () => {
 function event(sequence: number): SessionEvent {
   return {
     id: `event-${sequence}`,
+    workspaceId: "workspace-id",
     sessionId: "session-id",
     sequence,
     type: "agent.message.delta",

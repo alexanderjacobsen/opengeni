@@ -36,12 +36,12 @@ export async function createTemporalWorkflowClient(settings: ReturnType<typeof g
     signalUserMessage: async ({ eventId, workflowId }) => {
       await temporal.workflow.getHandle(workflowId).signal("userMessage", eventId);
     },
-    wakeSessionWorkflow: async ({ sessionId, workflowId }) => {
+    wakeSessionWorkflow: async ({ accountId, workspaceId, sessionId, workflowId }) => {
       await temporal.workflow.signalWithStart("sessionWorkflow", {
         taskQueue: settings.temporalTaskQueue,
         workflowId,
         workflowIdReusePolicy: "ALLOW_DUPLICATE",
-        args: [{ sessionId }],
+        args: [{ accountId, workspaceId, sessionId }],
         signal: "queueChanged",
       });
     },
@@ -66,24 +66,27 @@ export async function createTemporalWorkflowClient(settings: ReturnType<typeof g
     deleteScheduledTaskSchedule: async ({ temporalScheduleId }) => {
       await temporal.schedule.getHandle(temporalScheduleId).delete().catch(() => undefined);
     },
-    triggerScheduledTask: async ({ taskId }) => {
-      await temporal.workflow.start("scheduledTaskFireWorkflow", {
+	    triggerScheduledTask: async ({ task, agentRunUsageIdempotencyKey }) => {
+	      await temporal.workflow.start("scheduledTaskFireWorkflow", {
         taskQueue: settings.temporalTaskQueue,
-        workflowId: `scheduled-task-${taskId}-manual-${crypto.randomUUID()}`,
+        workflowId: `scheduled-task-${task.id}-manual-${crypto.randomUUID()}`,
         args: [{
-          taskId,
-          triggerType: "manual",
-        }],
-      });
-    },
+          accountId: task.accountId,
+	          workspaceId: task.workspaceId,
+	          taskId: task.id,
+	          triggerType: "manual",
+	          agentRunUsageIdempotencyKey,
+	        }],
+	      });
+	    },
   };
   const documentIndexer: DocumentIndexClient = {
-    indexDocument: async ({ documentId }) => {
+    indexDocument: async ({ accountId, workspaceId, documentId }) => {
       const workflowId = `document-index-${documentId}-${crypto.randomUUID()}`;
       await temporal.workflow.start("documentIndexWorkflow", {
         taskQueue: settings.temporalTaskQueue,
         workflowId,
-        args: [{ documentId }],
+        args: [{ accountId, workspaceId, documentId }],
       });
     },
   };
@@ -220,6 +223,8 @@ function temporalScheduleOptions(task: ScheduledTask, taskQueue: string): Schedu
       workflowType: "scheduledTaskFireWorkflow",
       taskQueue,
       args: [{
+        accountId: task.accountId,
+        workspaceId: task.workspaceId,
         taskId: task.id,
         triggerType: "scheduled",
       }],
@@ -234,6 +239,8 @@ function temporalScheduleOptions(task: ScheduledTask, taskQueue: string): Schedu
       ...(task.schedule.type === "once" ? { remainingActions: 1 } : {}),
     },
     memo: {
+      accountId: task.accountId,
+      workspaceId: task.workspaceId,
       scheduledTaskId: task.id,
       name: task.name,
     },

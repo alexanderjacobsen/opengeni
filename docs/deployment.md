@@ -65,16 +65,33 @@ bun run deployment:conformance -- --base-url https://opengeni.example.com
 ```
 
 For deployments with the built-in shared-key boundary enabled, pass the same key
-used by the backend. Conformance verifies that client config is secret-free,
-protected routes reject missing keys, and authenticated API/SSE requests work:
+used by the backend. Conformance sends it as `x-opengeni-access-key`, verifies
+that client config is secret-free, verifies protected routes reject missing
+keys, discovers the workspace through `/v1/access/me`, and then exercises
+workspace-scoped API/SSE requests:
 
 ```bash
-OPENGENI_CONFORMANCE_ACCESS_KEY="$OPENGENI_ACCESS_KEY" \
+OPENGENI_CONFORMANCE_DEPLOYMENT_ACCESS_KEY="$OPENGENI_ACCESS_KEY" \
   bun run deployment:conformance -- --base-url https://opengeni.example.com
 ```
 
-If the target reports `auth.required=true` and no conformance access key is
+For managed deployments, conformance should use an OpenGeni product API key for
+the test workspace:
+
+```bash
+OPENGENI_CONFORMANCE_PRODUCT_TOKEN="$OPENGENI_TEST_WORKSPACE_API_KEY" \
+  bun run deployment:conformance -- --base-url https://staging.app.opengeni.ai
+```
+
+If the target reports deployment-key auth and no conformance deployment key is
 provided, conformance fails instead of treating auth as a skipped check.
+
+Managed SaaS operators should keep their release pipeline, live Stripe account
+checks, staging/prod canaries, backup/restore drills, observability evidence,
+and private deployment inventory in an operator-controlled private repository or
+secret-managed CI system. The open-source repository intentionally provides the
+reusable product, chart, Terraform roots, and conformance commands; it does not
+ship Cloudgeni-specific operational release gates or live-account scripts.
 
 For private in-cluster MinIO behind a local port-forward, keep the presigned URL host intact with curl's connect mapping:
 
@@ -300,7 +317,11 @@ The secret must provide runtime values such as:
 - `OPENGENI_OBJECT_STORAGE_BACKEND=azure-blob` plus Azure Blob connection string/account-key settings
 - `OPENGENI_OBJECT_STORAGE_BACKEND=aws-s3` plus `OPENGENI_OBJECT_STORAGE_REGION`; prefer IRSA/EKS Pod Identity over static keys
 - `OPENGENI_OBJECT_STORAGE_BACKEND=gcs` plus `OPENGENI_OBJECT_STORAGE_GCS_PROJECT_ID`; prefer GKE Workload Identity over service-account JSON
-- `OPENGENI_AUTH_REQUIRED=true` and `OPENGENI_ACCESS_KEY` for the temporary built-in shared-key boundary, unless an external gateway supplies authentication
+- `OPENGENI_PRODUCT_ACCESS_MODE=local|configured|managed`, independent of cloud/infrastructure profile
+- `OPENGENI_BILLING_MODE=disabled|stripe`, `OPENGENI_ENTITLEMENTS_MODE=none|static|managed`, and `OPENGENI_USAGE_LIMITS_MODE=none|static|managed`
+- `OPENGENI_AUTH_REQUIRED=true` and `OPENGENI_ACCESS_KEY` only when using the optional deployment shared-key boundary
+- `OPENGENI_BETTER_AUTH_SECRET`, trusted origins, public base URL, Resend key, and delegation secret when `OPENGENI_PRODUCT_ACCESS_MODE=managed`
+- `OPENGENI_STRIPE_SECRET_KEY`, publishable key, webhook secret, and model pricing JSON when `OPENGENI_BILLING_MODE=stripe`
 - sandbox backend credentials when required
 
 Do not commit real secret values.
@@ -316,9 +337,15 @@ Sandbox file mount support is also backend-specific:
 
 ## Security Boundary
 
-OpenGeni ships a deliberately small shared-key boundary for deployment smoke and early self-hosted use. Set `OPENGENI_AUTH_REQUIRED=true` and provide `OPENGENI_ACCESS_KEY` through a Kubernetes Secret, ExternalSecret, or provider secret manager. The browser stores the key only in local storage and sends it as `Authorization: Bearer ...`; the API also accepts `X-OpenGeni-Access-Key` for simple automation.
+OpenGeni separates deployment edge access from product access. `OPENGENI_AUTH_REQUIRED=true` is an optional deployment shared-key boundary for smoke tests and simple self-hosting. It is not the tenant model and it does not create users, accounts, workspaces, or billing state. Set `OPENGENI_ACCESS_KEY` through a Kubernetes Secret, ExternalSecret, or provider secret manager; clients send it as `x-opengeni-access-key`.
 
-This is not full product auth. It does not provide users, tenancy, RBAC, audit identity, SSO, or rate limiting. Long-lived public deployments should still sit behind a gateway or ingress stack that provides:
+Product access is controlled by `OPENGENI_PRODUCT_ACCESS_MODE`:
+
+- `local` bootstraps a local default account/workspace.
+- `configured` supports self-hosted embedded deployments with delegated bearer tokens or the deployment shared-key boundary.
+- `managed` uses Better Auth for browser human auth, OpenGeni-owned API keys for product/API access, Stripe prepaid credits, usage, limits, and local entitlement mirrors.
+
+Long-lived public deployments should still sit behind a gateway or ingress stack that provides:
 
 - TLS termination with a managed certificate.
 - Authentication and authorization for every user-facing route.
@@ -413,7 +440,7 @@ Minimum production alerts:
 
 - API availability: `/healthz` is unavailable from the ingress or synthetic probe for more than 2 minutes.
 - API errors: 5xx ratio is above 2% for 10 minutes, or any critical route stays above 5% for 5 minutes.
-- API latency: p95 latency is above the product SLO for 10 minutes, tracked separately for `/v1/sessions`, event replay, SSE, scheduled-task trigger, and file routes.
+- API latency: p95 latency is above the product SLO for 10 minutes, tracked separately for `/v1/workspaces/:workspaceId/sessions`, event replay, SSE, scheduled-task trigger, and file routes.
 - Worker failures: `runAgentSegment` failure ratio is above 5% for 10 minutes.
 - Worker duration: p95 `runAgentSegment` duration is above the expected model/tool budget for 15 minutes.
 - Scheduler health: manual scheduled-task conformance does not dispatch a session through Temporal within the configured timeout.
@@ -508,6 +535,21 @@ are reusable stack-contract shapes for operator-owned automation. If an operator
 wants preview deployments, they should run `bun run deployment:stack` in their
 own CI/CD environment with their own cluster, registry, secrets, and teardown
 policy.
+
+Preview profiles are managed-product previews, not fake demos. They use
+disposable in-cluster Postgres, Temporal, NATS, and MinIO fixtures so state can
+be torn down safely, but they still run the real API, web app, worker, model
+provider, and configured sandbox backend. The checked-in
+`values.preview-managed.example.yaml` file keeps replicas small and enables the
+fixture data plane; generated private runtime artifacts must still provide
+managed auth, Resend, Stripe test mode, GitHub App, model-provider, Modal, and
+image digest values. Do not use `OPENGENI_SANDBOX_BACKEND=none` for previews
+that are meant to validate product behavior.
+
+Preview deployments should be private or maintainer-gated even when signup is
+enabled. The source repo may contain the contract, Helm values shape, and
+conformance scripts, but not provider secrets, kubeconfigs, Terraform state,
+preview tenant data, or unsanitized evidence.
 
 ## Conformance
 

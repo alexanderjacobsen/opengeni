@@ -5,6 +5,7 @@ import {
   createSignedState,
   envLinesFromGitHubManifestConversion,
   githubAppBotIdentity,
+  githubOAuthAuthorizeUrl,
   normalizeGitHubAppPrivateKey,
   verifySignedState,
 } from "../src";
@@ -20,7 +21,7 @@ describe("GitHub app manifest helpers", () => {
     expect(verifySignedState(state, "secret", 5000)).toBe(false);
   });
 
-  test("omits webhooks for localhost and includes them for public https", () => {
+  test("omits webhooks until a signed GitHub webhook receiver is shipped", () => {
     const local = buildGitHubAppManifest({
       appName: "Local",
       baseUrl: "http://127.0.0.1:8000",
@@ -28,6 +29,7 @@ describe("GitHub app manifest helpers", () => {
       includeCiPermissions: true,
     });
     expect(local.hook_attributes).toBeUndefined();
+    expect(local.request_oauth_on_install).toBe(true);
 
     const hosted = buildGitHubAppManifest({
       appName: "Hosted",
@@ -35,10 +37,9 @@ describe("GitHub app manifest helpers", () => {
       public: false,
       includeCiPermissions: true,
     });
-    expect(hosted.hook_attributes).toEqual({
-      url: "https://agents.example.com/v1/github/webhook",
-      active: true,
-    });
+    expect(hosted.hook_attributes).toBeUndefined();
+    expect(hosted.default_events).toBeUndefined();
+    expect(hosted.request_oauth_on_install).toBe(true);
   });
 
   test("renders env lines with escaped private key", () => {
@@ -52,6 +53,18 @@ describe("GitHub app manifest helpers", () => {
     });
     expect(lines).toContain("OPENGENI_GITHUB_APP_ID=1");
     expect(lines.at(-1)).toContain("\\n");
+  });
+
+  test("builds GitHub OAuth authorization URLs for installation binding", () => {
+    const url = new URL(githubOAuthAuthorizeUrl({
+      clientId: "client-id",
+      state: "signed-state",
+      redirectUri: "https://staging.app.opengeni.ai/v1/github/oauth/callback",
+    }));
+    expect(url.origin + url.pathname).toBe("https://github.com/login/oauth/authorize");
+    expect(url.searchParams.get("client_id")).toBe("client-id");
+    expect(url.searchParams.get("state")).toBe("signed-state");
+    expect(url.searchParams.get("redirect_uri")).toBe("https://staging.app.opengeni.ai/v1/github/oauth/callback");
   });
 
   test("derives GitHub App bot identity for git commits", () => {

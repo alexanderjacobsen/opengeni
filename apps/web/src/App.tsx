@@ -387,6 +387,7 @@ function RootRouteComponent() {
   const [selectedCapabilityToolIds, setSelectedCapabilityToolIds] = useState<Set<string>>(() => new Set());
   const previousCapabilityToolIds = useRef<Set<string>>(new Set());
   const githubRefreshId = useRef(0);
+  const mcpRefreshId = useRef(0);
   const [busy, setBusy] = useState(false);
   const [repoBusy, setRepoBusy] = useState(false);
   const [githubAppBusy, setGithubAppBusy] = useState(false);
@@ -548,8 +549,10 @@ function RootRouteComponent() {
   }
 
   async function refreshWorkspaceMcpServers(workspaceId: string, signal?: AbortSignal) {
+    const refreshId = mcpRefreshId.current + 1;
+    mcpRefreshId.current = refreshId;
     const catalog = await fetchCapabilities(workspaceId, signal);
-    if (signal?.aborted) {
+    if (signal?.aborted || mcpRefreshId.current !== refreshId) {
       return;
     }
     setWorkspaceMcpServers(enabledWorkspaceCapabilityMcpServers(catalog.items));
@@ -838,13 +841,17 @@ function WorkspaceShellRoute() {
   const pathname = useRouterState({ select: (state) => state.location.pathname });
   const activeWorkspace = context.workspaces.find((workspace) => workspace.id === workspaceId) ?? null;
   const isSessionRoute = pathname.includes(`/workspaces/${workspaceId}/sessions/`);
+  const previousWorkspaceId = useRef<string | null>(null);
 
   useEffect(() => {
     if (!activeWorkspace) {
       return;
     }
     const abortController = new AbortController();
-    context.resetSessionView();
+    if (previousWorkspaceId.current !== workspaceId) {
+      context.resetSessionView();
+    }
+    previousWorkspaceId.current = workspaceId;
     context.resetWorkspaceIntegrations();
     context.setSelectedRepoIds(new Set());
     context.setSelectedRepoRefs({});

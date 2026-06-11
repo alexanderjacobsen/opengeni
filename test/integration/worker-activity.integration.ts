@@ -310,7 +310,7 @@ describe("worker activities integration", () => {
     const events = await listSessionEvents(dbClient.db, grant.workspaceId, session.id, 0, 50);
     expect(events.some((event) => event.type === "turn.failed")).toBe(false);
     const completed = events.find((event) => event.type === "turn.completed");
-    expect(completed?.payload).toEqual({ output: "", segmentLimit: "max_turns" });
+    expect(completed?.payload).toEqual({ output: "", segmentLimit: "max_turns", runStateSaved: false });
     expect((await getSession(dbClient.db, grant.workspaceId, session.id))?.status).toBe("idle");
     const turns = await listSessionTurns(dbClient.db, grant.workspaceId, session.id, 10);
     expect(turns.every((turn) => turn.status !== "failed")).toBe(true);

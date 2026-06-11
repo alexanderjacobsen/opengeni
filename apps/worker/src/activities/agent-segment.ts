@@ -275,6 +275,13 @@ export function createRunAgentSegmentActivity(services: () => Promise<ActivitySe
       const maxTurns = maxTurnsExceededRunState(error);
       if (maxTurns && publish && turnId && turnStartedPublished) {
         await batcher?.flush().catch(() => undefined);
+        // The SDK attaches the run state at the throw site; persisting it lets
+        // the continuation resume with this segment's full context. If capture
+        // ever fails, the continuation falls back to the previous snapshot --
+        // degraded context, flagged on the event, but still strictly better
+        // than a terminal failed session: the sandbox filesystem state
+        // persists independently and the agent re-derives from it.
+        const runStateSaved = Boolean(maxTurns.serializedRunState);
         if (maxTurns.serializedRunState) {
           await saveRunState(db, {
             accountId: input.accountId,
@@ -286,7 +293,7 @@ export function createRunAgentSegmentActivity(services: () => Promise<ActivitySe
           });
         }
         await publish([
-          { type: "turn.completed", payload: { output: "", segmentLimit: "max_turns" } },
+          { type: "turn.completed", payload: { output: "", segmentLimit: "max_turns", runStateSaved } },
           { type: "session.status.changed", payload: { status: "idle" } },
         ], true);
         await finishTurn(db, input.workspaceId, turnId, "idle");

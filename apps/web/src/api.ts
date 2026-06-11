@@ -212,8 +212,8 @@ export function fetchAccessContext(): Promise<AccessContext> {
   return request<AccessContext>("/v1/access/me");
 }
 
-export function fetchCapabilities(workspaceId: string): Promise<CapabilityCatalogResponse> {
-  return request<CapabilityCatalogResponse>(workspacePath(workspaceId, "/capabilities"));
+export function fetchCapabilities(workspaceId: string, signal?: AbortSignal): Promise<CapabilityCatalogResponse> {
+  return request<CapabilityCatalogResponse>(workspacePath(workspaceId, "/capabilities"), { signal });
 }
 
 export function createCapability(workspaceId: string, input: CreateCapabilityInput): Promise<CapabilityCatalogItem> {
@@ -554,12 +554,12 @@ function parseSseEvent(block: string): SessionEvent | null {
   return data ? JSON.parse(data) as SessionEvent : null;
 }
 
-export async function fetchGitHubStatus(workspaceId: string): Promise<{ configured: boolean; missing: string[]; installUrl: string | null }> {
-  return await request(workspacePath(workspaceId, "/github/app"));
+export async function fetchGitHubStatus(workspaceId: string, signal?: AbortSignal): Promise<{ configured: boolean; missing: string[]; installUrl: string | null }> {
+  return await request(workspacePath(workspaceId, "/github/app"), { signal });
 }
 
-export async function fetchGitHubRepositories(workspaceId: string): Promise<GitHubRepository[]> {
-  const payload = await request<{ repositories: GitHubRepository[] }>(workspacePath(workspaceId, "/github/repositories"));
+export async function fetchGitHubRepositories(workspaceId: string, signal?: AbortSignal): Promise<GitHubRepository[]> {
+  const payload = await request<{ repositories: GitHubRepository[] }>(workspacePath(workspaceId, "/github/repositories"), { signal });
   return payload.repositories;
 }
 

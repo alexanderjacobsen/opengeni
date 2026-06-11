@@ -264,14 +264,15 @@ type AppContextValue = {
   addManualRepository: () => void;
   forgetAccessKey: () => void;
   handleManagedSignOut: () => Promise<void>;
-  refreshGitHub: (workspaceId: string) => Promise<void>;
-  refreshWorkspaceMcpServers: (workspaceId: string) => Promise<void>;
+  refreshGitHub: (workspaceId: string, signal?: AbortSignal) => Promise<void>;
+  refreshWorkspaceMcpServers: (workspaceId: string, signal?: AbortSignal) => Promise<void>;
   startGitHubAppManifestFlow: (workspaceId: string) => Promise<void>;
   toggleGitHubRepository: (repo: GitHubRepository) => void;
   startSession: (workspaceId: string, submission: TurnSubmission) => Promise<Session | null>;
   submitFollowUp: (workspaceId: string, sessionId: string, submission: TurnSubmission) => Promise<void>;
   interruptSession: (workspaceId: string, sessionId: string) => Promise<void>;
   resetSessionView: () => void;
+  resetWorkspaceIntegrations: () => void;
 };
 
 const AppContext = createContext<AppContextValue | null>(null);
@@ -511,25 +512,43 @@ function RootRouteComponent() {
     previousCapabilityToolIds.current = new Set(availableIds);
   }, [clientConfig, customMcpServers]);
 
-  async function refreshGitHub(workspaceId: string) {
+  async function refreshGitHub(workspaceId: string, signal?: AbortSignal) {
     setRepoBusy(true);
     try {
-      const status = await fetchGitHubStatus(workspaceId);
+      const status = await fetchGitHubStatus(workspaceId, signal);
+      if (signal?.aborted) {
+        return;
+      }
       setGithubStatus(status);
       setGithubAppOpen(!status.configured);
       if (status.configured) {
-        setGithubRepos(await fetchGitHubRepositories(workspaceId));
+        const repositories = await fetchGitHubRepositories(workspaceId, signal);
+        if (signal?.aborted) {
+          return;
+        }
+        setGithubRepos(repositories);
+      } else {
+        setGithubRepos([]);
       }
     } catch (error) {
+      if (isAbortError(error)) {
+        return;
+      }
       setGithubStatus({ configured: false, missing: [], installUrl: null });
+      setGithubRepos([]);
       toast.error("GitHub status unavailable", { description: String(error) });
     } finally {
-      setRepoBusy(false);
+      if (!signal?.aborted) {
+        setRepoBusy(false);
+      }
     }
   }
 
-  async function refreshWorkspaceMcpServers(workspaceId: string) {
-    const catalog = await fetchCapabilities(workspaceId);
+  async function refreshWorkspaceMcpServers(workspaceId: string, signal?: AbortSignal) {
+    const catalog = await fetchCapabilities(workspaceId, signal);
+    if (signal?.aborted) {
+      return;
+    }
     setWorkspaceMcpServers(enabledWorkspaceCapabilityMcpServers(catalog.items));
   }
 
@@ -687,6 +706,12 @@ function RootRouteComponent() {
     setConnectionState("closed");
   }
 
+  function resetWorkspaceIntegrations() {
+    setGithubStatus(null);
+    setGithubRepos([]);
+    setWorkspaceMcpServers([]);
+  }
+
   const appContext = clientConfig && accessContext ? {
     clientConfig,
     authSession: authSession ?? null,
@@ -744,6 +769,7 @@ function RootRouteComponent() {
     submitFollowUp,
     interruptSession,
     resetSessionView,
+    resetWorkspaceIntegrations,
   } satisfies AppContextValue : null;
 
   return (
@@ -814,12 +840,19 @@ function WorkspaceShellRoute() {
     if (!activeWorkspace) {
       return;
     }
+    const abortController = new AbortController();
     context.resetSessionView();
+    context.resetWorkspaceIntegrations();
     context.setSelectedRepoIds(new Set());
     context.setSelectedRepoRefs({});
-    void context.refreshGitHub(workspaceId);
-    void context.refreshWorkspaceMcpServers(workspaceId)
-      .catch((error) => toast.error("Failed to load workspace MCP tools", { description: String(error) }));
+    void context.refreshGitHub(workspaceId, abortController.signal);
+    void context.refreshWorkspaceMcpServers(workspaceId, abortController.signal)
+      .catch((error) => {
+        if (!isAbortError(error)) {
+          toast.error("Failed to load workspace MCP tools", { description: String(error) });
+        }
+      });
+    return () => abortController.abort();
   }, [workspaceId, context.accessKeyVersion, activeWorkspace?.id]);
 
   if (!activeWorkspace) {
@@ -5379,6 +5412,10 @@ function scheduleLabel(schedule: ScheduledTaskScheduleSpec): string {
 
 function isUiReasoningEffort(value: ReasoningEffort): value is IntelligenceEffort {
   return value === "low" || value === "medium" || value === "high" || value === "xhigh";
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
 }
 
 function labelEffort(value: IntelligenceEffort): string {

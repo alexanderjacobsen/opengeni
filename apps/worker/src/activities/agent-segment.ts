@@ -274,6 +274,7 @@ export function createRunAgentSegmentActivity(services: () => Promise<ActivitySe
       // that resumption.
       const maxTurns = maxTurnsExceededRunState(error);
       if (maxTurns && publish && turnId && turnStartedPublished) {
+        await batcher?.flush().catch(() => undefined);
         if (maxTurns.serializedRunState) {
           await saveRunState(db, {
             accountId: input.accountId,

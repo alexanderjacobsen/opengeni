@@ -1,14 +1,21 @@
 import {
   EnablePackRequest,
   MarketingDailyAnalysisTaskRequest,
+  RegisterCapabilityPackRequest,
   type SocialConnection,
 } from "@opengeni/contracts";
 import {
+  deleteWorkspacePack,
+  disableCapabilityInstallation,
   enablePackInstallation,
+  getCapabilityInstallation,
   getPackInstallation,
+  getWorkspacePack,
   getSocialConnection,
   listPackInstallations,
   listSocialConnections,
+  registerWorkspacePack,
+  updatePackInstallationStatus,
 } from "@opengeni/db";
 import { getDocumentBase } from "@opengeni/documents";
 import type { Hono } from "hono";
@@ -19,9 +26,10 @@ import type { ApiRouteDeps } from "../dependencies";
 import { validateEnvironmentAttachment } from "../domain/environments";
 import {
   buildMarketingDailyAnalysisAgentConfig,
-  getCapabilityPack,
-  listCapabilityPacks,
+  isBuiltInCapabilityPack,
+  listWorkspaceCapabilityPacks,
   MARKETING_SOCIAL_PACK_ID,
+  resolveCapabilityPack,
 } from "../domain/packs";
 import {
   createValidatedScheduledTask,
@@ -35,9 +43,52 @@ export function registerPackRoutes(app: Hono, deps: ApiRouteDeps): void {
     const workspaceId = c.req.param("workspaceId");
     await requireAccessGrant(c, deps, workspaceId, "workspace:read");
     return c.json({
-      packs: listCapabilityPacks(),
+      packs: await listWorkspaceCapabilityPacks(db, workspaceId),
       installations: await listPackInstallations(db, workspaceId),
     });
+  });
+
+  // Registers (or replaces) a workspace-scoped pack from a manifest payload.
+  // Built-in pack ids stay reserved so a registration can never shadow them.
+  app.post("/v1/workspaces/:workspaceId/packs", async (c) => {
+    const workspaceId = c.req.param("workspaceId");
+    const grant = await requireAccessGrant(c, deps, workspaceId, "workspace:admin");
+    const manifest = RegisterCapabilityPackRequest.parse(await c.req.json());
+    if (isBuiltInCapabilityPack(manifest.id)) {
+      throw new HTTPException(409, { message: `pack id ${manifest.id} is a built-in pack and cannot be replaced` });
+    }
+    const { pack, created } = await registerWorkspacePack(db, {
+      accountId: grant.accountId,
+      workspaceId,
+      pack: manifest,
+    });
+    return c.json(pack, created ? 201 : 200);
+  });
+
+  app.delete("/v1/workspaces/:workspaceId/packs/:packId", async (c) => {
+    const workspaceId = c.req.param("workspaceId");
+    await requireAccessGrant(c, deps, workspaceId, "workspace:admin");
+    const packId = c.req.param("packId");
+    if (isBuiltInCapabilityPack(packId)) {
+      throw new HTTPException(409, { message: "built-in packs cannot be unregistered" });
+    }
+    if (!await getWorkspacePack(db, workspaceId, packId)) {
+      throw new HTTPException(404, { message: "pack not found" });
+    }
+    // Disable installations before deleting the registration so a crash in
+    // between can never orphan an active installation whose manifest is
+    // gone; the capability installation row for pack:{packId} would
+    // otherwise keep a future re-registration looking enabled.
+    const installation = await getPackInstallation(db, workspaceId, packId);
+    if (installation && installation.status === "active") {
+      await updatePackInstallationStatus(db, workspaceId, packId, "disabled");
+    }
+    const capabilityInstallation = await getCapabilityInstallation(db, workspaceId, `pack:${packId}`);
+    if (capabilityInstallation && capabilityInstallation.status === "active") {
+      await disableCapabilityInstallation(db, workspaceId, `pack:${packId}`);
+    }
+    await deleteWorkspacePack(db, workspaceId, packId);
+    return c.body(null, 204);
   });
 
   app.get("/v1/workspaces/:workspaceId/packs/installations", async (c) => {
@@ -49,7 +100,7 @@ export function registerPackRoutes(app: Hono, deps: ApiRouteDeps): void {
   app.get("/v1/workspaces/:workspaceId/packs/:packId", async (c) => {
     const workspaceId = c.req.param("workspaceId");
     await requireAccessGrant(c, deps, workspaceId, "workspace:read");
-    const pack = requirePack(c.req.param("packId"));
+    const pack = await requirePack(db, workspaceId, c.req.param("packId"));
     return c.json({
       pack,
       installation: await getPackInstallation(db, workspaceId, pack.id),
@@ -59,19 +110,21 @@ export function registerPackRoutes(app: Hono, deps: ApiRouteDeps): void {
   app.post("/v1/workspaces/:workspaceId/packs/:packId/enable", async (c) => {
     const workspaceId = c.req.param("workspaceId");
     const grant = await requireAccessGrant(c, deps, workspaceId, "workspace:admin");
-    const pack = requirePack(c.req.param("packId"));
+    const pack = await requirePack(db, workspaceId, c.req.param("packId"));
     const existing = await getPackInstallation(db, workspaceId, pack.id);
     const payload = EnablePackRequest.parse(await c.req.json());
     // Re-enabling without environmentId keeps the stored attachment instead of
     // silently dropping it; the inherited attachment is re-validated below in
-    // case the environment was deleted or its variables changed since.
+    // case the environment was deleted or its variables changed since. The
+    // inherited attachment was authorized with environments:use when it was
+    // first attached, so only a fresh attachment re-checks that permission.
     const storedEnvironmentId = typeof existing?.metadata.environmentId === "string" ? existing.metadata.environmentId : undefined;
     const environmentId = payload.environmentId ?? storedEnvironmentId;
     if (pack.environment?.required && !environmentId) {
       throw new HTTPException(422, { message: "this pack requires an environment attachment; pass environmentId" });
     }
     if (environmentId) {
-      const environment = await validateEnvironmentAttachment({ settings, db }, grant, workspaceId, environmentId);
+      const environment = await validateEnvironmentAttachment({ settings, db }, grant, workspaceId, environmentId, { preauthorized: !payload.environmentId });
       const missing = (pack.environment?.requiredVariables ?? [])
         .filter((name) => !environment.variables.some((variable) => variable.name === name));
       if (missing.length > 0) {
@@ -94,7 +147,7 @@ export function registerPackRoutes(app: Hono, deps: ApiRouteDeps): void {
   app.post("/v1/workspaces/:workspaceId/packs/marketing-social-daily-analysis/scheduled-tasks", async (c) => {
     const workspaceId = c.req.param("workspaceId");
     const grant = await requireAccessGrant(c, deps, workspaceId, "scheduled_tasks:manage");
-    const pack = requirePack(MARKETING_SOCIAL_PACK_ID);
+    const pack = await requirePack(db, workspaceId, MARKETING_SOCIAL_PACK_ID);
     const installation = await getPackInstallation(db, workspaceId, pack.id);
     if (installation?.status !== "active") {
       throw new HTTPException(409, { message: "enable the marketing social pack before creating its scheduled tasks" });
@@ -150,8 +203,8 @@ export function registerPackRoutes(app: Hono, deps: ApiRouteDeps): void {
   });
 }
 
-function requirePack(packId: string) {
-  const pack = getCapabilityPack(packId);
+async function requirePack(db: ApiRouteDeps["db"], workspaceId: string, packId: string) {
+  const pack = await resolveCapabilityPack(db, workspaceId, packId);
   if (!pack) {
     throw new HTTPException(404, { message: "pack not found" });
   }

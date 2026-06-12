@@ -12,6 +12,7 @@ import {
   recordUsageEvent,
   appendSessionHistoryItems,
   countSessionHistoryItems,
+  requeuePreemptedTurn,
   saveRunState,
   upsertSandboxSessionEnvelope,
   setSessionStatus,
@@ -58,6 +59,26 @@ import type { ResourceRef } from "@opengeni/contracts";
 // budget against the same window.
 export const PROVIDER_BACKPRESSURE_DELAY_MS = 60_000;
 
+// Resume notice fed to the model when a turn re-enters after a graceful
+// worker shutdown (deploy/rollout restart) checkpointed it mid-flight. The
+// agent must not blindly replay side effects it cannot see in its history:
+// at most the single in-flight model step was lost, and anything it started
+// there may or may not have completed.
+export const WORKER_SHUTDOWN_RESUME_TEXT = [
+  "[TURN RESUMED AFTER WORKER RESTART] The platform worker running this turn restarted (deploy/rollout) before the turn finished.",
+  "Your conversation history above, including this turn's earlier work, is preserved up to the last checkpoint; at most the single in-flight model step after it was lost.",
+  "Continue the original task from where it left off. Before repeating any action with side effects, check whether it already happened.",
+].join("\n");
+
+/**
+ * True when this activity attempt was cancelled because its hosting worker is
+ * shutting down gracefully (SIGTERM during a deploy), as opposed to a
+ * workflow-requested cancellation (user interrupt) or a server-side timeout.
+ */
+export function isWorkerShutdownCancellation(error: unknown): boolean {
+  return error instanceof CancelledFailure && error.message === "WORKER_SHUTDOWN";
+}
+
 export function createRunAgentTurnActivity(services: () => Promise<ActivityServices>) {
   return async function runAgentTurn(input: RunAgentTurnInput): Promise<RunAgentTurnResult> {
     const { settings, db, bus, runtime, objectStorage, observability } = await services();
@@ -82,6 +103,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
     // sandbox recovery envelope is upserted alongside. Best-effort by design:
     // persistence problems must never fail the run.
     let persistedHistoryCount = 0;
+    let historyCountAtTurnStart = 0;
     const reconcileConversationTruth = async () => {
       if (!stream || !turnId) {
         return;
@@ -119,6 +141,10 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
     // created (and used for turn.started) before the environment is available.
     let redact: (payload: unknown) => unknown = identityRedactor;
     let environmentId = "";
+    // Hoisted for the preemption path: an approval-decision rerun must
+    // re-enter through the approval resume path (its frozen mid-flight state
+    // only exists in the RunState blob), never through a swapped trigger.
+    let triggerType: string | null = null;
     try {
       const capabilitySettings = await settingsWithEnabledCapabilityMcpServers(db, input.workspaceId, settings);
       runtime.configure(capabilitySettings);
@@ -127,6 +153,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       if (!trigger) {
         throw new Error(`Trigger event not found: ${input.triggerEventId}`);
       }
+      triggerType = trigger.type;
       let turn = input.turnId ? await getSessionTurn(db, input.workspaceId, input.turnId) : await claimNextQueuedTurnDb(db, input.workspaceId, input.sessionId, input.workflowId);
       if (!turn && !input.turnId) {
         const createdTurnId = await createTurn(db, {
@@ -143,13 +170,28 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       turnId = turn.id;
       await ensureRunAllowed(settings, db, input.accountId, input.workspaceId);
       const activityContext = currentActivityContext();
+      // Setup (environment load, MCP connects, sandbox restore) does not
+      // stream and so never observes cancellation on its own; these explicit
+      // checks let a graceful shutdown preempt the turn before the worker is
+      // force-killed instead of riding the setup to a heartbeat timeout.
+      const throwIfWorkerShuttingDown = () => {
+        const reason = activityContext?.cancellationSignal.reason;
+        if (isWorkerShutdownCancellation(reason)) {
+          throw reason;
+        }
+      };
       heartbeatTimer = startActivityHeartbeat(activityContext, {
         phase: "running",
         sessionId: input.sessionId,
         turnId,
       });
       let producerSeq = 0;
-      const producerId = `${input.workflowId}:${turnId}`;
+      // One producer per activity execution, not per turn: a turn can run
+      // again on the same workflow (preemption resume, approval rerun), and
+      // each execution restarts producerSeq at 1 — a shared producer id would
+      // trip the per-producer uniqueness constraint on the event log. The
+      // Temporal activity id is unique per scheduled execution.
+      const producerId = `${input.workflowId}:${turnId}${activityContext ? `:${activityContext.info.activityId}` : ""}`;
       publish = async (events: Array<Omit<AppendEventInput, "producerId" | "producerSeq" | "turnId">>, immediate = false) => {
         const inputs = events.map((event) => ({
           ...event,
@@ -166,6 +208,10 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       };
       activityContext?.heartbeat({ phase: "turn_started", sessionId: input.sessionId, turnId });
 
+      // A shutdown that landed during claim/billing setup preempts before the
+      // turn visibly starts: nothing ran yet, so the requeued turn replays the
+      // original trigger cleanly on a healthy worker.
+      throwIfWorkerShuttingDown();
       await setSessionStatus(db, input.workspaceId, input.sessionId, "running", turnId);
       await publish([
         { type: "session.status.changed", payload: { status: "running" } },
@@ -188,6 +234,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       );
       const sandboxEnvironment = await sandboxEnvironmentForRun(runSettings, turnResources, workspaceEnvironment?.values ?? {});
       const fileResourceDownloads = await sandboxFileDownloadsForRun(runSettings, db, objectStorage, input.workspaceId, turnResources);
+      throwIfWorkerShuttingDown();
       preparedTools = await runtime.prepareTools(runSettings, turnTools, {
         accountId: input.accountId,
         workspaceId: input.workspaceId,
@@ -212,7 +259,9 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       });
       const runInput = await turnInput(db, runtime, agent, trigger, runSettings);
       persistedHistoryCount = await countSessionHistoryItems(db, input.workspaceId, input.sessionId);
+      historyCountAtTurnStart = persistedHistoryCount;
       let responseUsageCount = 0;
+      throwIfWorkerShuttingDown();
       stream = await runtime.runStream(agent, runInput, runSettings, {
         sandboxEnvironment,
         onRuntimeEvent: async (event) => {
@@ -342,12 +391,97 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       activityStatus = "idle";
       return { status: "idle" };
     } catch (error) {
+      // Graceful worker shutdown (deploy / rollout restart): checkpoint and
+      // hand the turn back instead of failing the session. Conversation truth
+      // is already dual-written per model response; the final reconcile below
+      // bounds the loss to at most the single in-flight model step. The turn
+      // is re-queued so the session workflow re-dispatches it on a healthy
+      // worker — through a synthesized resume notice when this turn already
+      // persisted progress (replaying the original trigger would duplicate
+      // input the model has already seen and invite it to redo side effects),
+      // or through the original trigger when nothing was persisted yet. This
+      // is an explicit checkpoint/resume, not a blind activity retry: the
+      // resumed attempt sees everything the first attempt did.
+      //
+      // The branch deliberately does NOT require turn.started to have been
+      // published: a shutdown landing during setup (claim/billing, before the
+      // turn visibly started) must also requeue, not fail the session. In
+      // that early case nothing ran and nothing was checkpointed, so the
+      // requeued turn replays the original trigger cleanly. The turn id falls
+      // back to the workflow-claimed turn when the local lookup had not
+      // finished yet.
+      const preemptTurnId = turnId ?? input.turnId;
+      if (isWorkerShutdownCancellation(error) && preemptTurnId) {
+        try {
+          await batcher?.flush().catch(() => undefined);
+          await reconcileConversationTruth();
+          // An approval-decision rerun always replays its original trigger:
+          // the decision is applied through the approval resume path reading
+          // the frozen RunState blob (the only representation of a turn
+          // paused mid-flight), so swapping the trigger for a resume notice
+          // could drop the user's decision. Re-applying an already-consumed
+          // approval re-executes at most the single approved step — the same
+          // bound every preemption already accepts.
+          const approvalRerun = triggerType === "user.approvalDecision";
+          let resumeWithNotice = !approvalRerun && settings.sessionHistorySource === "items" && persistedHistoryCount > historyCountAtTurnStart;
+          if (settings.sessionHistorySource !== "items" && stream) {
+            // Legacy run-state mode: the resume reads the RunState blob, so
+            // the checkpoint must be captured there — including any pending
+            // approval interruptions, exactly like the requires_action path,
+            // so a shutdown while approvals wait does not erase them. A
+            // failed capture falls back to the previous snapshot and a clean
+            // re-run of the original trigger.
+            try {
+              await saveRunState(db, {
+                accountId: input.accountId,
+                workspaceId: input.workspaceId,
+                sessionId: input.sessionId,
+                turnId: preemptTurnId,
+                serializedRunState: stream.state.toString(),
+                pendingApprovals: runtime.serializeApprovals(stream.interruptions ?? []),
+              });
+              resumeWithNotice = true;
+            } catch {
+              resumeWithNotice = false;
+            }
+          }
+          const [preemptedEvent] = await appendAndPublishEvents(db, bus, input.workspaceId, input.sessionId, [
+            {
+              turnId: preemptTurnId,
+              type: "turn.preempted",
+              payload: {
+                triggerEventId: input.triggerEventId,
+                reason: "worker_shutdown",
+                resumeWithNotice,
+                ...(resumeWithNotice ? { text: WORKER_SHUTDOWN_RESUME_TEXT } : {}),
+              },
+            },
+            {
+              turnId: preemptTurnId,
+              type: "session.status.changed",
+              payload: { status: "queued" },
+            },
+          ]);
+          await requeuePreemptedTurn(db, input.workspaceId, preemptTurnId, resumeWithNotice && preemptedEvent ? preemptedEvent.id : input.triggerEventId);
+          await setSessionStatus(db, input.workspaceId, input.sessionId, "queued", null).catch(() => undefined);
+          activityStatus = "preempted";
+          return { status: "preempted" };
+        } catch (preemptError) {
+          // A failing checkpoint/requeue must not surface as an arbitrary
+          // activity error around a half-applied preemption (the workflow
+          // would fail the session while a requeued turn lingers). Fall
+          // through to the cancellation path below: the turn is marked
+          // cancelled — also resetting a turn this block already requeued —
+          // and the session fails like an uncheckpointed death.
+          console.error("worker-shutdown preemption failed; falling back to cancellation", preemptError);
+        }
+      }
       if (error instanceof CancelledFailure) {
         activityStatus = "cancelled";
         activityError = error;
         await batcher?.flush().catch(() => undefined);
-        if (turnId) {
-          await finishTurn(db, input.workspaceId, turnId, "cancelled").catch(() => undefined);
+        if (preemptTurnId) {
+          await finishTurn(db, input.workspaceId, preemptTurnId, "cancelled").catch(() => undefined);
         }
         throw error;
       }

@@ -2578,6 +2578,33 @@ export async function finishTurn(db: Database, workspaceId: string, turnId: stri
   });
 }
 
+/**
+ * Put a preempted (worker shutdown mid-flight) turn back on the session
+ * queue so the workflow's next claim re-dispatches it on a healthy worker.
+ * The trigger event is swapped when the resumed attempt should enter
+ * through a synthesized resume notice instead of replaying the original
+ * trigger (the original input is already part of persisted conversation
+ * truth by then). Keeping the original position lets the resumed turn run
+ * before any turns queued behind it. Accepts `running` turns and
+ * `requires_action` turns: an approval rerun re-dispatches the same turn
+ * without a fresh claim, so the row still carries the approval-wait status
+ * while the rerun activity executes.
+ */
+export async function requeuePreemptedTurn(db: Database, workspaceId: string, turnId: string, triggerEventId: string): Promise<void> {
+  await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [row] = await scopedDb.update(schema.sessionTurns).set({
+      status: "queued",
+      triggerEventId,
+      startedAt: null,
+      finishedAt: null,
+      updatedAt: new Date(),
+    }).where(and(eq(schema.sessionTurns.workspaceId, workspaceId), eq(schema.sessionTurns.id, turnId), inArray(schema.sessionTurns.status, ["running", "requires_action"]))).returning({ id: schema.sessionTurns.id });
+    if (!row) {
+      throw new Error(`Preemptible session turn not found: ${turnId}`);
+    }
+  });
+}
+
 export async function getSessionTurn(db: Database, workspaceId: string, turnId: string): Promise<SessionTurn | null> {
   return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
     const [row] = await scopedDb.select().from(schema.sessionTurns).where(and(eq(schema.sessionTurns.workspaceId, workspaceId), eq(schema.sessionTurns.id, turnId))).limit(1);

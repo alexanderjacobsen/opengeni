@@ -12,6 +12,7 @@ import {
 import { appendAndPublishEvents } from "@opengeni/events";
 import { WORKER_DEATH_RESUME_TEXT } from "./agent-turn";
 import { isSteerInterrupt, pauseActiveGoalOnInterrupt } from "./goals";
+import { notifyParentOfChildTerminal } from "./parent-wake";
 import type {
   ActivityServices,
   ClaimNextQueuedTurnInput,
@@ -29,8 +30,17 @@ export const WORKER_DEATH_MAX_REDISPATCHES = 3;
 
 export function createSessionStateActivities(services: () => Promise<ActivityServices>) {
   async function failSession(input: RunAgentTurnInput & { error?: string }): Promise<void> {
-    const { db, bus } = await services();
+    const { db, bus, settings, observability, wakeSessionWorkflow } = await services();
     const session = await requireSession(db, input.workspaceId, input.sessionId);
+    // Already terminal: runAgentTurn settled this turn as failed (status failed,
+    // activeTurnId cleared, turn finished) and already woke any parent, then the
+    // workflow still routed here because the activity's finally threw after the
+    // failed return. Re-failing would append a second turn.failed/status.changed
+    // and a second parent wake (a different lastSequence dodges the idle dedupe).
+    // The session is already where this activity would put it, so stop.
+    if (session.status === "failed") {
+      return;
+    }
     const trigger = await getSessionEvent(db, input.workspaceId, input.triggerEventId);
     const turnId = session.activeTurnId ?? null;
     await appendAndPublishEvents(db, bus, input.workspaceId, input.sessionId, [
@@ -53,6 +63,7 @@ export function createSessionStateActivities(services: () => Promise<ActivitySer
       await finishTurn(db, input.workspaceId, turnId, "failed");
     }
     await setSessionStatus(db, input.workspaceId, input.sessionId, "failed", null);
+    await notifyParentOfChildTerminal({ db, bus, settings, observability, wakeSessionWorkflow }, input.workspaceId, input.sessionId, "failed");
   }
 
   async function interruptActiveTurn(input: RunAgentTurnInput): Promise<void> {
@@ -167,11 +178,17 @@ export function createSessionStateActivities(services: () => Promise<ActivitySer
   }
 
   async function markSessionIdle(input: MarkSessionIdleInput): Promise<void> {
-    const { db } = await services();
+    const { db, bus, settings, observability, wakeSessionWorkflow } = await services();
     const session = await requireSession(db, input.workspaceId, input.sessionId);
     if (session.status === "queued" || session.status === "running") {
       await setSessionStatus(db, input.workspaceId, input.sessionId, "idle", null);
     }
+    // The workflow reaches markSessionIdle exactly when it has decided to stop
+    // for now (no queued turn, no goal continuation): the terminal-for-now
+    // point for a spawned worker, whatever the cause (goal completed, agent or
+    // system paused goal, goalless work finished, idle-interrupt stop). Wake
+    // the parent here, deduped per idle episode so the manager is nudged once.
+    await notifyParentOfChildTerminal({ db, bus, settings, observability, wakeSessionWorkflow }, input.workspaceId, input.sessionId, "idle");
   }
 
   return {

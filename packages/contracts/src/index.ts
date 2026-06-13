@@ -1154,6 +1154,11 @@ export const Session = z.object({
   // Non-default first-party MCP token permissions (manager-style sessions);
   // null means the fixed worker default set.
   firstPartyMcpPermissions: z.array(Permission).nullable(),
+  // The manager session that spawned this one via session_create (set only
+  // when the creating grant carried a worker-signed sessionId claim); null for
+  // direct API creates and scheduled-task runs. When set, this session's
+  // terminal-for-now transitions wake the parent.
+  parentSessionId: z.string().uuid().nullable(),
   temporalWorkflowId: z.string().nullable(),
   activeTurnId: z.string().uuid().nullable(),
   lastSequence: z.number().int().nonnegative(),

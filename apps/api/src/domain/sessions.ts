@@ -58,6 +58,10 @@ export async function createAndStartSession(input: {
   goal?: GoalSpec | null;
   // Validated against the creating grant before this is called.
   firstPartyMcpPermissions?: Permission[] | null;
+  // The manager session spawning this worker (a worker-signed sessionId claim
+  // on the creating grant); null for direct API creates and scheduled runs.
+  // When set, the worker's terminal-for-now transitions wake this parent.
+  parentSessionId?: string | null;
 }) {
   const session = await createSession(input.db, {
     accountId: input.accountId,
@@ -74,6 +78,7 @@ export async function createAndStartSession(input: {
     sandboxBackend: input.sandboxBackend,
     environmentId: input.environment?.id ?? null,
     firstPartyMcpPermissions: input.firstPartyMcpPermissions ?? null,
+    parentSessionId: input.parentSessionId ?? null,
   });
   // The goal row is durable session state; the workflow picks it up from the
   // database once the first turn completes — no extra workflow plumbing here.
@@ -326,6 +331,18 @@ export async function createSessionForRequest(
   if (payload.goal && firstPartyMcpPermissions && !firstPartyMcpPermissions.includes("goals:manage")) {
     firstPartyMcpPermissions = [...firstPartyMcpPermissions, "goals:manage"];
   }
+  // Parent linkage: a worker is linked to its manager ONLY from the
+  // worker-signed sessionId claim on the creating grant — the manager
+  // session's own id, signed into the delegated token by the worker and never
+  // agent- or caller-controlled. A grant without that claim (a workspace API
+  // key, any non-delegated grant) creates a parentless top-level session.
+  //
+  // We deliberately do NOT honor a caller-supplied parentSessionId: it would
+  // let any sessions:create grant aim a worker at an arbitrary session's id so
+  // its completion wake injects a user.message + queued turn into that session
+  // without holding sessions:control on it (a cross-session write escalation).
+  // The claim is the only trustworthy parent source.
+  const parentSessionId = typeof grant.metadata?.["sessionId"] === "string" ? grant.metadata["sessionId"] as string : null;
   await requireLimit(deps, { accountId: grant.accountId, workspaceId, action: "agent_run:create", quantity: 1 });
   const session = await createAndStartSession({
     db,
@@ -344,6 +361,7 @@ export async function createSessionForRequest(
     environment: environment ? { id: environment.id, name: environment.name } : null,
     goal: payload.goal ?? null,
     firstPartyMcpPermissions,
+    parentSessionId,
   });
   await recordWorkspaceUsage(deps, {
     accountId: grant.accountId,

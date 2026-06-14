@@ -50,7 +50,7 @@ import type {
   WorkspaceRegisteredPack,
 } from "@opengeni/contracts";
 import { reasoningEffortForMetadata } from "@opengeni/contracts";
-import { and, asc, desc, eq, gt, gte, inArray, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, lt, sql, type SQL } from "drizzle-orm";
 import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import { decryptEnvironmentValue } from "./environment-crypto";
@@ -2097,6 +2097,149 @@ export async function getSessionHistoryItems(db: Database, workspaceId: string, 
   });
 }
 
+/**
+ * The LIVE conversation-truth read path: only active rows, position-ordered.
+ * After a client-side context compaction this returns [active summary,
+ * ...active recent tail]; with no compaction yet it equals
+ * getSessionHistoryItems. The model-facing read path uses this so superseded
+ * (summarized-away) prefix rows are excluded while the full transcript stays in
+ * the table as an audit trail.
+ */
+export async function getActiveSessionHistoryItems(db: Database, workspaceId: string, sessionId: string): Promise<Array<{ position: number; item: Record<string, unknown> }>> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const rows = await scopedDb.select({
+      position: schema.sessionHistoryItems.position,
+      item: schema.sessionHistoryItems.item,
+    }).from(schema.sessionHistoryItems)
+      .where(and(
+        eq(schema.sessionHistoryItems.workspaceId, workspaceId),
+        eq(schema.sessionHistoryItems.sessionId, sessionId),
+        eq(schema.sessionHistoryItems.active, true),
+      ))
+      .orderBy(schema.sessionHistoryItems.position);
+    return rows;
+  });
+}
+
+/**
+ * Count of ACTIVE (live, model-facing) history rows for a session. This is the
+ * length of the history the next turn is seeded from — the dual-write slice
+ * index — which after a compaction is far smaller than the total persisted-row
+ * count (countSessionHistoryItems still includes the superseded prefix).
+ */
+export async function countActiveSessionHistoryItems(db: Database, workspaceId: string, sessionId: string): Promise<number> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [row] = await scopedDb.select({
+      count: sql<number>`count(*)`,
+    }).from(schema.sessionHistoryItems)
+      .where(and(
+        eq(schema.sessionHistoryItems.workspaceId, workspaceId),
+        eq(schema.sessionHistoryItems.sessionId, sessionId),
+        eq(schema.sessionHistoryItems.active, true),
+      ));
+    return Number(row?.count ?? 0);
+  });
+}
+
+/**
+ * Apply a client-side context compaction as an atomic, audit-preserving write:
+ *
+ *  - supersede (set active=false) every active row whose position lies in
+ *    [0, boundaryPosition) — i.e. the summarized prefix — EXCLUDING the tail.
+ *    Rows are never deleted.
+ *  - insert ONE active synthetic summary row at `summaryPosition` (a FRACTIONAL
+ *    position — boundaryPosition - 0.5 — that sorts immediately before the kept
+ *    tail and collides with NO existing row, so no real prefix row is ever
+ *    overwritten). Idempotent on position: a retry that finds the summary row
+ *    already there does not duplicate it (it only re-activates the existing
+ *    summary row at that fractional position) and — crucially — never mutates
+ *    the real row at boundaryPosition - 1.
+ *
+ * The caller computes the boundary from the orphan-safe planner so no tool-call
+ * pair straddles the cut. `summaryPosition` must be < boundaryPosition (between
+ * the last superseded prefix row and the kept tail), guaranteeing it sorts
+ * before the tail. Because positions are whole numbers and summaries are
+ * half-steps, the summary's fractional position can never equal a real row.
+ */
+export async function applyContextCompaction(db: Database, input: {
+  accountId: string;
+  workspaceId: string;
+  sessionId: string;
+  turnId?: string | null;
+  /** Active prefix rows with position < boundaryPosition get superseded. */
+  boundaryPosition: number;
+  /** Fractional position for the new summary row (must be < boundaryPosition). */
+  summaryPosition: number;
+  summaryItem: Record<string, unknown>;
+}): Promise<void> {
+  await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId }, async (scopedDb) => {
+    await scopedDb.transaction(async (tx) => {
+      await tx.update(schema.sessionHistoryItems)
+        .set({ active: false })
+        .where(and(
+          eq(schema.sessionHistoryItems.workspaceId, input.workspaceId),
+          eq(schema.sessionHistoryItems.sessionId, input.sessionId),
+          eq(schema.sessionHistoryItems.active, true),
+          lt(schema.sessionHistoryItems.position, input.boundaryPosition),
+        ));
+      // Insert the summary at its FRACTIONAL position. The supersede step above
+      // also sets active=false for any rows with position < boundaryPosition —
+      // which on a RETRY includes the summary itself (it sits below the
+      // boundary). The conflict target here is that fractional position, which
+      // can ONLY ever collide with a prior summary row (real rows are whole
+      // numbers), so onConflictDoUpdate set:{active:true} is safe: it merely
+      // re-activates the existing summary, keeping the retry idempotent WITHOUT
+      // mutating its item/turnId and — crucially — WITHOUT ever touching the
+      // real row at boundaryPosition - 1 (the old integer placement overwrote
+      // it). The summary carries the current turnId so per-turn counts stay
+      // correct.
+      await tx.insert(schema.sessionHistoryItems).values({
+        accountId: input.accountId,
+        workspaceId: input.workspaceId,
+        sessionId: input.sessionId,
+        turnId: input.turnId ?? null,
+        position: input.summaryPosition,
+        item: input.summaryItem,
+        active: true,
+      }).onConflictDoUpdate({
+        target: [schema.sessionHistoryItems.workspaceId, schema.sessionHistoryItems.sessionId, schema.sessionHistoryItems.position],
+        set: { active: true },
+      });
+    });
+  });
+}
+
+/**
+ * The next free WHOLE-NUMBER history position for a session: one past the
+ * largest existing position (active or superseded), floored so the synthetic
+ * summary's fractional half-step never shifts the count. The dual-write
+ * watermark uses this to append new rows at fresh absolute positions, decoupled
+ * from the in-memory history length (which, after a compaction, is far shorter
+ * than the total persisted-row count and so cannot serve as the next position).
+ */
+export async function nextSessionHistoryPosition(db: Database, workspaceId: string, sessionId: string): Promise<number> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [row] = await scopedDb.select({
+      maxPosition: sql<number | null>`max(${schema.sessionHistoryItems.position})`,
+    }).from(schema.sessionHistoryItems)
+      .where(and(eq(schema.sessionHistoryItems.workspaceId, workspaceId), eq(schema.sessionHistoryItems.sessionId, sessionId)));
+    const max = row?.maxPosition;
+    return max === null || max === undefined ? 0 : Math.floor(Number(max)) + 1;
+  });
+}
+
+/**
+ * Record the actual input-token count of the most recent turn's final model
+ * call, for the next turn's pre-read compaction trigger.
+ */
+export async function setSessionLastInputTokens(db: Database, workspaceId: string, sessionId: string, lastInputTokens: number): Promise<void> {
+  await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    await scopedDb.update(schema.sessions)
+      .set({ lastInputTokens, updatedAt: new Date() })
+      .where(and(eq(schema.sessions.workspaceId, workspaceId), eq(schema.sessions.id, sessionId)));
+  });
+}
+
 export async function countSessionHistoryItems(db: Database, workspaceId: string, sessionId: string): Promise<number> {
   return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
     const [row] = await scopedDb.select({
@@ -3075,6 +3218,7 @@ function mapSession(row: typeof schema.sessions.$inferSelect): Session {
     parentSessionId: row.parentSessionId ?? null,
     temporalWorkflowId: row.temporalWorkflowId,
     activeTurnId: row.activeTurnId,
+    lastInputTokens: row.lastInputTokens ?? null,
     lastSequence: row.lastSequence,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),

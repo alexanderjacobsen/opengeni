@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { bigint, index, integer, jsonb, pgTable, text, timestamp, uniqueIndex, uuid, customType } from "drizzle-orm/pg-core";
+import { bigint, boolean, index, integer, jsonb, numeric, pgTable, text, timestamp, uniqueIndex, uuid, customType } from "drizzle-orm/pg-core";
 
 const vector = customType<{ data: number[]; driverData: string }>({
   dataType() {
@@ -125,6 +125,11 @@ export const sessions = pgTable("sessions", {
   parentSessionId: uuid("parent_session_id"),
   temporalWorkflowId: text("temporal_workflow_id"),
   activeTurnId: uuid("active_turn_id"),
+  // Actual input tokens reported for the last model call of the most recent
+  // turn. The pre-turn client-side compaction trigger reads this as its budget
+  // signal (char/4 estimate is the same-turn fallback). Null until a turn with
+  // usage has completed.
+  lastInputTokens: integer("last_input_tokens"),
   lastSequence: integer("last_sequence").notNull().default(0),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -311,8 +316,20 @@ export const sessionHistoryItems = pgTable("session_history_items", {
   workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
   sessionId: uuid("session_id").notNull().references(() => sessions.id, { onDelete: "cascade" }),
   turnId: uuid("turn_id").references(() => sessionTurns.id, { onDelete: "set null" }),
-  position: integer("position").notNull(),
+  // Numeric (not integer) so the synthetic compaction-summary row can be
+  // inserted at a FRACTIONAL position (boundaryPosition - 0.5) that sorts ahead
+  // of the kept tail without colliding with — and thus overwriting — the real
+  // prefix row at boundaryPosition - 1. Normally-appended rows keep whole-number
+  // positions; only the summary uses the half-step. `mode: "number"` maps the
+  // postgres.js string back to a JS number so every reader stays numeric.
+  position: numeric("position", { mode: "number" }).notNull(),
   item: jsonb("item").$type<Record<string, unknown>>().notNull(),
+  // Live-row flag for client-side context compaction. The read path selects
+  // only active rows; a compaction supersedes the summarized prefix (sets this
+  // false — never deletes, so the full transcript stays as an audit trail) and
+  // inserts ONE synthetic active summary row at the boundary. Defaults true so
+  // every existing and normally-appended row is live.
+  active: boolean("active").notNull().default(true),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => ({
   positionIdx: uniqueIndex("session_history_items_position_idx").on(table.workspaceId, table.sessionId, table.position),

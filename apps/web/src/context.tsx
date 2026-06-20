@@ -40,8 +40,8 @@ import {
   buildTools,
   enabledWorkspaceCapabilityMcpServers,
   groupRepositories,
+  initialReasoningEffort,
   isAbortError,
-  isUiReasoningEffort,
   mergeMcpServerOptions,
   selectableMcpServers,
   selectedAvailableCapabilityToolIds,
@@ -73,6 +73,15 @@ export type AppContextValue = {
   keyAuthRequired: boolean;
   model: string;
   setModel: Dispatch<SetStateAction<string>>;
+  /**
+   * The model chosen for a specific open session. Composer state (draft, mode)
+   * is session-scoped, and so is the model: each session remembers its own pick
+   * in-memory, falling back to the deployment default ({@link model}) until the
+   * operator overrides it. The new-session surface uses the bare {@link model}
+   * (no session id yet); the session route threads its id through these.
+   */
+  modelForSession: (sessionId: string) => string;
+  setModelForSession: (sessionId: string, value: string) => void;
   reasoningEffort: IntelligenceEffort;
   setReasoningEffort: Dispatch<SetStateAction<IntelligenceEffort>>;
   inspectorOpen: boolean;
@@ -147,6 +156,10 @@ export function RootRouteComponent() {
   const [accessLoading, setAccessLoading] = useState(false);
   const [accessError, setAccessError] = useState<string | null>(null);
   const [model, setModel] = useState("gpt-5.5");
+  // Per-session model overrides (session id → model). A session with no entry
+  // inherits the deployment default `model`; selecting in its picker writes here
+  // so each open session keeps its own choice independently.
+  const [modelBySession, setModelBySession] = useState<Record<string, string>>({});
   const [reasoningEffort, setReasoningEffort] = useState<IntelligenceEffort>("low");
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [connectionState, setConnectionState] = useState<SessionEventsConnectionState>("idle");
@@ -202,9 +215,11 @@ export function RootRouteComponent() {
         setClientConfig(config);
         setConfigError(null);
         setModel(config.defaultModel);
-        if (isUiReasoningEffort(config.defaultReasoningEffort)) {
-          setReasoningEffort(config.defaultReasoningEffort);
-        }
+        // Sync to the deployment default UNCONDITIONALLY: the full enum is now
+        // representable, so a `none`/`minimal` default no longer gets clamped to
+        // the "low" placeholder (which the server treated as an override beating
+        // the deployer's configured default — a silent billing footgun).
+        setReasoningEffort(initialReasoningEffort(config));
       })
       .catch((error) => {
         if (cancelled) {
@@ -524,6 +539,16 @@ export function RootRouteComponent() {
     setConnectionState("idle");
   }
 
+  // Session-scoped model: read the session's override or fall back to the
+  // deployment default; writing records it without disturbing other sessions
+  // (or the new-session surface, which reads the bare `model`).
+  function modelForSession(sessionId: string): string {
+    return modelBySession[sessionId] ?? model;
+  }
+  function setModelForSession(sessionId: string, value: string): void {
+    setModelBySession((current) => ({ ...current, [sessionId]: value }));
+  }
+
   function resetWorkspaceIntegrations() {
     setGithubStatus(null);
     setGithubRepos([]);
@@ -540,6 +565,8 @@ export function RootRouteComponent() {
     keyAuthRequired: keyAuthRequired === true,
     model,
     setModel,
+    modelForSession,
+    setModelForSession,
     reasoningEffort,
     setReasoningEffort,
     inspectorOpen,

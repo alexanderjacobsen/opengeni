@@ -46,6 +46,37 @@ export type { UseBillingUsageOptions, UseBillingUsageResult } from "./hooks/use-
 export { useAvailableModels } from "./hooks/use-available-models";
 export type { UseAvailableModelsOptions, UseAvailableModelsResult } from "./hooks/use-available-models";
 
+// Sandbox surfacing (Phase 5): capability negotiation + terminal/files/diff/desktop
+export { useSessionCapabilities } from "./hooks/use-session-capabilities";
+export type {
+  SessionCapabilitiesState,
+  UseSessionCapabilitiesOptions,
+  UseSessionCapabilitiesResult,
+} from "./hooks/use-session-capabilities";
+export { useDesktopStream } from "./hooks/use-desktop-stream";
+export type { UseDesktopStreamOptions, UseDesktopStreamResult } from "./hooks/use-desktop-stream";
+export { useTerminalStream } from "./hooks/use-terminal-stream";
+export type {
+  TerminalStreamStatus,
+  UseTerminalStreamOptions,
+  UseTerminalStreamResult,
+} from "./hooks/use-terminal-stream";
+export { useSandboxTerminal } from "./hooks/use-sandbox-terminal";
+export type {
+  TerminalChunk,
+  UseSandboxTerminalOptions,
+  UseSandboxTerminalResult,
+} from "./hooks/use-sandbox-terminal";
+export { useSandboxFiles } from "./hooks/use-sandbox-files";
+export type {
+  FileTreeNode,
+  FileTreeStatus,
+  UseSandboxFilesOptions,
+  UseSandboxFilesResult,
+} from "./hooks/use-sandbox-files";
+export { useSandboxGit } from "./hooks/use-sandbox-git";
+export type { UseSandboxGitOptions, UseSandboxGitResult } from "./hooks/use-sandbox-git";
+
 // Pending-approvals projection
 export { approvalsFromRequiresAction, projectPendingApprovals } from "./approvals";
 export type { PendingApproval } from "./approvals";
@@ -115,6 +146,30 @@ export { SessionStatus, StatusDot, SESSION_STATUS_META } from "./components/sess
 export type { SessionStatusProps, StatusDotProps, SessionStatusMeta } from "./components/session-status";
 export { FleetTile, sessionDisplayTitle } from "./components/fleet-tile";
 export type { FleetTileProps } from "./components/fleet-tile";
+
+// Sandbox surfacing components (Phase 5)
+export { SandboxTerminal } from "./components/sandbox-terminal";
+export type { SandboxTerminalProps, XtermTheme } from "./components/sandbox-terminal";
+export { FileBrowser } from "./components/file-browser";
+export type { FileBrowserProps } from "./components/file-browser";
+export { DiffView } from "./components/diff-view";
+export type { DiffViewProps, DiffTheme } from "./components/diff-view";
+export { PierreDiff } from "./components/pierre-diff";
+export type { PierreDiffProps } from "./components/pierre-diff";
+export { PierreFile } from "./components/pierre-file";
+export type { PierreFileProps } from "./components/pierre-file";
+export { CodeEditor, languageForPath } from "./components/code-editor";
+export type { CodeEditorProps } from "./components/code-editor";
+export { SandboxFiles } from "./components/sandbox-files";
+export type { SandboxFilesProps } from "./components/sandbox-files";
+export { DesktopViewer } from "./components/desktop-viewer";
+export type { DesktopViewerProps } from "./components/desktop-viewer";
+export { WorkspaceDock } from "./components/workspace-dock";
+export type { WorkspaceDockProps, WorkspaceTab } from "./components/workspace-dock";
+
+// Sandbox helpers
+export { gitFileDiffToPatch } from "./lib/git-patch";
+export { xtermThemeFromTokens } from "./lib/xterm-theme";
 
 // Utilities
 export { cn } from "./lib/cn";

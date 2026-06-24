@@ -11,10 +11,14 @@ import {
   parseStaticEntitlementsJson,
   parseStaticUsageLimitsJson,
   parseMcpServers,
+  requiredSandboxEnvForBackend,
+  resolveStreamTokenSecret,
   retryStartupDependency,
+  SANDBOX_REQUIRED_ENV,
   sandboxEnvironmentVariableNames,
   sandboxLifecycleHookIds,
   startupRetryOptions,
+  streamTokenDegraded,
 } from "../src";
 
 describe("sandbox preparation profiles", () => {
@@ -157,6 +161,63 @@ describe("sandbox preparation profiles", () => {
       OPENGENI_AUTH_REQUIRED: "true",
       OPENGENI_ACCESS_KEY: "configured-shared-key",
     }, () => getSettings()).productAccessMode).toBe("configured");
+  });
+
+  test("stream-token secret resolves explicit first, then falls back to delegationSecret", () => {
+    const explicit = withEnv({
+      OPENGENI_DELEGATION_SECRET: "delegation",
+      OPENGENI_STREAM_TOKEN_SECRET: "stream-explicit",
+    }, () => getSettings());
+    expect(resolveStreamTokenSecret(explicit)).toBe("stream-explicit");
+
+    const fallback = withEnv({
+      OPENGENI_DELEGATION_SECRET: "delegation-only",
+    }, () => getSettings());
+    expect(resolveStreamTokenSecret(fallback)).toBe("delegation-only");
+
+    const neither = withEnv({}, () => getSettings());
+    expect(resolveStreamTokenSecret(neither)).toBeUndefined();
+  });
+
+  test("desktop enabled WITHOUT a stream-token secret GRACEFULLY DEGRADES (boots + warns, no throw)", () => {
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); };
+    try {
+      // The whole point of I8/OD-8: desktop on + no secret is NOT a boot-fail.
+      // getSettings() returns settings (does not throw), emits a loud warning,
+      // and streamTokenDegraded() flags the runtime degrade to transport:null.
+      const settings = withEnv({
+        OPENGENI_SANDBOX_DESKTOP_ENABLED: "true",
+        OPENGENI_DELEGATION_SECRET: "",
+      }, () => getSettings());
+      expect(settings.sandboxDesktopEnabled).toBe(true);
+      expect(streamTokenDegraded(settings)).toBe(true);
+      expect(warnings.some((line) => line.includes("GRACEFULLY DEGRADE"))).toBe(true);
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  test("desktop enabled WITH a stream-token secret does not degrade and does not warn", () => {
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); };
+    try {
+      const settings = withEnv({
+        OPENGENI_SANDBOX_DESKTOP_ENABLED: "true",
+        OPENGENI_STREAM_TOKEN_SECRET: "stream-secret",
+      }, () => getSettings());
+      expect(streamTokenDegraded(settings)).toBe(false);
+      expect(warnings.some((line) => line.includes("GRACEFULLY DEGRADE"))).toBe(false);
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  test("streamControlEnabled defaults to false (the input plane is OFF in v1)", () => {
+    expect(withEnv({}, () => getSettings()).streamControlEnabled).toBe(false);
+    expect(withEnv({ OPENGENI_STREAM_CONTROL_ENABLED: "true" }, () => getSettings()).streamControlEnabled).toBe(true);
   });
 
   test("retries startup dependency operations with bounded backoff", async () => {
@@ -545,6 +606,95 @@ describe("provider item id policy", () => {
 
   test("rejects unknown provider item id policies", () => {
     expect(() => withEnv({ OPENGENI_OPENAI_PROVIDER_ITEM_IDS: "sometimes" }, () => getSettings())).toThrow();
+  });
+});
+
+describe("backend-gated sandbox required-credential validation", () => {
+  test("a backend's creds are NOT required when it is not the active backend", () => {
+    // sandboxBackend defaults to docker (no creds). Modal/daytona/etc creds may
+    // be entirely absent — only the active backend's creds gate boot.
+    const settings = withEnv({}, () => getSettings());
+    expect(settings.sandboxBackend).toBe("docker");
+    expect(settings.modalTokenId).toBeUndefined();
+  });
+
+  test("docker/local/none require no sandbox credentials", () => {
+    for (const backend of ["docker", "local", "none"]) {
+      expect(() => withEnv({ OPENGENI_SANDBOX_BACKEND: backend }, () => getSettings())).not.toThrow();
+    }
+  });
+
+  test("modal requires the token only when sandboxBackend=modal", () => {
+    // Backend=modal WITHOUT the token → fails (gated).
+    expect(() => withEnv({ OPENGENI_SANDBOX_BACKEND: "modal" }, () => getSettings()))
+      .toThrow("OPENGENI_MODAL_TOKEN_ID is required when OPENGENI_SANDBOX_BACKEND=modal");
+    // Backend=modal WITH the token (and app name defaulted) → passes.
+    expect(() => withEnv({
+      OPENGENI_SANDBOX_BACKEND: "modal",
+      OPENGENI_MODAL_TOKEN_ID: "ak-test",
+      OPENGENI_MODAL_TOKEN_SECRET: "as-test",
+    }, () => getSettings())).not.toThrow();
+    // The SAME missing-token config but backend=docker → does NOT fail on modal.
+    expect(() => withEnv({ OPENGENI_SANDBOX_BACKEND: "docker" }, () => getSettings())).not.toThrow();
+  });
+
+  test("daytona requires its api key only when active", () => {
+    expect(() => withEnv({ OPENGENI_SANDBOX_BACKEND: "daytona" }, () => getSettings()))
+      .toThrow("OPENGENI_DAYTONA_API_KEY is required when OPENGENI_SANDBOX_BACKEND=daytona");
+    expect(() => withEnv({
+      OPENGENI_SANDBOX_BACKEND: "daytona",
+      OPENGENI_DAYTONA_API_KEY: "dk-test",
+    }, () => getSettings())).not.toThrow();
+    // daytona creds are irrelevant when modal is active (modal has its own gate).
+    expect(() => withEnv({
+      OPENGENI_SANDBOX_BACKEND: "modal",
+      OPENGENI_MODAL_TOKEN_ID: "ak",
+      OPENGENI_MODAL_TOKEN_SECRET: "as",
+    }, () => getSettings())).not.toThrow();
+  });
+
+  test("vercel requires BOTH the token and the project id when active", () => {
+    expect(() => withEnv({ OPENGENI_SANDBOX_BACKEND: "vercel", OPENGENI_VERCEL_TOKEN: "vt" }, () => getSettings()))
+      .toThrow("OPENGENI_VERCEL_PROJECT_ID is required when OPENGENI_SANDBOX_BACKEND=vercel");
+    expect(() => withEnv({
+      OPENGENI_SANDBOX_BACKEND: "vercel",
+      OPENGENI_VERCEL_TOKEN: "vt",
+      OPENGENI_VERCEL_PROJECT_ID: "prj",
+    }, () => getSettings())).not.toThrow();
+  });
+
+  test("runloop/e2b/blaxel/cloudflare each gate their own single credential", () => {
+    const cases: Array<[string, string, string]> = [
+      ["runloop", "OPENGENI_RUNLOOP_API_KEY", "rk"],
+      ["e2b", "OPENGENI_E2B_API_KEY", "ek"],
+      ["blaxel", "OPENGENI_BLAXEL_API_KEY", "bk"],
+      ["cloudflare", "OPENGENI_CLOUDFLARE_WORKER_URL", "https://worker.example.com"],
+    ];
+    for (const [backend, envKey, value] of cases) {
+      expect(() => withEnv({ OPENGENI_SANDBOX_BACKEND: backend }, () => getSettings()))
+        .toThrow(`${envKey} is required when OPENGENI_SANDBOX_BACKEND=${backend}`);
+      expect(() => withEnv({ OPENGENI_SANDBOX_BACKEND: backend, [envKey]: value }, () => getSettings()))
+        .not.toThrow();
+    }
+  });
+
+  test("the modal token stays a both-or-neither pair regardless of the active backend", () => {
+    // Half-configured Modal token while backend=docker: still a misconfig.
+    expect(() => withEnv({ OPENGENI_SANDBOX_BACKEND: "docker", OPENGENI_MODAL_TOKEN_ID: "only-id" }, () => getSettings()))
+      .toThrow("OPENGENI_MODAL_TOKEN_ID and OPENGENI_MODAL_TOKEN_SECRET must both be set or both omitted");
+  });
+
+  test("SANDBOX_REQUIRED_ENV + requiredSandboxEnvForBackend agree", () => {
+    expect(requiredSandboxEnvForBackend("modal")).toEqual([
+      "OPENGENI_MODAL_APP_NAME",
+      "OPENGENI_MODAL_TOKEN_ID",
+      "OPENGENI_MODAL_TOKEN_SECRET",
+    ]);
+    expect(requiredSandboxEnvForBackend("docker")).toEqual([]);
+    // every backend in the table maps to a (possibly empty) env list.
+    for (const backend of Object.keys(SANDBOX_REQUIRED_ENV)) {
+      expect(Array.isArray(requiredSandboxEnvForBackend(backend as keyof typeof SANDBOX_REQUIRED_ENV))).toBe(true);
+    }
   });
 });
 

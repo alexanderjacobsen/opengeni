@@ -18,6 +18,7 @@ import type {
   PackInstallationStatus,
   ResourceRef,
   SandboxBackend,
+  SandboxOs,
   ScheduledTask,
   ScheduledTaskAgentConfig,
   ScheduledTaskOverlapPolicy,
@@ -51,14 +52,17 @@ import type {
   WorkspaceRegisteredPack,
 } from "@opengeni/contracts";
 import { reasoningEffortForMetadata, CLEARED_RUN_STATE_BLOB } from "@opengeni/contracts";
+import { environmentsEncryptionKeyBytes, type Settings } from "@opengeni/config";
 import { and, asc, desc, eq, gt, gte, inArray, lt, sql, type SQL } from "drizzle-orm";
 import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import { decryptEnvironmentValue } from "./environment-crypto";
+import { sanitizeEventPayload } from "./event-payload-sanitizer";
 import * as schema from "./schema";
 
 export { sql as dbSql } from "drizzle-orm";
 export { decryptEnvironmentValue, encryptEnvironmentValue } from "./environment-crypto";
+export { sanitizeEventPayload, sanitizeEventString } from "./event-payload-sanitizer";
 
 export type Database = PostgresJsDatabase<typeof schema>;
 
@@ -1936,6 +1940,61 @@ export async function getWorkspaceEnvironmentValuesForRun(db: Database, workspac
   });
 }
 
+export type WorkspaceEnvironmentForRun = {
+  id: string;
+  name: string;
+  description: string | null;
+  values: Record<string, string>;
+};
+
+/**
+ * Load and decrypt the workspace environment attached to a run's session. SHARED
+ * by the worker TURN path (apps/worker agent-turn) AND the API-direct ATTACH paths
+ * (viewer / Channel-A / desktop / terminal) so a box first warmed by an attach is
+ * created with the SAME decrypted workspace-environment values the turn declares —
+ * the box-manifest env must match the agent-manifest env or the SDK's
+ * `validateNoEnvironmentDelta` throws when the agent injects its manifest into the
+ * resumed non-owned box.
+ *
+ * `environmentId === null` is the unattached path: zero DB work and behavior
+ * byte-identical to deployments without this feature. Attached runs fail closed: a
+ * missing key or a deleted environment throws (names/ids only in messages) instead
+ * of silently running without the secrets the run expects.
+ */
+export async function loadWorkspaceEnvironmentForRun(
+  db: Database,
+  settings: Settings,
+  workspaceId: string,
+  environmentId: string | null,
+): Promise<WorkspaceEnvironmentForRun | null> {
+  if (!environmentId) {
+    return null;
+  }
+  const key = environmentsEncryptionKeyBytes(settings);
+  if (!key) {
+    throw new Error("workspace environment attached but OPENGENI_ENVIRONMENTS_ENCRYPTION_KEY is not configured");
+  }
+  const stored = await getWorkspaceEnvironmentValuesForRun(db, workspaceId, environmentId);
+  if (!stored) {
+    throw new Error(`workspace environment not found: ${environmentId}`);
+  }
+  const values: Record<string, string> = {};
+  for (const [name, encrypted] of Object.entries(stored.values)) {
+    try {
+      values[name] = decryptEnvironmentValue(key, encrypted);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(`failed to decrypt workspace environment variable ${name}: ${reason}`);
+    }
+  }
+  return {
+    id: stored.environment.id,
+    name: stored.environment.name,
+    description: stored.environment.description,
+    values,
+  };
+}
+
 export async function recordAuditEvent(db: Database, input: {
   accountId: string;
   workspaceId?: string | null;
@@ -2015,9 +2074,18 @@ export async function createSession(db: Database, input: {
   firstPartyMcpPermissions?: Permission[] | null;
   parentSessionId?: string | null;
   createIdempotencyKey?: string | null;
+  // The shared-sandbox group to join. Omit (or null) for a singleton group:
+  // the new row's own id is used (group === session), today's 1:1 behavior. A
+  // shared spawn passes the parent's sandboxGroupId so both run in ONE box.
+  sandboxGroupId?: string | null;
+  sandboxOs?: SandboxOs;
 }): Promise<Session> {
+  // Generate the id up front so the same uuid can seed sandbox_group_id for a
+  // singleton group (sandbox_group_id cannot SQL-default to id).
+  const id = crypto.randomUUID();
   return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId }, async (scopedDb) => {
     const [row] = await scopedDb.insert(schema.sessions).values({
+      id,
       accountId: input.accountId,
       workspaceId: input.workspaceId,
       initialMessage: input.initialMessage,
@@ -2026,6 +2094,8 @@ export async function createSession(db: Database, input: {
       metadata: input.metadata,
       model: input.model,
       sandboxBackend: input.sandboxBackend,
+      sandboxOs: input.sandboxOs ?? "linux",
+      sandboxGroupId: input.sandboxGroupId ?? id,
       environmentId: input.environmentId ?? null,
       firstPartyMcpPermissions: input.firstPartyMcpPermissions ?? null,
       parentSessionId: input.parentSessionId ?? null,
@@ -2062,9 +2132,17 @@ export async function createSessionWithIdempotencyKey(db: Database, input: {
   firstPartyMcpPermissions?: Permission[] | null;
   parentSessionId?: string | null;
   createIdempotencyKey: string;
+  // The shared-sandbox group to join. Omit (or null) for a singleton group
+  // (group === the new row's own id); a shared spawn passes the parent's group.
+  sandboxGroupId?: string | null;
+  sandboxOs?: SandboxOs;
 }): Promise<{ session: Session; created: boolean }> {
+  // Generate the id up front so the same uuid can seed sandbox_group_id for a
+  // singleton group (sandbox_group_id cannot SQL-default to id).
+  const id = crypto.randomUUID();
   return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId }, async (scopedDb) => {
     const [inserted] = await scopedDb.insert(schema.sessions).values({
+      id,
       accountId: input.accountId,
       workspaceId: input.workspaceId,
       initialMessage: input.initialMessage,
@@ -2073,6 +2151,8 @@ export async function createSessionWithIdempotencyKey(db: Database, input: {
       metadata: input.metadata,
       model: input.model,
       sandboxBackend: input.sandboxBackend,
+      sandboxOs: input.sandboxOs ?? "linux",
+      sandboxGroupId: input.sandboxGroupId ?? id,
       environmentId: input.environmentId ?? null,
       firstPartyMcpPermissions: input.firstPartyMcpPermissions ?? null,
       parentSessionId: input.parentSessionId ?? null,
@@ -2112,6 +2192,27 @@ export async function getSessionByCreateIdempotencyKey(db: Database, workspaceId
 export async function getSession(db: Database, workspaceId: string, sessionId: string): Promise<Session | null> {
   return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
     const [row] = await scopedDb.select().from(schema.sessions).where(and(eq(schema.sessions.workspaceId, workspaceId), eq(schema.sessions.id, sessionId))).limit(1);
+    return row ? mapSession(row) : null;
+  });
+}
+
+/**
+ * Resolve ANY session that belongs to a shared-sandbox group (addendum 05 §D.3,
+ * stress (e)). Used by the create-session `sandbox:{groupId}` join path to (1)
+ * prove the group exists and (2) inherit its box's (backend, os).
+ *
+ * `workspaceId` is a MANDATORY access boundary, NOT optional: the group uuid is
+ * caller-supplied, so the workspace filter (inside RLS) is what forbids a
+ * cross-workspace join — a foreign group returns null → the caller 404s. The
+ * group uuid itself is never an authorization boundary. Returns the first member
+ * session (any one suffices to read the shared box's backend/os); null when the
+ * group has no session in this workspace.
+ */
+export async function getAnySessionInGroup(db: Database, workspaceId: string, sandboxGroupId: string): Promise<Session | null> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [row] = await scopedDb.select().from(schema.sessions)
+      .where(and(eq(schema.sessions.workspaceId, workspaceId), eq(schema.sessions.sandboxGroupId, sandboxGroupId)))
+      .limit(1);
     return row ? mapSession(row) : null;
   });
 }
@@ -2212,7 +2313,7 @@ export async function appendSessionHistoryItems(db: Database, input: {
       sessionId: input.sessionId,
       turnId: input.turnId ?? null,
       position: entry.position,
-      item: entry.item,
+      item: sanitizeEventPayload(entry.item),
     }))).onConflictDoNothing({
       target: [schema.sessionHistoryItems.workspaceId, schema.sessionHistoryItems.sessionId, schema.sessionHistoryItems.position],
     });
@@ -2434,7 +2535,7 @@ export async function applyContextCompaction(db: Database, input: {
         sessionId: input.sessionId,
         turnId: input.turnId ?? null,
         position: input.summaryPosition,
-        item: input.summaryItem,
+        item: sanitizeEventPayload(input.summaryItem),
         active: true,
       }).onConflictDoUpdate({
         target: [schema.sessionHistoryItems.workspaceId, schema.sessionHistoryItems.sessionId, schema.sessionHistoryItems.position],
@@ -2567,7 +2668,7 @@ export async function clearSessionContext(db: Database, input: {
         sessionId: input.sessionId,
         turnId: null,
         position: markerPosition,
-        item: clearedContextMarkerItem(),
+        item: sanitizeEventPayload(clearedContextMarkerItem()),
         active: true,
       }).onConflictDoNothing({
         target: [schema.sessionHistoryItems.workspaceId, schema.sessionHistoryItems.sessionId, schema.sessionHistoryItems.position],
@@ -2690,6 +2791,1333 @@ export async function getSandboxSessionEnvelope(db: Database, workspaceId: strin
       .where(and(eq(schema.sandboxSessionEnvelopes.workspaceId, workspaceId), eq(schema.sandboxSessionEnvelopes.sessionId, sessionId)))
       .limit(1);
     return row?.envelope ?? null;
+  });
+}
+
+// ============================================================================
+// Session recordings — the durable index for the "agent films itself proving
+// the fix" loop (P4.3). One row per recording; insert at start, update at
+// finalize (available with the storage_key) or failure. Read-side feeds the
+// list route + the signed-URL replay route (storage_key is the source of truth).
+// ============================================================================
+
+export type SessionRecordingState = (typeof schema.sessionRecordingStateValues)[number];
+export type SessionRecordingMode = (typeof schema.sessionRecordingModeValues)[number];
+export type SessionRecordingCodec = (typeof schema.sessionRecordingCodecValues)[number];
+
+export type SessionRecordingRow = {
+  id: string;
+  workspaceId: string;
+  sessionId: string;
+  turnId: string | null;
+  state: SessionRecordingState;
+  mode: SessionRecordingMode;
+  codec: SessionRecordingCodec;
+  storageKey: string | null;
+  sizeBytes: number | null;
+  durationSeconds: number | null;
+  width: number;
+  height: number;
+  reason: string | null;
+  createdAt: Date;
+  finalizedAt: Date | null;
+};
+
+function mapRecording(row: typeof schema.sessionRecordings.$inferSelect): SessionRecordingRow {
+  return {
+    id: row.id,
+    workspaceId: row.workspaceId,
+    sessionId: row.sessionId,
+    turnId: row.turnId,
+    state: row.state,
+    mode: row.mode,
+    codec: row.codec,
+    storageKey: row.storageKey,
+    sizeBytes: row.sizeBytes === null || row.sizeBytes === undefined ? null : Number(row.sizeBytes),
+    durationSeconds: row.durationSeconds === null || row.durationSeconds === undefined ? null : Number(row.durationSeconds),
+    width: row.width,
+    height: row.height,
+    reason: row.reason,
+    createdAt: row.createdAt,
+    finalizedAt: row.finalizedAt,
+  };
+}
+
+export async function insertRecording(db: Database, input: {
+  id: string;
+  accountId: string;
+  workspaceId: string;
+  sessionId: string;
+  turnId?: string | null;
+  mode: SessionRecordingMode;
+  codec: SessionRecordingCodec;
+  width: number;
+  height: number;
+  reason?: string | null;
+}): Promise<SessionRecordingRow> {
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId }, async (scopedDb) => {
+    const [row] = await scopedDb.insert(schema.sessionRecordings).values({
+      id: input.id,
+      accountId: input.accountId,
+      workspaceId: input.workspaceId,
+      sessionId: input.sessionId,
+      turnId: input.turnId ?? null,
+      state: "recording",
+      mode: input.mode,
+      codec: input.codec,
+      width: input.width,
+      height: input.height,
+      reason: input.reason ?? null,
+    }).returning();
+    return mapRecording(row!);
+  });
+}
+
+export async function updateRecording(db: Database, input: {
+  accountId: string;
+  workspaceId: string;
+  recordingId: string;
+  state: SessionRecordingState;
+  storageKey?: string | null;
+  sizeBytes?: number | null;
+  durationSeconds?: number | null;
+  reason?: string | null;
+  finalized?: boolean;
+}): Promise<SessionRecordingRow | null> {
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId }, async (scopedDb) => {
+    const set: Partial<typeof schema.sessionRecordings.$inferInsert> = { state: input.state };
+    if (input.storageKey !== undefined) set.storageKey = input.storageKey;
+    if (input.sizeBytes !== undefined) set.sizeBytes = input.sizeBytes;
+    if (input.durationSeconds !== undefined) set.durationSeconds = input.durationSeconds;
+    if (input.reason !== undefined) set.reason = input.reason;
+    if (input.finalized || input.state === "available" || input.state === "failed") {
+      set.finalizedAt = new Date();
+    }
+    const [row] = await scopedDb.update(schema.sessionRecordings)
+      .set(set)
+      .where(and(
+        eq(schema.sessionRecordings.workspaceId, input.workspaceId),
+        eq(schema.sessionRecordings.id, input.recordingId),
+      ))
+      .returning();
+    return row ? mapRecording(row) : null;
+  });
+}
+
+export async function getRecording(db: Database, workspaceId: string, recordingId: string): Promise<SessionRecordingRow | null> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [row] = await scopedDb.select().from(schema.sessionRecordings)
+      .where(and(
+        eq(schema.sessionRecordings.workspaceId, workspaceId),
+        eq(schema.sessionRecordings.id, recordingId),
+      ))
+      .limit(1);
+    return row ? mapRecording(row) : null;
+  });
+}
+
+export async function listRecordings(db: Database, workspaceId: string, sessionId: string): Promise<SessionRecordingRow[]> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const rows = await scopedDb.select().from(schema.sessionRecordings)
+      .where(and(
+        eq(schema.sessionRecordings.workspaceId, workspaceId),
+        eq(schema.sessionRecordings.sessionId, sessionId),
+      ))
+      .orderBy(desc(schema.sessionRecordings.createdAt));
+    return rows.map(mapRecording);
+  });
+}
+
+// ============================================================================
+// Channel-A interactive PTY sessions (P4.4) — the ptyId <-> exec-session-id map.
+// The ONLY new persistent state Channel A needs; FS/Git reads persist nothing.
+// ============================================================================
+
+export type SandboxPtySessionRow = {
+  id: string;
+  accountId: string;
+  workspaceId: string;
+  sessionId: string;
+  execSessionId: number | null;
+  leaseEpoch: number;
+  cols: number;
+  rows: number;
+  shell: string;
+  cwd: string;
+  status: "open" | "closed";
+  openedBy: string;
+  lastInputAt: string;
+  createdAt: string;
+  closedAt: string | null;
+};
+
+function mapPtySession(row: typeof schema.sandboxPtySessions.$inferSelect): SandboxPtySessionRow {
+  return {
+    id: row.id,
+    accountId: row.accountId,
+    workspaceId: row.workspaceId,
+    sessionId: row.sessionId,
+    execSessionId: row.execSessionId ?? null,
+    leaseEpoch: row.leaseEpoch,
+    cols: row.cols,
+    rows: row.rows,
+    shell: row.shell,
+    cwd: row.cwd,
+    status: row.status as "open" | "closed",
+    openedBy: row.openedBy,
+    lastInputAt: row.lastInputAt.toISOString(),
+    createdAt: row.createdAt.toISOString(),
+    closedAt: row.closedAt ? row.closedAt.toISOString() : null,
+  };
+}
+
+export async function insertPtySession(db: Database, input: {
+  id: string;
+  accountId: string;
+  workspaceId: string;
+  sessionId: string;
+  execSessionId?: number | null;
+  leaseEpoch: number;
+  cols: number;
+  rows: number;
+  shell: string;
+  cwd: string;
+  openedBy: string;
+}): Promise<SandboxPtySessionRow> {
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId }, async (scopedDb) => {
+    const [row] = await scopedDb.insert(schema.sandboxPtySessions).values({
+      id: input.id,
+      accountId: input.accountId,
+      workspaceId: input.workspaceId,
+      sessionId: input.sessionId,
+      execSessionId: input.execSessionId ?? null,
+      leaseEpoch: input.leaseEpoch,
+      cols: input.cols,
+      rows: input.rows,
+      shell: input.shell,
+      cwd: input.cwd,
+      status: "open",
+      openedBy: input.openedBy,
+    }).returning();
+    return mapPtySession(row!);
+  });
+}
+
+/** Read an OPEN PTY row by ptyId. Returns null when absent or already closed. */
+export async function getOpenPtySession(db: Database, workspaceId: string, ptyId: string): Promise<SandboxPtySessionRow | null> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [row] = await scopedDb.select().from(schema.sandboxPtySessions)
+      .where(and(
+        eq(schema.sandboxPtySessions.workspaceId, workspaceId),
+        eq(schema.sandboxPtySessions.id, ptyId),
+        eq(schema.sandboxPtySessions.status, "open"),
+      ))
+      .limit(1);
+    return row ? mapPtySession(row) : null;
+  });
+}
+
+/** Stamp the SDK exec-session id (known only after the open exec yields a still-
+ *  running process) + refresh the input-activity TTL. */
+export async function updatePtySessionActivity(db: Database, input: {
+  accountId: string;
+  workspaceId: string;
+  ptyId: string;
+  execSessionId?: number | null;
+  cols?: number;
+  rows?: number;
+}): Promise<SandboxPtySessionRow | null> {
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId }, async (scopedDb) => {
+    const set: Partial<typeof schema.sandboxPtySessions.$inferInsert> = { lastInputAt: new Date() };
+    if (input.execSessionId !== undefined) set.execSessionId = input.execSessionId;
+    if (input.cols !== undefined) set.cols = input.cols;
+    if (input.rows !== undefined) set.rows = input.rows;
+    const [row] = await scopedDb.update(schema.sandboxPtySessions)
+      .set(set)
+      .where(and(
+        eq(schema.sandboxPtySessions.workspaceId, input.workspaceId),
+        eq(schema.sandboxPtySessions.id, input.ptyId),
+        eq(schema.sandboxPtySessions.status, "open"),
+      ))
+      .returning();
+    return row ? mapPtySession(row) : null;
+  });
+}
+
+/** Mark a PTY closed (idempotent — a double close on a closed row is a no-op). */
+export async function closePtySession(db: Database, input: {
+  accountId: string;
+  workspaceId: string;
+  ptyId: string;
+}): Promise<SandboxPtySessionRow | null> {
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId }, async (scopedDb) => {
+    const [row] = await scopedDb.update(schema.sandboxPtySessions)
+      .set({ status: "closed", closedAt: new Date() })
+      .where(and(
+        eq(schema.sandboxPtySessions.workspaceId, input.workspaceId),
+        eq(schema.sandboxPtySessions.id, input.ptyId),
+      ))
+      .returning();
+    return row ? mapPtySession(row) : null;
+  });
+}
+
+/** List a session's OPEN PTYs (reattach + reap). */
+export async function listOpenPtySessions(db: Database, workspaceId: string, sessionId: string): Promise<SandboxPtySessionRow[]> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const rows = await scopedDb.select().from(schema.sandboxPtySessions)
+      .where(and(
+        eq(schema.sandboxPtySessions.workspaceId, workspaceId),
+        eq(schema.sandboxPtySessions.sessionId, sessionId),
+        eq(schema.sandboxPtySessions.status, "open"),
+      ))
+      .orderBy(desc(schema.sandboxPtySessions.createdAt));
+    return rows.map(mapPtySession);
+  });
+}
+
+// ============================================================================
+// Sandbox singleton lease — the SOLE enforcer of one-box-per-group (P1.1).
+//
+// Group-keyed (workspace_id, sandbox_group_id) from the start. The sole
+// double-spawn guard is the UNIQUE (workspace_id, sandbox_group_id) index +
+// plain SELECT … FOR UPDATE (block, NOT skip-locked) + the cold->warming CAS
+// inside that row lock. lease_epoch is integer (returns a JS number) but every
+// read is Number()-coerced defensively. Mirrors the claimNextQueuedTurn
+// withWorkspaceRls/withRlsContext -> scopedDb.transaction -> tx.execute(sql<T>``)
+// pattern (the row type goes on the sql tag, not on .execute).
+// ============================================================================
+
+export type SandboxLeaseLiveness = "cold" | "warming" | "warm" | "draining";
+export type LeaseHolderKind = "turn" | "viewer";
+
+// The snake_case raw shape returned by the raw sql`` lease queries. lease_epoch
+// comes back as a number for an integer column, but we type it number|string
+// and Number()-coerce so the same code is correct regardless of column type.
+// Typed with an index signature so it satisfies db.execute<TRow extends
+// Record<string, unknown>>.
+type LeaseRow = {
+  id: string;
+  account_id: string;
+  workspace_id: string;
+  sandbox_group_id: string;
+  liveness: SandboxLeaseLiveness;
+  refcount: number;
+  turn_holders: number;
+  viewer_holders: number;
+  instance_id: string | null;
+  backend: string;
+  os: string;
+  data_plane_url: string | null;
+  terminal_data_plane_url: string | null;
+  lease_epoch: number | string;
+  resume_backend_id: string | null;
+  resume_state: Record<string, unknown> | null;
+  last_meter_at: Date | string | null;
+  last_meter_tick: number;
+  expires_at: Date | string;
+} & Record<string, unknown>;
+
+export interface LeaseSnapshot {
+  id: string;
+  sandboxGroupId: string;
+  liveness: SandboxLeaseLiveness;
+  refcount: number;
+  turnHolders: number;
+  viewerHolders: number;
+  instanceId: string | null;
+  backend: string;
+  os: string;
+  dataPlaneUrl: string | null;
+  // The cached ttyd pty-ws tunnel URL (7681), separate from dataPlaneUrl (the
+  // 6080 desktop tunnel). Null until mintTerminalStream resolves + records it.
+  terminalDataPlaneUrl: string | null;
+  leaseEpoch: number;
+  resumeBackendId: string | null;
+  resumeState: Record<string, unknown> | null;
+  expiresAt: Date;
+}
+
+export interface AcquireLeaseInput {
+  accountId: string;
+  workspaceId: string;
+  // The group's identity (sessions.sandbox_group_id; == session id for a
+  // singleton group). The lease is per-group, not per-session.
+  sandboxGroupId: string;
+  kind: LeaseHolderKind;
+  holderId: string;            // session_turns.id (turn) | viewer connection id (viewer)
+  subjectId?: string | null;   // the attributing session within the group
+  backend: string;             // sessions.sandbox_backend
+  os?: string;                 // default 'linux'
+  leaseTtlMs: number;          // refresh window for expires_at (turn-heartbeat cadence)
+  // Optional epoch fence for a re-establishing turn holder: when set, the
+  // turn-arrival increment is gated on lease_epoch == expectedEpoch (split-brain).
+  expectedEpoch?: number;
+}
+
+export type AcquireLeaseResult =
+  // Caller WON the cold->warming CAS: it is the spawner (any pool worker). Must
+  // resume-by-id from resume_state, expose the stream port, then call
+  // commitWarmingToWarm. No owner process is started.
+  | { role: "spawner"; lease: LeaseSnapshot }
+  // Box live or being built by someone else: attach (and, for warming, wait).
+  | { role: "attached"; lease: LeaseSnapshot }
+  // Re-armed a draining lease back to warm (box never torn down).
+  | { role: "rearmed"; lease: LeaseSnapshot }
+  // Epoch fence rejected the turn-arrival increment: a newer epoch exists (a
+  // later turn re-established the box). Caller must back off and re-read; NEVER
+  // create().
+  | { role: "fenced"; lease: LeaseSnapshot };
+
+// Thrown by callers that treat a fenced/superseded epoch as an error path.
+export class SandboxLeaseSupersededError extends Error {
+  constructor(public readonly sandboxGroupId: string, public readonly leaseEpoch: number) {
+    super(`Sandbox lease superseded for group ${sandboxGroupId} (epoch ${leaseEpoch})`);
+    this.name = "SandboxLeaseSupersededError";
+  }
+}
+
+function mapLeaseRow(row: LeaseRow): LeaseSnapshot {
+  return {
+    id: row.id,
+    sandboxGroupId: row.sandbox_group_id,
+    liveness: row.liveness,
+    refcount: Number(row.refcount),
+    turnHolders: Number(row.turn_holders),
+    viewerHolders: Number(row.viewer_holders),
+    instanceId: row.instance_id,
+    backend: row.backend,
+    os: row.os,
+    dataPlaneUrl: row.data_plane_url,
+    terminalDataPlaneUrl: row.terminal_data_plane_url ?? null,
+    // Defensive coercion: integer returns a number, but coerce regardless so the
+    // fence comparison stays exact even if the column type ever drifts to int8.
+    leaseEpoch: Number(row.lease_epoch),
+    resumeBackendId: row.resume_backend_id,
+    resumeState: row.resume_state,
+    expiresAt: row.expires_at instanceof Date ? row.expires_at : new Date(row.expires_at),
+  };
+}
+
+// Recompute refcount/split-counts from the holder rows (holders are the source
+// of truth), refresh expires_at, optionally set liveness. Returns the updated row.
+async function recomputeAndStampLease(
+  tx: Database,
+  leaseId: string,
+  leaseTtlMs: number,
+  setLiveness: SandboxLeaseLiveness | null,
+): Promise<LeaseRow> {
+  const counts = await tx.execute<{ total: number; turns: number; viewers: number }>(sql`
+    select count(*)::int as total,
+           count(*) filter (where kind = 'turn')::int   as turns,
+           count(*) filter (where kind = 'viewer')::int as viewers
+    from sandbox_lease_holders where lease_id = ${leaseId}
+  `);
+  const c = counts[0]!;
+  const updated = await tx.execute<LeaseRow>(sql`
+    update sandbox_leases set
+      refcount       = ${c.total},
+      turn_holders   = ${c.turns},
+      viewer_holders = ${c.viewers},
+      expires_at     = now() + (${String(leaseTtlMs)} || ' milliseconds')::interval,
+      ${setLiveness ? sql`liveness = ${setLiveness},` : sql``}
+      updated_at     = now()
+    where id = ${leaseId}
+    returning *
+  `);
+  return updated[0]!;
+}
+
+// Idempotent acquire: the unique (lease, kind, holder) index makes a retried or
+// duplicate acquire a no-op heartbeat refresh, never a double-count.
+async function upsertLeaseHolder(
+  tx: Database, leaseId: string, accountId: string, workspaceId: string,
+  kind: LeaseHolderKind, holderId: string, subjectId: string | null,
+): Promise<void> {
+  await tx.execute(sql`
+    insert into sandbox_lease_holders
+      (account_id, workspace_id, lease_id, kind, holder_id, subject_id, last_heartbeat_at)
+    values (${accountId}, ${workspaceId}, ${leaseId}, ${kind}, ${holderId}, ${subjectId}, now())
+    on conflict (lease_id, kind, holder_id)
+      do update set last_heartbeat_at = now()
+  `);
+}
+
+// §4.1 — the get-or-create critical section. ONE transaction:
+// insert-or-nothing -> SELECT … FOR UPDATE (block, not skip) -> branch -> bump.
+// The single most load-bearing function: the sole double-spawn guard.
+export async function acquireLease(db: Database, input: AcquireLeaseInput): Promise<AcquireLeaseResult> {
+  const { accountId, workspaceId, sandboxGroupId, kind, holderId, backend } = input;
+  const os = input.os ?? "linux";
+  const subjectId = input.subjectId ?? null;
+  return await withRlsContext(db, { accountId, workspaceId }, async (scopedDb) =>
+    await scopedDb.transaction(async (txRaw) => {
+      const tx = txRaw as unknown as Database;
+      // (1) Materialize the singleton row if absent. ON CONFLICT DO NOTHING + the
+      // unique index = idempotent under a race; concurrent inserts collapse to
+      // one row. expires_at seeded so a never-warmed cold row has a valid TTL.
+      await tx.execute(sql`
+        insert into sandbox_leases
+          (account_id, workspace_id, sandbox_group_id, liveness, backend, os, expires_at)
+        values
+          (${accountId}, ${workspaceId}, ${sandboxGroupId}, 'cold', ${backend}, ${os},
+           now() + (${String(input.leaseTtlMs)} || ' milliseconds')::interval)
+        on conflict (workspace_id, sandbox_group_id) do nothing
+      `);
+
+      // (2) Serialize ALL concurrent arrivals on this group's row. Plain FOR
+      // UPDATE (block, do NOT skip) — unlike claimNextQueuedTurn's SKIP LOCKED,
+      // because we WANT the loser to block then attach, not skip and lose.
+      const rows = await tx.execute<LeaseRow>(sql`
+        select * from sandbox_leases
+        where workspace_id = ${workspaceId} and sandbox_group_id = ${sandboxGroupId}
+        for update
+      `);
+      const row = rows[0];
+      if (!row) throw new Error(`Lease row vanished post-insert: ${sandboxGroupId}`);
+
+      const liveness = row.liveness;
+
+      // -- draining: late arrival re-arms (D1). Box still alive (grace open).
+      if (liveness === "draining") {
+        await upsertLeaseHolder(tx, row.id, accountId, workspaceId, kind, holderId, subjectId);
+        const updated = await recomputeAndStampLease(tx, row.id, input.leaseTtlMs, "warm");
+        return { role: "rearmed" as const, lease: mapLeaseRow(updated) };
+      }
+
+      // -- cold: WIN the cold->warming CAS (C1). Exactly one winner under the
+      // held row lock; concurrent arrivals serialize behind us and see warming.
+      if (liveness === "cold") {
+        const casRows = await tx.execute<{ id: string }>(sql`
+          update sandbox_leases set liveness = 'warming', updated_at = now()
+          where id = ${row.id} and liveness = 'cold'
+          returning id
+        `);
+        await upsertLeaseHolder(tx, row.id, accountId, workspaceId, kind, holderId, subjectId);
+        const updated = await recomputeAndStampLease(tx, row.id, input.leaseTtlMs, null);
+        // casRows.length === 0 cannot happen under the held row lock (defensive):
+        // a lost CAS means a sibling flipped it first, so we attach.
+        const role = casRows.length === 0 ? "attached" as const : "spawner" as const;
+        return { role, lease: mapLeaseRow(updated) };
+      }
+
+      // -- warm: epoch fence for re-establishing turn holders (split-brain). A
+      // turn arriving with expectedEpoch must match the live row epoch; a stale
+      // re-dispatched turn is fenced out -> back off, NEVER create(). Number()-
+      // coerced so an int8 drift cannot make the compare always-true.
+      if (liveness === "warm" && kind === "turn" && input.expectedEpoch !== undefined
+          && Number(row.lease_epoch) !== input.expectedEpoch) {
+        return { role: "fenced" as const, lease: mapLeaseRow(row) };
+      }
+
+      // -- warm / warming: attach (A2 / A1). refcount++ ONLY; never touch
+      // liveness. The spawner exclusively owns warming->warm.
+      await upsertLeaseHolder(tx, row.id, accountId, workspaceId, kind, holderId, subjectId);
+      const updated = await recomputeAndStampLease(tx, row.id, input.leaseTtlMs, null);
+      return { role: "attached" as const, lease: mapLeaseRow(updated) };
+    }),
+  );
+}
+
+// §4.2 — the ONLY lease_epoch++ site. CAS on (warming AND lease_epoch=expected).
+// Folds the group box-envelope (resume_backend_id/resume_state) onto the lease.
+export async function commitWarmingToWarm(db: Database, input: {
+  accountId: string; workspaceId: string; sandboxGroupId: string;
+  expectedEpoch: number;          // the epoch the spawner observed at cold->warming
+  instanceId: string;
+  dataPlaneUrl?: string | null;   // event-driven resolveExposedPort result, any worker
+  resumeBackendId?: string | null;
+  resumeState?: Record<string, unknown> | null;
+  leaseTtlMs: number;
+}): Promise<{ committed: boolean; lease: LeaseSnapshot | null }> {
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId },
+    async (scopedDb) => {
+      // resume_state is jsonb: the raw postgres driver does NOT auto-stringify a
+      // plain object bound for a jsonb column, so serialize to a JSON string and
+      // cast ::jsonb (null stays a real SQL null). Binding the object directly
+      // throws "string argument must be of type string" on the wire.
+      const resumeStateJson = input.resumeState == null ? null : JSON.stringify(input.resumeState);
+      const rows = await scopedDb.execute<LeaseRow>(sql`
+        update sandbox_leases set
+          liveness          = 'warm',
+          instance_id       = ${input.instanceId},
+          data_plane_url    = ${input.dataPlaneUrl ?? null},
+          -- A box re-key (epoch++) invalidates the prior epoch's ttyd tunnel; the
+          -- terminal URL is re-resolved + re-recorded lazily by mintTerminalStream
+          -- on the next attach. Clear it here so a stale URL never survives a roll.
+          terminal_data_plane_url = null,
+          resume_backend_id = ${input.resumeBackendId ?? null},
+          resume_state      = ${resumeStateJson}::jsonb,
+          lease_epoch       = lease_epoch + 1,
+          expires_at        = now() + (${String(input.leaseTtlMs)} || ' milliseconds')::interval,
+          updated_at        = now()
+        where workspace_id = ${input.workspaceId} and sandbox_group_id = ${input.sandboxGroupId}
+          and liveness = 'warming' and lease_epoch = ${input.expectedEpoch}
+        returning *
+      `);
+      // CAS miss = a reaper already reset this warming row to cold (the spawner
+      // was too slow), or another spawner re-established and bumped the epoch.
+      // The spawner MUST drop its in-memory handle and re-acquire — NEVER force
+      // warm, NEVER provider-delete the box (it rides the provider idle-timeout).
+      if (rows.length === 0) return { committed: false, lease: null };
+      return { committed: true, lease: mapLeaseRow(rows[0]!) };
+    });
+}
+
+// §4.3 — caught spawn failure: warming -> cold (W3). Holders are intentionally
+// left intact — the arrival that triggered the spawn still wants a box, so the
+// next acquireLease re-CAS cold->warming.
+export async function failWarmingToCold(db: Database, input: {
+  accountId: string; workspaceId: string; sandboxGroupId: string; expectedEpoch: number;
+}): Promise<void> {
+  await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId },
+    async (scopedDb) => {
+      await scopedDb.execute(sql`
+        update sandbox_leases set
+          liveness = 'cold', instance_id = null,
+          resume_backend_id = null, resume_state = null,
+          data_plane_url = null, terminal_data_plane_url = null, updated_at = now()
+        where workspace_id = ${input.workspaceId} and sandbox_group_id = ${input.sandboxGroupId}
+          and liveness = 'warming' and lease_epoch = ${input.expectedEpoch}
+      `);
+    });
+}
+
+// §4.4 — idempotent delete-my-row (+ opportunistic warm->draining guarded
+// refcount=0 AND turn_holders=0, so a paying turn is never drained).
+export async function releaseLeaseHolder(db: Database, input: {
+  accountId: string; workspaceId: string; sandboxGroupId: string;
+  kind: LeaseHolderKind; holderId: string; idleGraceMs: number;
+}): Promise<{ liveness: SandboxLeaseLiveness; refcount: number } | null> {
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId },
+    async (scopedDb) => await scopedDb.transaction(async (txRaw) => {
+      const tx = txRaw as unknown as Database;
+      const rows = await tx.execute<LeaseRow>(sql`
+        select * from sandbox_leases
+        where workspace_id = ${input.workspaceId} and sandbox_group_id = ${input.sandboxGroupId}
+        for update
+      `);
+      const row = rows[0];
+      if (!row) return null;  // already cold-and-reaped; release is an idempotent no-op
+
+      // Idempotent: deleting an already-gone holder affects 0 rows, fine.
+      await tx.execute(sql`
+        delete from sandbox_lease_holders
+        where lease_id = ${row.id} and kind = ${input.kind} and holder_id = ${input.holderId}
+      `);
+
+      const counts = await tx.execute<{ total: number; turns: number; viewers: number }>(sql`
+        select count(*)::int as total,
+               count(*) filter (where kind = 'turn')::int   as turns,
+               count(*) filter (where kind = 'viewer')::int as viewers
+        from sandbox_lease_holders where lease_id = ${row.id}
+      `);
+      const c = counts[0]!;
+
+      // warm + dropped to 0 (AND no turn holders) -> draining, stamp grace deadline.
+      // Release during warming decrements only, NEVER touches liveness (the
+      // spawner owns warming->warm and re-checks refcount after committing).
+      const enterDraining = row.liveness === "warm" && c.total === 0 && c.turns === 0;
+      const updated = await tx.execute<LeaseRow>(sql`
+        update sandbox_leases set
+          refcount = ${c.total}, turn_holders = ${c.turns}, viewer_holders = ${c.viewers},
+          ${enterDraining
+            ? sql`liveness = 'draining', expires_at = now() + (${String(input.idleGraceMs)} || ' milliseconds')::interval,`
+            : sql``}
+          updated_at = now()
+        where id = ${row.id}
+        returning *
+      `);
+      return { liveness: updated[0]!.liveness, refcount: Number(c.total) };
+    }));
+}
+
+// §4.5 — heartbeat. EPOCH-FENCED (the C1b fix — the real split-brain bug, on the
+// HEARTBEAT path): a stale (superseded) owner's lease refresh is rejected so it
+// self-evicts. Also liveness-guarded to warm/warming (C2) so a heartbeat can't
+// wedge a draining lease forever by pushing its grace deadline.
+export async function heartbeatLeaseHolder(db: Database, input: {
+  accountId: string; workspaceId: string; sandboxGroupId: string;
+  kind: LeaseHolderKind; holderId: string; leaseTtlMs: number; expectedEpoch: number;
+}): Promise<boolean> {
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId },
+    async (scopedDb) => await scopedDb.transaction(async (txRaw) => {
+      const tx = txRaw as unknown as Database;
+      const updated = await tx.execute<{ id: string }>(sql`
+        update sandbox_lease_holders set last_heartbeat_at = now()
+        where lease_id = (select id from sandbox_leases
+                          where workspace_id = ${input.workspaceId} and sandbox_group_id = ${input.sandboxGroupId})
+          and kind = ${input.kind} and holder_id = ${input.holderId}
+        returning id
+      `);
+      if (updated.length === 0) return false;   // holder was reaped — caller re-acquires
+      // Epoch-fenced, liveness-guarded lease TTL refresh: only a live-epoch
+      // warm/warming lease is refreshed. A stale-epoch (split-brain) or draining
+      // lease returns 0 rows -> false -> the stale holder drops its handle.
+      const leaseRows = await tx.execute<{ id: string }>(sql`
+        update sandbox_leases set
+          expires_at = now() + (${String(input.leaseTtlMs)} || ' milliseconds')::interval,
+          updated_at = now()
+        where workspace_id = ${input.workspaceId} and sandbox_group_id = ${input.sandboxGroupId}
+          and lease_epoch = ${input.expectedEpoch}
+          and liveness in ('warm','warming')
+        returning id
+      `);
+      return leaseRows.length > 0;
+    }));
+}
+
+// §4.6 — the reaper. DB-SIDE ONLY (no provider call — the provider stop() is
+// P1.3's runtime concern). Three actions in one pass: TTL-reap stale viewer
+// holders, recompute refcounts + warm->draining, reset warming-death to cold;
+// returns the drainable (workspaceId, sandboxGroupId) rows the caller terminates.
+//
+// This is the PER-WORKSPACE entry point (RLS-scoped). The cross-workspace global
+// sweep is the SECURITY-DEFINER opengeni_private.reap_sandbox_leases() fn —
+// reapStaleLeaseHoldersGlobal below.
+export interface ReapDrainable {
+  workspaceId: string;
+  sandboxGroupId: string;
+  instanceId: string | null;
+  leaseEpoch: number;
+}
+
+export async function reapStaleLeaseHolders(db: Database, input: {
+  workspaceId: string;
+  viewerHolderTtlMs: number;   // delete viewer rows older than this
+  idleGraceMs: number;         // drain-grace horizon (matches releaseLeaseHolder)
+}): Promise<{ reapedViewers: number; warmingReset: number; drained: ReapDrainable[] }> {
+  return await withWorkspaceRls(db, input.workspaceId, async (scopedDb) =>
+    await scopedDb.transaction(async (txRaw) => {
+      const tx = txRaw as unknown as Database;
+      // (a) Reap stale VIEWER holders (turn holders are TTL-exempt — never reaped).
+      const reaped = await tx.execute<{ lease_id: string }>(sql`
+        delete from sandbox_lease_holders
+        where workspace_id = ${input.workspaceId} and kind = 'viewer'
+          and last_heartbeat_at < now() - (${String(input.viewerHolderTtlMs)} || ' milliseconds')::interval
+        returning lease_id
+      `);
+
+      // (b) Recompute refcounts for every lease in the workspace; warm leases
+      // that hit 0 (AND turn_holders=0) enter draining with a fresh grace
+      // deadline (idleGraceMs — the SAME horizon releaseLeaseHolder stamps).
+      await tx.execute(sql`
+        update sandbox_leases L set
+          refcount       = c.total,
+          turn_holders   = c.turns,
+          viewer_holders = c.viewers,
+          liveness = case when L.liveness = 'warm' and c.total = 0 and c.turns = 0
+                          then 'draining' else L.liveness end,
+          expires_at = case when L.liveness = 'warm' and c.total = 0 and c.turns = 0
+                          then now() + (${String(input.idleGraceMs)} || ' milliseconds')::interval
+                          else L.expires_at end,
+          updated_at = now()
+        from (
+          select L2.id,
+                 (select count(*) from sandbox_lease_holders h where h.lease_id = L2.id)::int                       as total,
+                 (select count(*) from sandbox_lease_holders h where h.lease_id = L2.id and h.kind = 'turn')::int   as turns,
+                 (select count(*) from sandbox_lease_holders h where h.lease_id = L2.id and h.kind = 'viewer')::int as viewers
+          from sandbox_leases L2 where L2.workspace_id = ${input.workspaceId}
+        ) c
+        where L.id = c.id and L.workspace_id = ${input.workspaceId}
+      `);
+
+      // (c) WARMING-death: a 'warming' row whose LEASE TTL lapsed = an uncaught
+      // spawner death. Reset to cold so a queued turn can re-acquire and re-spawn.
+      const warmingReset = await tx.execute<{ id: string }>(sql`
+        update sandbox_leases set
+          liveness = 'cold', instance_id = null,
+          resume_backend_id = null, resume_state = null,
+          data_plane_url = null, terminal_data_plane_url = null, updated_at = now()
+        where workspace_id = ${input.workspaceId}
+          and liveness = 'warming' and expires_at < now()
+        returning id
+      `);
+
+      // (d) DRAINING-grace elapsed: surface leases whose grace is up AND still
+      // idle, with instance_id + epoch, so the caller can issue the provider
+      // stop() then confirmDrainCold. DB-only: no provider call here.
+      const drainable = await tx.execute<{ sandbox_group_id: string; instance_id: string | null; lease_epoch: number | string }>(sql`
+        select sandbox_group_id, instance_id, lease_epoch from sandbox_leases
+        where workspace_id = ${input.workspaceId}
+          and liveness = 'draining' and expires_at < now() and refcount = 0
+      `);
+
+      return {
+        reapedViewers: reaped.length,
+        warmingReset: warmingReset.length,
+        drained: drainable.map((r) => ({
+          workspaceId: input.workspaceId,
+          sandboxGroupId: r.sandbox_group_id,
+          instanceId: r.instance_id,
+          leaseEpoch: Number(r.lease_epoch),
+        })),
+      };
+    }));
+}
+
+// §4.6 (global) — the cross-workspace reaper sweep (OD-3). Calls the
+// SECURITY-DEFINER opengeni_private.reap_sandbox_leases() fn so the global
+// reaper Temporal Schedule (P1.3) sees stale rows across ALL workspaces in ONE
+// pass, bypassing per-workspace FORCE RLS. DB-only — returns the drainable rows;
+// the provider stop() is the caller's concern. No RLS GUC is set (the DEFINER fn
+// is the sanctioned cross-workspace read).
+export async function reapStaleLeaseHoldersGlobal(db: Database, input: {
+  viewerHolderTtlMs: number;
+  idleGraceMs: number;
+}): Promise<ReapDrainable[]> {
+  const rows = await db.execute<{ workspace_id: string; sandbox_group_id: string; instance_id: string | null; lease_epoch: number | string }>(sql`
+    select workspace_id, sandbox_group_id, instance_id, lease_epoch
+    from opengeni_private.reap_sandbox_leases(${input.viewerHolderTtlMs}, ${input.idleGraceMs})
+  `);
+  return rows.map((r) => ({
+    workspaceId: r.workspace_id,
+    sandboxGroupId: r.sandbox_group_id,
+    instanceId: r.instance_id,
+    leaseEpoch: Number(r.lease_epoch),
+  }));
+}
+
+// §2.2 (global) — the warm-meter read for the REAPER tick (P2.1). Returns one row
+// per WARM viewer-only group (turn-held boxes are metered by the turn heartbeat,
+// so they are EXCLUDED here — no double-meter). Cross-workspace via the
+// SECURITY-DEFINER list fn (FORCE RLS would hide other workspaces from the scoped
+// connection). DB-only read; the worker accrues per row via accrueWarmSeconds.
+export interface MeterableWarmLease {
+  accountId: string;
+  workspaceId: string;
+  sandboxGroupId: string;
+  leaseEpoch: number;
+  backend: string;
+}
+
+export async function listMeterableWarmLeases(db: Database): Promise<MeterableWarmLease[]> {
+  const rows = await db.execute<{ account_id: string; workspace_id: string; sandbox_group_id: string; lease_epoch: number | string; backend: string }>(sql`
+    select account_id, workspace_id, sandbox_group_id, lease_epoch, backend
+    from opengeni_private.list_meterable_warm_leases()
+  `);
+  return rows.map((r) => ({
+    accountId: r.account_id,
+    workspaceId: r.workspace_id,
+    sandboxGroupId: r.sandbox_group_id,
+    leaseEpoch: Number(r.lease_epoch),
+    backend: r.backend,
+  }));
+}
+
+// §4.7 — explicit re-arm seam (D1). acquireLease already re-arms a draining
+// lease inline; this is the standalone version for callers that learn a holder
+// is wanted during the grace window without going through acquireLease first.
+export async function reArmDrainingLease(db: Database, input: {
+  accountId: string; workspaceId: string; sandboxGroupId: string; leaseTtlMs: number;
+}): Promise<{ rearmed: boolean }> {
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId },
+    async (scopedDb) => {
+      const rows = await scopedDb.execute<{ id: string }>(sql`
+        update sandbox_leases set
+          liveness = 'warm',
+          expires_at = now() + (${String(input.leaseTtlMs)} || ' milliseconds')::interval,
+          updated_at = now()
+        where workspace_id = ${input.workspaceId} and sandbox_group_id = ${input.sandboxGroupId}
+          and liveness = 'draining'
+        returning id
+      `);
+      return { rearmed: rows.length > 0 };
+    });
+}
+
+// §4.8 — the reaper's final teardown commit (D3). Called AFTER the caller issued
+// the provider stop() on instance_id. CAS-guarded (draining AND refcount=0 AND
+// lease_epoch=expected) so a late re-arm (D1) or a newer epoch that snuck in
+// during teardown wins — wentCold:false means the box is still wanted and must
+// NOT have been stopped (the caller checks this CAS before stop(), or re-reads).
+export async function confirmDrainCold(db: Database, input: {
+  accountId: string; workspaceId: string; sandboxGroupId: string; expectedEpoch: number;
+}): Promise<{ wentCold: boolean }> {
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId },
+    async (scopedDb) => {
+      const rows = await scopedDb.execute<{ id: string }>(sql`
+        update sandbox_leases set
+          liveness = 'cold', instance_id = null,
+          resume_backend_id = null, resume_state = null,
+          data_plane_url = null, terminal_data_plane_url = null, updated_at = now()
+        where workspace_id = ${input.workspaceId} and sandbox_group_id = ${input.sandboxGroupId}
+          and liveness = 'draining' and refcount = 0 and lease_epoch = ${input.expectedEpoch}
+        returning id
+      `);
+      return { wentCold: rows.length > 0 };
+    });
+}
+
+// §4.9 — non-locking snapshot for the API handshake & health.
+export async function readLease(db: Database, workspaceId: string, sandboxGroupId: string): Promise<LeaseSnapshot | null> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const rows = await scopedDb.execute<LeaseRow>(sql`
+      select * from sandbox_leases
+      where workspace_id = ${workspaceId} and sandbox_group_id = ${sandboxGroupId}
+      limit 1
+    `);
+    return rows[0] ? mapLeaseRow(rows[0]) : null;
+  });
+}
+
+// P4.2 — record the (re-)resolved desktop data-plane URL on an ALREADY-WARM
+// lease, EPOCH-FENCED. commitWarmingToWarm records the URL at cold→warming→warm
+// (the spawn path); this is the WARM-path counterpart used when a viewer mints
+// the URL against a box that some other holder already brought up, and on
+// rollover-rotation (re-resolve under the current epoch). The fence is the
+// split-brain guard: a stale-epoch writer (a box re-established under a newer
+// epoch) updates ZERO rows and the caller backs off. Returns the updated
+// snapshot, or null on a fence miss (epoch advanced / lease vanished).
+export async function recordLeaseDataPlaneUrl(db: Database, input: {
+  accountId: string;
+  workspaceId: string;
+  sandboxGroupId: string;
+  expectedEpoch: number;
+  dataPlaneUrl: string | null;
+}): Promise<LeaseSnapshot | null> {
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId },
+    async (scopedDb) => {
+      const rows = await scopedDb.execute<LeaseRow>(sql`
+        update sandbox_leases set
+          data_plane_url = ${input.dataPlaneUrl ?? null},
+          updated_at     = now()
+        where workspace_id = ${input.workspaceId} and sandbox_group_id = ${input.sandboxGroupId}
+          and lease_epoch = ${input.expectedEpoch}
+          and liveness in ('warm', 'draining')
+        returning *
+      `);
+      return rows[0] ? mapLeaseRow(rows[0]) : null;
+    });
+}
+
+// P5.t — record the (re-)resolved ttyd terminal data-plane URL (7681) on an
+// ALREADY-WARM lease, EPOCH-FENCED. The exact terminal twin of
+// recordLeaseDataPlaneUrl: the REAL PTY rides a SEPARATE provider tunnel from the
+// desktop noVNC, so its URL is cached in its own column. mintTerminalStream calls
+// this after resolving the 7681 tunnel; the fast-path then re-mints only a fresh
+// token against the cached URL. The fence is the split-brain guard (a stale-epoch
+// writer updates ZERO rows). Returns the updated snapshot, or null on a fence
+// miss (epoch advanced / lease vanished).
+export async function recordLeaseTerminalDataPlaneUrl(db: Database, input: {
+  accountId: string;
+  workspaceId: string;
+  sandboxGroupId: string;
+  expectedEpoch: number;
+  terminalDataPlaneUrl: string | null;
+}): Promise<LeaseSnapshot | null> {
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId },
+    async (scopedDb) => {
+      const rows = await scopedDb.execute<LeaseRow>(sql`
+        update sandbox_leases set
+          terminal_data_plane_url = ${input.terminalDataPlaneUrl ?? null},
+          updated_at              = now()
+        where workspace_id = ${input.workspaceId} and sandbox_group_id = ${input.sandboxGroupId}
+          and lease_epoch = ${input.expectedEpoch}
+          and liveness in ('warm', 'draining')
+        returning *
+      `);
+      return rows[0] ? mapLeaseRow(rows[0]) : null;
+    });
+}
+
+// ============================================================================
+// P3.2 — the un-redacted-pixel consent gate + viewer revocation.
+//
+// The desktop-stream path is gated behind an explicit acknowledgment that the
+// pixel plane is un-redacted (it can show cloud creds the agent cat's into a
+// terminal — strictly broader than the redacted Channel-A event log). For a
+// SHARED box (the group has >1 session) the principal must additionally consent
+// to the shared-exposure disclosure: watching A's desktop also shows B's agent
+// on the one :0 framebuffer (addendum E.1 / stress g). Consent is per-PRINCIPAL
+// and per-GROUP (one :0 per group), recorded in session_stream_acknowledgments
+// (0019). Reuses the acknowledgment machinery — no new permission beyond
+// stream:acknowledge.
+// ============================================================================
+
+export interface StreamAcknowledgment {
+  acknowledgedUnredacted: boolean;
+  acknowledgedShared: boolean;
+}
+
+// Record (or upsert) a principal's acknowledgment of the group's un-redacted
+// pixel plane (and, when shared, the shared-exposure disclosure). Keyed on
+// (workspace, group, subject); a re-ack (e.g. a solo→shared upgrade adding the
+// shared consent) is ON CONFLICT DO UPDATE, never a duplicate row.
+export async function recordStreamAcknowledgment(db: Database, input: {
+  accountId: string;
+  workspaceId: string;
+  sandboxGroupId: string;
+  subjectId: string;
+  acknowledgeUnredacted: boolean;
+  acknowledgeShared: boolean;
+}): Promise<StreamAcknowledgment> {
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId },
+    async (scopedDb) => {
+      const rows = await scopedDb.execute<{ acknowledged_unredacted: boolean; acknowledged_shared: boolean }>(sql`
+        insert into session_stream_acknowledgments
+          (account_id, workspace_id, sandbox_group_id, subject_id,
+           acknowledged_unredacted, acknowledged_shared, acknowledged_at, updated_at)
+        values
+          (${input.accountId}, ${input.workspaceId}, ${input.sandboxGroupId}, ${input.subjectId},
+           ${input.acknowledgeUnredacted}, ${input.acknowledgeShared}, now(), now())
+        on conflict (workspace_id, sandbox_group_id, subject_id) do update set
+          -- Acknowledgment is monotonic: a later ack can ADD the shared consent
+          -- but never silently withdraw a prior one (OR the bits in).
+          acknowledged_unredacted = session_stream_acknowledgments.acknowledged_unredacted or excluded.acknowledged_unredacted,
+          acknowledged_shared     = session_stream_acknowledgments.acknowledged_shared     or excluded.acknowledged_shared,
+          acknowledged_at         = now(),
+          updated_at              = now()
+        returning acknowledged_unredacted, acknowledged_shared
+      `);
+      const row = rows[0]!;
+      return { acknowledgedUnredacted: row.acknowledged_unredacted, acknowledgedShared: row.acknowledged_shared };
+    });
+}
+
+// Read a principal's recorded acknowledgment for a group, or null if they have
+// never acknowledged the un-redacted pixel plane. The negotiation read + the
+// desktop-stream gate both consult this.
+export async function getStreamAcknowledgment(db: Database, input: {
+  workspaceId: string;
+  sandboxGroupId: string;
+  subjectId: string;
+}): Promise<StreamAcknowledgment | null> {
+  return await withWorkspaceRls(db, input.workspaceId, async (scopedDb) => {
+    const rows = await scopedDb.execute<{ acknowledged_unredacted: boolean; acknowledged_shared: boolean }>(sql`
+      select acknowledged_unredacted, acknowledged_shared
+      from session_stream_acknowledgments
+      where workspace_id = ${input.workspaceId}
+        and sandbox_group_id = ${input.sandboxGroupId}
+        and subject_id = ${input.subjectId}
+      limit 1
+    `);
+    if (!rows[0]) return null;
+    return { acknowledgedUnredacted: rows[0].acknowledged_unredacted, acknowledgedShared: rows[0].acknowledged_shared };
+  });
+}
+
+// Enumerate the session ids in a group (workspace-scoped). The shared-exposure
+// disclosure surfaces the OTHER sessions' ids ONLY — never their goal/metadata/
+// conversation. The query selects ONLY the id column (id is the disclosure
+// boundary; stress g). RLS-scoped: a foreign-workspace group returns no rows.
+export async function listSessionIdsInGroup(db: Database, workspaceId: string, sandboxGroupId: string): Promise<string[]> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const rows = await scopedDb.execute<{ id: string }>(sql`
+      select id from sessions
+      where workspace_id = ${workspaceId} and sandbox_group_id = ${sandboxGroupId}
+      order by created_at asc
+    `);
+    return rows.map((r) => r.id);
+  });
+}
+
+// OD-6 v1 — revoke a viewer: DROP that viewer's holder from the GROUP lease so
+// refcount recomputes (the box drains iff nothing else holds it — a turn-held or
+// other-viewer-held box survives), AND block its reconnect by recording the
+// revoked subject so a re-attach with the same viewerId is refused. The
+// live-RFB force-disconnect of an already-open socket is a P4 follow-up; the
+// holder-drop (so the box can drain) is here.
+//
+// Returns the post-drop lease liveness/refcount (null if the lease was already
+// cold-and-reaped — a revoke is then an idempotent no-op). A revoked viewer who
+// independently holds a holder on a SIBLING session may still watch via that
+// session (correct — authorized there); this drops ONLY the named viewerId's
+// holder.
+export async function revokeViewer(db: Database, input: {
+  accountId: string;
+  workspaceId: string;
+  sandboxGroupId: string;
+  viewerId: string;
+  idleGraceMs: number;
+}): Promise<{ liveness: SandboxLeaseLiveness; refcount: number } | null> {
+  // The drop is exactly releaseLeaseHolder's idempotent delete-my-row +
+  // recompute (refcount recomputes; warm→draining is guarded refcount=0 AND
+  // turn_holders=0, so a turn-held box never drains on a viewer revoke). The
+  // reconnect-block is a P4 concern (the holder-drop is the v1 deliverable —
+  // the box can now drain); a re-attach mints a fresh viewerId regardless.
+  return await releaseLeaseHolder(db, {
+    accountId: input.accountId,
+    workspaceId: input.workspaceId,
+    sandboxGroupId: input.sandboxGroupId,
+    kind: "viewer",
+    holderId: input.viewerId,
+    idleGraceMs: input.idleGraceMs,
+  });
+}
+
+// ============================================================================
+// Warm-time metering (P2.1) — the COST hole the lease design opens.
+//
+// A box held warm by a viewer with no agent turn running emits ZERO model usage
+// today; the provider bills by wall-clock and OpenGeni meters nothing. Warm-time
+// accrues on TWO stateless ticks: (a) the turn's existing activity heartbeat
+// (while a turn runs); (b) the reaper sweep (for viewer-only boxes between turns).
+//
+// The meter is GROUP-KEYED + epoch-keyed + tick-keyed:
+//   idempotencyKey = usage:sandbox.warm_seconds:<group>:<epoch>:<tick>
+// so a SHARED box (N sessions on one group) is metered EXACTLY ONCE per tick
+// (N sessions != N x bill — a session-keyed meter would N x-over-bill), and a
+// re-dispatched/overlapping tick at the same (group,epoch,tick) can never
+// double-charge (recordUsageEvent is onConflictDoNothing on idempotencyKey).
+//
+// Cursor advance + usage insert are ATOMIC: both run inside ONE FOR UPDATE txn on
+// the lease row (the M3 cross-statement-atomicity fix). The insert uses ON
+// CONFLICT DO NOTHING on idempotency_key (matching recordUsageEvent), and the
+// cursor (last_meter_at/last_meter_tick) is advanced in the SAME txn — so the tick
+// index and the metered seconds can never desync, and a partial-failure rollback
+// leaves BOTH the cursor and the event untouched.
+// ============================================================================
+
+export interface AccrueWarmSecondsResult {
+  /** false when nothing was accrued (epoch fenced / not warm / no elapsed / the
+   *  first tick that only seeds the cursor). */
+  accrued: boolean;
+  /** Whole seconds metered this tick (0 when accrued:false). */
+  seconds: number;
+  /** The monotonic tick index this accrual was recorded under. */
+  tick: number;
+  /** usd_micros charged for this tick (0 when rate is 0). */
+  costMicros: number;
+}
+
+/**
+ * Accrue warm-seconds for the elapsed wall-clock since the lease's last meter
+ * cursor, idempotent on (sandbox_group_id, lease_epoch, tick). EPOCH-FENCED +
+ * liveness-guarded (warm only): a stale-epoch tick or a draining/cold lease is a
+ * no-op, so a superseded writer that re-fires cannot mis-meter. The FIRST tick on
+ * a never-metered lease (last_meter_at IS NULL) only SEEDS the cursor — it
+ * accrues nothing (there is no prior cursor to diff against), matching the
+ * "delta since last tick" contract. warmRateMicrosPerSecond > 0 also records a
+ * sandbox.warm_cost event (cost = seconds x rate) AND debits the same micros from
+ * the credit balance via applyCreditDebitUpToBalance (the model-cost precedent),
+ * idempotent on the SAME (group, epoch, tick) key. The usage event is the
+ * REQUESTED cost; the ledger is the ACTUAL debit (they legitimately differ when
+ * balance is low — M2). Set debitCredits:false to meter without debiting.
+ */
+export async function accrueWarmSeconds(db: Database, input: {
+  accountId: string;
+  workspaceId: string;
+  sandboxGroupId: string;
+  /** The epoch the tick observed; the fence — a stale writer no-ops. */
+  expectedEpoch: number;
+  /** usd_micros per warm-second for this box's backend (0 = meter only, no cost). */
+  warmRateMicrosPerSecond: number;
+  /** Optional attribution: the founding/observing session (visibility only — the
+   *  group meter key makes the workspace charge correct regardless). */
+  subjectId?: string | null;
+  /** Debit credits for warm-cost (default true). The force-drain at 0 balance
+   *  depends on this decrementing the balance. */
+  debitCredits?: boolean;
+}): Promise<AccrueWarmSecondsResult> {
+  const none: AccrueWarmSecondsResult = { accrued: false, seconds: 0, tick: 0, costMicros: 0 };
+  const result = await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId },
+    async (scopedDb) => await scopedDb.transaction(async (txRaw) => {
+      const tx = txRaw as unknown as Database;
+      // Lock the group's lease row so the cursor advance + the usage insert are
+      // one atomic step (no other tick can interleave between the diff and the
+      // cursor write).
+      const rows = await tx.execute<LeaseRow & { meter_elapsed_s: number | null }>(sql`
+        select *,
+          case when last_meter_at is null then null
+               else floor(extract(epoch from (now() - last_meter_at)))::int end as meter_elapsed_s
+        from sandbox_leases
+        where workspace_id = ${input.workspaceId} and sandbox_group_id = ${input.sandboxGroupId}
+        for update
+      `);
+      const row = rows[0];
+      if (!row) return none;
+
+      // Epoch fence + liveness guard: only a live-epoch warm box meters. A stale
+      // (superseded) tick or a draining/cold/warming lease is a no-op.
+      if (Number(row.lease_epoch) !== input.expectedEpoch || row.liveness !== "warm") {
+        return none;
+      }
+
+      // First tick on a never-metered lease: SEED the cursor, accrue nothing.
+      if (row.last_meter_at == null) {
+        await tx.execute(sql`
+          update sandbox_leases set last_meter_at = now(), updated_at = now()
+          where id = ${row.id}
+        `);
+        return none;
+      }
+
+      const elapsedS = Number(row.meter_elapsed_s ?? 0);
+      if (elapsedS <= 0) {
+        // No whole second elapsed yet — leave the cursor untouched so the
+        // remainder accrues on the next tick (no silent seconds loss).
+        return none;
+      }
+
+      const tick = Number(row.last_meter_tick) + 1;
+      const costMicros = Math.round(elapsedS * Math.max(0, input.warmRateMicrosPerSecond));
+
+      // (1) The warm-seconds meter — GROUP+epoch+tick keyed, ON CONFLICT DO
+      // NOTHING (the idempotency that makes a shared box one stream + a re-fire a
+      // no-op). sourceResourceId is keyed on (group, epoch).
+      await tx.execute(sql`
+        insert into usage_events
+          (account_id, workspace_id, subject_id, event_type, quantity, unit,
+           source_resource_type, source_resource_id, idempotency_key, occurred_at)
+        values
+          (${input.accountId}, ${input.workspaceId}, ${input.subjectId ?? null},
+           'sandbox.warm_seconds', ${elapsedS}, 'seconds',
+           'sandbox_lease', ${`${input.sandboxGroupId}:${input.expectedEpoch}`},
+           ${`usage:sandbox.warm_seconds:${input.sandboxGroupId}:${input.expectedEpoch}:${tick}`},
+           now())
+        on conflict (idempotency_key) do nothing
+      `);
+
+      // (2) The warm-cost meter (only when a rate is configured). Same keying.
+      if (costMicros > 0) {
+        await tx.execute(sql`
+          insert into usage_events
+            (account_id, workspace_id, subject_id, event_type, quantity, unit,
+             source_resource_type, source_resource_id, idempotency_key, occurred_at)
+          values
+            (${input.accountId}, ${input.workspaceId}, ${input.subjectId ?? null},
+             'sandbox.warm_cost', ${costMicros}, 'usd_micros',
+             'sandbox_lease', ${`${input.sandboxGroupId}:${input.expectedEpoch}`},
+             ${`usage:sandbox.warm_cost:${input.sandboxGroupId}:${input.expectedEpoch}:${tick}`},
+             now())
+          on conflict (idempotency_key) do nothing
+        `);
+      }
+
+      // (3) Advance the cursor IN THE SAME TXN — the atomicity that makes the tick
+      // index and the metered seconds inseparable.
+      await tx.execute(sql`
+        update sandbox_leases set
+          last_meter_at = now(), last_meter_tick = ${tick}, updated_at = now()
+        where id = ${row.id}
+      `);
+
+      return { accrued: true, seconds: elapsedS, tick, costMicros };
+    }));
+
+  // Debit credits for the warm-cost OUTSIDE the lease-row txn (applyCreditDebit
+  // takes its own per-account advisory lock — never nest it under the lease row
+  // lock). Idempotent on the SAME (group, epoch, tick) key so a re-fire of an
+  // already-committed tick cannot double-debit. The ledger records the ACTUAL
+  // debit (min(requested, balance)); the warm_cost usage event above is the
+  // requested cost.
+  if (result.accrued && result.costMicros > 0 && (input.debitCredits ?? true)) {
+    await applyCreditDebitUpToBalance(db, {
+      accountId: input.accountId,
+      workspaceId: input.workspaceId,
+      type: "sandbox.warm_cost",
+      requestedAmountMicros: result.costMicros,
+      sourceType: "sandbox_lease",
+      sourceId: `${input.sandboxGroupId}:${input.expectedEpoch}`,
+      idempotencyKey: `debit:sandbox.warm_cost:${input.sandboxGroupId}:${input.expectedEpoch}:${result.tick}`,
+    }).catch(() => undefined);
+  }
+
+  return result;
+}
+
+// §2.2/2.3 — the per-workspace warm-cap + force-drain. Under the EXISTING usage
+// lock (withWorkspaceUsageLock — NOT a bare count, so two concurrent ticks in
+// different sessions of one workspace can't both read "under cap" and race past
+// it). A workspace at 0 balance OR over its warm-second cap force-drains its
+// VIEWER-ONLY boxes: CAS warm->draining guarded `AND turn_holders = 0` so a box
+// with a running (paying) turn is NEVER killed. The reaper then issues the
+// provider stop() at refcount 0 (this fn is DB-only — no provider call).
+//
+// Group-wide force-drain on workspace balance exhaustion is deliberate (one
+// balance drains a multi-session box): the workspace, not the session, is the
+// billing unit — correctness (charged once) is automatic from the group meter key.
+export interface ForceDrainResult {
+  /** Whether the workspace was over a limit (0 balance or over the warm cap). */
+  overLimit: boolean;
+  /** The reason, for observability. */
+  reason: "balance" | "warm_cap" | null;
+  /** The (workspaceId, sandboxGroupId) viewer-only boxes CASed warm->draining. */
+  drained: { workspaceId: string; sandboxGroupId: string }[];
+}
+
+// Start of the current UTC month (the default warm-cap window). Local helper so
+// packages/db has no dependency on a worker/api date util; callers may override
+// via capWindowStart to keep the fn time-source-agnostic for tests.
+function startOfUtcMonthDefault(date = new Date()): Date {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1, 0, 0, 0, 0));
+}
+
+export async function forceDrainOverLimitViewerOnlyBoxes(db: Database, input: {
+  workspaceId: string;
+  /** account balance gate: when <= 0 (and a billing/managed mode is on) drain. */
+  balanceMicros: number;
+  enforceBalance: boolean;
+  /** warm-second cap (cumulative this UTC month). 0 = unbounded (no cap gate). */
+  maxWarmSecondsPerWorkspace: number;
+  /** start of the cap window (caller passes startOfUtcMonth() so the fn stays
+   *  time-source-agnostic for tests). */
+  capWindowStart?: Date;
+  /** drain-grace horizon stamped on the newly-draining rows (matches the reaper). */
+  idleGraceMs: number;
+}): Promise<ForceDrainResult> {
+  return await withWorkspaceUsageLock(db, input.workspaceId, async (scopedDb) => {
+    // Determine over-limit under the lock (so the cap read + the drain are one
+    // serialized critical section per workspace).
+    let reason: "balance" | "warm_cap" | null = null;
+    if (input.enforceBalance && input.balanceMicros <= 0) {
+      reason = "balance";
+    } else if (input.maxWarmSecondsPerWorkspace > 0) {
+      const since = input.capWindowStart ?? startOfUtcMonthDefault();
+      const [{ total } = { total: 0 }] = await scopedDb.select({
+        total: sql<number>`coalesce(sum(${schema.usageEvents.quantity}), 0)`,
+      }).from(schema.usageEvents).where(and(
+        eq(schema.usageEvents.workspaceId, input.workspaceId),
+        eq(schema.usageEvents.eventType, "sandbox.warm_seconds"),
+        gt(schema.usageEvents.occurredAt, since),
+      ));
+      if (Number(total) >= input.maxWarmSecondsPerWorkspace) {
+        reason = "warm_cap";
+      }
+    }
+
+    if (!reason) {
+      return { overLimit: false, reason: null, drained: [] };
+    }
+
+    // Force-drain VIEWER-ONLY warm boxes: CAS warm->draining guarded
+    // turn_holders = 0 (a paying turn is NEVER killed). Stamp the grace deadline
+    // so the reaper terminates at refcount 0 past the grace, exactly as a normal
+    // refcount->0 drain would.
+    // Drop the viewer holders of every warm VIEWER-ONLY lease (turn_holders=0 — a
+    // paying turn is never killed) so refcount → 0 (otherwise the viewer holder
+    // pins refcount > 0 and the reaper never terminates at refcount=0, and the
+    // holder heartbeat would re-arm the lease). Scoped to the warm viewer-only
+    // leases via a subselect so a turn-held box's holders are untouched.
+    await scopedDb.execute(sql`
+      delete from sandbox_lease_holders h
+      where h.kind = 'viewer'
+        and h.lease_id in (
+          select id from sandbox_leases
+          where workspace_id = ${input.workspaceId}
+            and liveness = 'warm' and turn_holders = 0
+        )
+    `);
+    // CAS the now-holderless leases warm→draining at refcount 0 with the grace
+    // deadline stamped — so the SAME reaper sweep's refcount=0 drain predicate
+    // then terminates the box.
+    const drained = await scopedDb.execute<{ sandbox_group_id: string }>(sql`
+      update sandbox_leases set
+        liveness = 'draining',
+        refcount = 0, turn_holders = 0, viewer_holders = 0,
+        expires_at = now() + (${String(input.idleGraceMs)} || ' milliseconds')::interval,
+        updated_at = now()
+      where workspace_id = ${input.workspaceId}
+        and liveness = 'warm' and turn_holders = 0
+      returning sandbox_group_id
+    `);
+
+    return {
+      overLimit: true,
+      reason,
+      drained: drained.map((r) => ({ workspaceId: input.workspaceId, sandboxGroupId: r.sandbox_group_id })),
+    };
   });
 }
 
@@ -3251,7 +4679,7 @@ export async function wakeParentSessionForChildCompletion(
       sessionId: parent.id,
       sequence: ++sequence,
       type: event.type,
-      payload: event.payload,
+      payload: sanitizeEventPayload(event.payload),
       clientEventId: event.clientEventId ?? null,
       turnId: null,
       producerId: null,
@@ -3291,7 +4719,7 @@ export async function wakeParentSessionForChildCompletion(
       sessionId: parent.id,
       sequence,
       type: "turn.queued",
-      payload: { turnId: turn.id, triggerEventId: triggerEvent.id, source: turn.source },
+      payload: sanitizeEventPayload({ turnId: turn.id, triggerEventId: triggerEvent.id, source: turn.source }),
       clientEventId: null,
       turnId: turn.id,
       producerId: null,
@@ -3476,7 +4904,7 @@ export async function appendSessionEvents(db: Database, workspaceId: string, ses
       sessionId,
       sequence: ++sequence,
       type: input.type,
-      payload: input.payload ?? {},
+      payload: sanitizeEventPayload(input.payload ?? {}),
       clientEventId: input.clientEventId ?? null,
       turnId: input.turnId ?? null,
       producerId: input.producerId ?? null,
@@ -3516,7 +4944,7 @@ export async function appendSessionEventsAndUpdateSession(db: Database, workspac
       sessionId,
       sequence: ++sequence,
       type: input.type,
-      payload: input.payload ?? {},
+      payload: sanitizeEventPayload(input.payload ?? {}),
       clientEventId: input.clientEventId ?? null,
       turnId: input.turnId ?? null,
       producerId: input.producerId ?? null,
@@ -3566,7 +4994,7 @@ export async function appendSessionEventsWithLockedSessionUpdate(db: Database, w
       sessionId,
       sequence: ++sequence,
       type: input.type,
-      payload: input.payload ?? {},
+      payload: sanitizeEventPayload(input.payload ?? {}),
       clientEventId: input.clientEventId ?? null,
       turnId: input.turnId ?? null,
       producerId: input.producerId ?? null,
@@ -3605,6 +5033,8 @@ function mapSession(row: typeof schema.sessions.$inferSelect): Session {
     metadata: row.metadata,
     model: row.model,
     sandboxBackend: row.sandboxBackend as SandboxBackend,
+    sandboxOs: row.sandboxOs as SandboxOs,
+    sandboxGroupId: row.sandboxGroupId,
     environmentId: row.environmentId,
     firstPartyMcpPermissions: (row.firstPartyMcpPermissions as Permission[] | null) ?? null,
     parentSessionId: row.parentSessionId ?? null,
@@ -3648,6 +5078,7 @@ function mapSessionTurn(row: typeof schema.sessionTurns.$inferSelect): SessionTu
     model: row.model,
     reasoningEffort: row.reasoningEffort as ReasoningEffort,
     sandboxBackend: row.sandboxBackend as SandboxBackend,
+    sandboxOs: (row.sandboxOs as SandboxOs | null) ?? null,
     metadata: row.metadata,
     startedAt: row.startedAt ? row.startedAt.toISOString() : null,
     finishedAt: row.finishedAt ? row.finishedAt.toISOString() : null,

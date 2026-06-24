@@ -11,7 +11,193 @@ export type SessionStatus =
   | "failed"
   | "cancelled";
 
-export type SandboxBackend = "docker" | "modal" | "local" | "none";
+// Mirror of `@opengeni/contracts` SandboxBackend (10 values; existing four keep
+// position). 3-way enum parity is pinned by `test/contract-parity.test.ts`.
+export type SandboxBackend =
+  | "docker"
+  | "modal"
+  | "local"
+  | "none"
+  | "daytona"
+  | "runloop"
+  | "e2b"
+  | "blaxel"
+  | "cloudflare"
+  | "vercel";
+
+// Mirror of `@opengeni/contracts` SandboxOs. Only "linux" is reachable in v1.
+export type SandboxOs = "linux" | "macos" | "windows";
+
+// Mirror of `@opengeni/contracts` SandboxCapabilityName.
+export type SandboxCapabilityName =
+  | "FileSystem"
+  | "Terminal"
+  | "Git"
+  | "DesktopStream"
+  | "Recording";
+
+// Mirror of `@opengeni/contracts` CapabilityUnavailableReason.
+export type CapabilityUnavailableReason =
+  | "backend_unsupported"
+  | "os_unsupported"
+  | "not_provisioned"
+  | "disabled_by_policy"
+  | "lease_cold"
+  | "tier_headless";
+
+// Mirror of `@opengeni/contracts` SessionCapabilities (the negotiated handshake
+// document). The descriptor table itself is NOT mirrored — it lives in
+// contracts (P0.1) and is consumed by the SDK config in a later PR.
+export type SessionCapabilities = {
+  sessionId: string;
+  backend: SandboxBackend;
+  os: SandboxOs;
+  liveness: "cold" | "warming" | "warm" | "draining";
+  leaseEpoch: number;
+  viewerHeartbeatIntervalMs: number;
+  FileSystem: {
+    available: boolean;
+    readOnly: boolean;
+    root: string;
+    pathSep: "/" | "\\";
+    treeMode: "lazy" | "snapshot";
+    reason: CapabilityUnavailableReason | null;
+  };
+  Terminal: {
+    transport: "sse-events" | "pty-ws" | null;
+    ptyCapable: boolean;
+    shell: string;
+    url: string | null;
+    token: string | null;
+    reason: CapabilityUnavailableReason | null;
+  };
+  Git: {
+    available: boolean;
+    repos: string[];
+    reason: CapabilityUnavailableReason | null;
+  };
+  DesktopStream: {
+    transport: "vnc-ws" | "rdp-ws" | "webrtc" | null;
+    client: "novnc" | "web-rdp" | null;
+    mode: "read-only" | "interactive";
+    url: string | null;
+    token: string | null;
+    expiresAt: string | null;
+    resolution: [number, number];
+    unredacted: boolean;
+    requiresAcknowledgment: boolean;
+    acknowledged: boolean;
+    // Shared-exposure disclosure (addendum E.1): `shared` when the group has >1
+    // session; `sharedSessionIds` lists the OTHER sessions' ids ONLY (never their
+    // conversation/metadata).
+    shared: boolean;
+    sharedSessionIds: string[];
+    reason: CapabilityUnavailableReason | null;
+  };
+  Recording: {
+    available: boolean;
+    modes: ("manual" | "on-turn" | "on-verify")[];
+    codecs: ("h264-mp4" | "vp9-webm")[];
+    reason: CapabilityUnavailableReason | null;
+  };
+  ComputerUse: {
+    available: boolean;
+    readOnly: boolean;
+    reason: CapabilityUnavailableReason | null;
+  };
+  negotiatedAt: string;
+};
+
+// Convenience aliases for the per-surface cells of `SessionCapabilities`, so the
+// client hooks/components can take a single cell without restating the inline
+// shape. These are exact structural views of the cells above.
+export type FileSystemCapability = SessionCapabilities["FileSystem"];
+export type TerminalCapability = SessionCapabilities["Terminal"];
+export type GitCapability = SessionCapabilities["Git"];
+export type DesktopStreamCapability = SessionCapabilities["DesktopStream"];
+export type RecordingCapability = SessionCapabilities["Recording"];
+export type ComputerUseCapability = SessionCapabilities["ComputerUse"];
+
+// ── Stream-surfacing client surface (Phase 5) ───────────────────────────────
+// Mirrors of the contracts viewer-attach / acknowledge / heartbeat shapes that
+// the capability-gated client (`@opengeni/react`) drives. The desktop pixel
+// plane rides Channel B (direct-to-provider noVNC); the structured terminal/
+// files/git surfaces ride Channel A (the existing event spine + the synchronous
+// fs/git/terminal point queries above). These are TYPES only (the SDK keeps zero
+// runtime deps); the contract-parity test pins them.
+
+// Mirror of `@opengeni/contracts` StreamUrlRotatedPayload — the Channel-A event
+// the client folds in to hot-swap its noVNC socket on a box rollover, fenced on
+// leaseEpoch.
+export type StreamUrlRotatedPayload = {
+  url: string;
+  token: string | null;
+  expiresAt: string | null;
+  leaseEpoch: number;
+  transport: "vnc-ws";
+  viewerId: string | null;
+};
+export type StreamOpenedPayload = { viewerId: string; shared: boolean; viewerCount: number };
+export type StreamClosedPayload = {
+  viewerId: string;
+  reason: "client-disconnect" | "reaped" | "revoked" | "box-rollover";
+  viewerCount: number;
+};
+export type StreamRevokedPayload = {
+  viewerId: string | null;
+  reason: "grant-revoked" | "session-failed" | "admin";
+};
+
+// Mirror of `@opengeni/contracts` AttachViewerRequest. Omitting `viewerId` mints
+// a fresh holder id (returned on the response, carried through heartbeat/detach).
+// `desktop:true` opts into the un-redacted pixel plane (the consent-gated noVNC
+// stream); a terminal/files-only warm attach omits it (defaults false) so it
+// warms the box + mints the pty-ws terminal cell WITHOUT tripping the consent 409.
+export type AttachViewerRequest = { viewerId?: string | undefined; desktop?: boolean | undefined };
+
+// Mirror of `@opengeni/contracts` ViewerHolder + the P4.2 desktop-stream fields
+// the POST /viewers handler folds in when the pixel plane is minted in-process.
+export type ViewerHolder = {
+  viewerId: string;
+  sandboxGroupId: string;
+  liveness: "cold" | "warming" | "warm" | "draining";
+  leaseEpoch: number;
+  viewerHeartbeatIntervalMs: number;
+  dataPlaneUrl: string | null;
+};
+export type AttachViewerResponse = ViewerHolder & {
+  // The scoped desktop-stream address minted for THIS holder (P4.2). Null when
+  // the deployment is headless / desktop is disabled / the mint degraded —
+  // the client then falls back to the Channel-A surfaces only.
+  streamToken: string | null;
+  streamExpiresAt: string | null;
+  resolution: [number, number] | null;
+  transport: "vnc-ws" | null;
+  client: "novnc" | null;
+  // The scoped ttyd PTY-over-websocket address minted for THIS holder — the REAL
+  // interactive terminal, symmetric with the desktop pixel plane (same Modal
+  // tunnel, same scoped stream token). Populated on a warm box; null when the
+  // terminal mint degraded (headless / no secret / tunnel failure), in which case
+  // the client falls back to the Channel-A read-only command-output firehose.
+  // `terminalTransport` is "pty-ws" iff a live `terminalUrl` was minted.
+  terminalUrl: string | null;
+  terminalToken: string | null;
+  terminalTransport: "pty-ws" | null;
+};
+
+// Mirror of `@opengeni/contracts` AcknowledgeStreamRequest/Response — the
+// un-redacted-pixel + shared-exposure consent gate (P3.2).
+export type AcknowledgeStreamRequest = {
+  acknowledgeUnredacted?: boolean | undefined;
+  acknowledgeShared?: boolean | undefined;
+};
+export type AcknowledgeStreamResponse = { acknowledged: boolean; acknowledgedShared: boolean };
+
+// Mirror of `@opengeni/contracts` ViewerHeartbeatRequest/Response — the
+// Channel-A viewer-liveness ping, epoch-fenced (a stale-epoch beat → alive:false
+// → the client re-attaches).
+export type ViewerHeartbeatRequest = { leaseEpoch: number };
+export type ViewerHeartbeatResponse = { alive: boolean };
 
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
@@ -130,6 +316,23 @@ export const SESSION_EVENT_TYPES = [
   "goal.paused",
   "goal.resumed",
   "goal.continuation",
+  // Channel-B desktop pixel-plane signals (mirror of contracts SessionEventType;
+  // the contract-parity test asserts sorted equality).
+  "stream.url.rotated",
+  "stream.opened",
+  "stream.closed",
+  "stream.revoked",
+  // Channel-B recording signals (P4.3 — "agent films itself proving the fix").
+  "recording.started",
+  "recording.available",
+  "recording.failed",
+  // Channel-A structured-service notifications (P4.4; mirror of contracts
+  // SessionEventType — the contract-parity test asserts sorted equality).
+  "fs.changed",
+  "git.changed",
+  "terminal.pty.started",
+  "terminal.pty.output.delta",
+  "terminal.pty.exited",
 ] as const;
 
 export type KnownSessionEventType = (typeof SESSION_EVENT_TYPES)[number];
@@ -165,6 +368,144 @@ export type AgentToolCallCreatedPayload = {
 };
 export type AgentToolCallOutputPayload = { id: string | null; output: unknown };
 export type SessionStatusChangedPayload = { status: SessionStatus };
+
+// Recording payloads (P4.3 — plain TS mirror of the contracts Zod schemas; the
+// SDK is zero-runtime-dep so these are TYPES, not Zod, F15). The contract-parity
+// test asserts the event-type literals; these shapes document the wire payloads.
+export type RecordingMode = "manual" | "on-turn" | "on-verify";
+export type RecordingCodec = "h264-mp4" | "vp9-webm";
+export type RecordingContentType = "video/mp4" | "video/webm";
+export type RecordingFailedReason =
+  | "ffmpeg-error"
+  | "box-death"
+  | "box-rollover"
+  | "upload-failed"
+  | "max-bytes-exceeded"
+  | "display-unavailable";
+
+export type RecordingStartedPayload = {
+  recordingId: string;
+  turnId: string | null;
+  mode: RecordingMode;
+  codec: RecordingCodec;
+  dimensions: [number, number];
+  framerate: number;
+  startedAt: string;
+  reason?: string | null | undefined;
+};
+export type RecordingAvailablePayload = {
+  recordingId: string;
+  turnId: string | null;
+  codec: RecordingCodec;
+  contentType: RecordingContentType;
+  storageKey: string;
+  durationSeconds: number | null;
+  sizeBytes: number;
+  dimensions: [number, number];
+};
+export type RecordingFailedPayload = {
+  recordingId: string;
+  turnId: string | null;
+  reason: RecordingFailedReason;
+  detail?: string | null | undefined;
+};
+
+// ── Channel-A structured services (P4.4) — hand-written wire mirrors ─────────
+
+// A1 notification payloads.
+export type SandboxCommandOutputDeltaPayload = {
+  stream: "stdout" | "stderr";
+  chunk: string;
+  commandId?: string | undefined;
+  seq?: number | undefined;
+};
+export type FsChangeKind = "created" | "modified" | "deleted" | "renamed";
+export type FsChangedPayload = {
+  changes: { path: string; kind: FsChangeKind; isDir: boolean; sizeBytes: number | null; oldPath?: string | undefined }[];
+  source: "write" | "watch" | "agent";
+  revision: number;
+  leaseEpoch: number;
+};
+export type GitChangedPayload = {
+  head: string | null;
+  dirty: boolean;
+  ahead: number;
+  behind: number;
+  changedFileCount: number;
+  reason: "commit" | "checkout" | "stage" | "worktree" | "fetch" | "unknown";
+  revision: number;
+  leaseEpoch: number;
+};
+export type TerminalPtyStartedPayload = { ptyId: string; cols: number; rows: number; shell: string; cwd: string };
+export type TerminalPtyOutputDeltaPayload = { ptyId: string; stream: "stdout" | "stderr"; chunk: string; seq: number };
+export type TerminalPtyExitedPayload = { ptyId: string; exitCode: number | null; reason: "exit" | "killed" | "owner_gone" | "timeout" };
+
+// A2 FileSystem request/response.
+export type FsNodeType = "file" | "dir" | "symlink" | "other";
+export type FsTreeNode = {
+  name: string;
+  path: string;
+  type: FsNodeType;
+  sizeBytes: number | null;
+  mtimeMs: number | null;
+  mode: number | null;
+  children?: FsTreeNode[] | undefined;
+  truncated: boolean;
+};
+export type FsEncoding = "utf8" | "base64";
+export type FsListRequest = { path?: string; depth?: number; maxEntries?: number; includeHidden?: boolean };
+export type FsListResponse = { root: FsTreeNode; revision: number; truncated: boolean };
+export type FsReadRequest = { path: string; encoding?: FsEncoding; maxBytes?: number };
+export type FsReadResponse = { path: string; encoding: FsEncoding; content: string; sizeBytes: number; truncated: boolean; isBinary: boolean; revision: number };
+export type FsWriteRequest = { path: string; encoding?: FsEncoding; content: string; overwrite?: boolean; createParents?: boolean };
+export type FsWriteResponse = { path: string; sizeBytes: number; revision: number };
+export type FsDeleteRequest = { path: string; recursive?: boolean };
+export type FsDeleteResponse = { revision: number };
+export type FsMoveRequest = { path: string; newPath: string; overwrite?: boolean; createParents?: boolean };
+export type FsMoveResponse = { path: string; newPath: string; revision: number };
+export type FsMkdirRequest = { path: string; recursive?: boolean };
+export type FsMkdirResponse = { path: string; revision: number };
+
+// A2 Git request/response (the Pierre-diff feed).
+export type GitFileStatusCode = "added" | "modified" | "deleted" | "renamed" | "copied" | "untracked" | "ignored" | "conflicted" | "typechange";
+export type GitFileStatus = { path: string; oldPath: string | null; index: GitFileStatusCode | null; worktree: GitFileStatusCode | null; isConflicted: boolean };
+export type GitStatusRequest = { path?: string };
+export type GitStatusResponse = { isRepo: boolean; head: string | null; detached: boolean; upstream: string | null; ahead: number; behind: number; files: GitFileStatus[]; revision: number };
+export type GitDiffLineType = "context" | "add" | "del" | "meta";
+export type GitDiffLine = { type: GitDiffLineType; oldNo: number | null; newNo: number | null; text: string };
+export type GitDiffHunk = { oldStart: number; oldLines: number; newStart: number; newLines: number; header: string; lines: GitDiffLine[] };
+export type GitFileDiff = { path: string; oldPath: string | null; status: GitFileStatusCode; isBinary: boolean; isImage: boolean; additions: number; deletions: number; hunks: GitDiffHunk[]; truncated: boolean };
+export type GitDiffRequest = { path?: string; staged?: boolean; fromRef?: string; toRef?: string; pathspec?: string[]; contextLines?: number; maxBytesPerFile?: number };
+export type GitDiffResponse = { files: GitFileDiff[]; revision: number };
+export type GitLogRequest = { path?: string; ref?: string; maxCount?: number; skip?: number; pathspec?: string[] };
+export type GitCommit = {
+  sha: string;
+  shortSha: string;
+  parents: string[];
+  author: { name: string; email: string; timestamp: number };
+  committer: { name: string; email: string; timestamp: number };
+  subject: string;
+  body: string;
+  refs: string[];
+};
+export type GitLogResponse = { commits: GitCommit[]; hasMore: boolean };
+export type GitShowRequest = { path?: string; ref: string; filePath?: string; encoding?: FsEncoding; maxBytesPerFile?: number };
+export type GitShowResponse = { commit: GitCommit | null; files: GitFileDiff[]; blob: { content: string; encoding: FsEncoding; sizeBytes: number; truncated: boolean } | null; revision: number };
+
+// A2 Terminal exec + PTY.
+export type TerminalExecRequest = { command: string; cwd?: string; timeoutMs?: number; emitStream?: boolean };
+export type TerminalExecResponse = { stdout: string; stderr: string; exitCode: number | null; running: boolean; wallTimeSeconds: number };
+export type PtyOpenRequest = { cols?: number; rows?: number; cwd?: string; shell?: string };
+export type PtyOpenResponse = { ptyId: string; streamVia: "sse-events"; supportsInput: boolean };
+export type PtyWriteRequest = { ptyId: string; data: string };
+export type PtyResizeRequest = { ptyId: string; cols: number; rows: number };
+export type PtyCloseRequest = { ptyId: string };
+
+export type SessionStructuredCapabilities = {
+  FileSystem: { available: boolean; readOnly: boolean; root: string };
+  Terminal: { events: boolean; exec: boolean; pty: { available: boolean } };
+  Git: { available: boolean; repos: string[] };
+};
 
 export type ScheduledTaskStatus = "active" | "paused";
 
@@ -258,8 +599,17 @@ export const KNOWN_PERMISSIONS = [
   "sessions:create",
   "sessions:read",
   "sessions:control",
+  // Sandbox-surfacing (mirror of @opengeni/contracts Permission). stream:view is
+  // strictly broader than sessions:read (un-redacted pixels); stream:control is
+  // the never-granted-v1 raw-input plane; stream:acknowledge is the secret-leak
+  // consent gate.
+  "stream:view",
+  "stream:control",
+  "stream:acknowledge",
   "files:upload",
   "files:read",
+  "files:write",
+  "terminal:attach",
   "documents:manage",
   "documents:search",
   "scheduled_tasks:manage",
@@ -327,6 +677,11 @@ export type ClientConfig = {
   fileUploads: { enabled: boolean; maxSizeBytes: number };
   productAccessMode: ProductAccessMode;
   auth: ClientAuthConfig;
+  // Server-wide hint: does this deployment support Channel-A structured services
+  // at all (P4.4). Per-session availability is negotiated on /stream-capabilities;
+  // this is the coarse on/off the client uses to decide whether to even attempt
+  // the fs/git/terminal panels.
+  structuredServices: { fileSystem: boolean; git: boolean; terminalEvents: boolean };
 };
 
 export type AccountRole = "owner" | "admin" | "member";
@@ -1018,6 +1373,9 @@ export const KNOWN_USAGE_EVENT_TYPES = [
   "document.indexed",
   "scheduled_task.fired",
   "api_key.request",
+  // sandbox warm-time metering (P2.1) — mirrors contracts UsageEventType.
+  "sandbox.warm_seconds",
+  "sandbox.warm_cost",
 ] as const;
 
 export type KnownUsageEventType = (typeof KNOWN_USAGE_EVENT_TYPES)[number];

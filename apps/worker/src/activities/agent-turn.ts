@@ -20,6 +20,9 @@ import {
   setSessionStatus,
   setSessionLastInputTokens,
   sumUsageQuantity,
+  heartbeatLeaseHolder,
+  accrueWarmSeconds,
+  SandboxLeaseSupersededError,
   type AppendEventInput,
 } from "@opengeni/db";
 import { appendAndPublishEvents } from "@opengeni/events";
@@ -34,7 +37,7 @@ import {
   type SandboxFileDownload,
   type OpenGeniRuntime,
 } from "@opengeni/runtime";
-import { calculateModelUsageCostMicros, configuredModelPricing, configuredStaticUsageLimits, type ModelUsageInput, type Settings } from "@opengeni/config";
+import { calculateModelUsageCostMicros, configuredModelPricing, configuredStaticUsageLimits, sandboxWarmRateMicrosPerSecond, type ModelUsageInput, type Settings } from "@opengeni/config";
 import { CancelledFailure } from "@temporalio/activity";
 import { settingsWithEnabledCapabilityMcpServers } from "./capabilities";
 import {
@@ -58,8 +61,12 @@ import type {
   RunAgentTurnInput,
   RunAgentTurnResult,
 } from "./types";
+import { resumeBoxForTurn, type ResumedTurnSandbox } from "../sandbox-resume";
+import { beginRecording, finalizeRecording, type ActiveRecording } from "./recording";
 import { createObjectStorage, type ObjectStorage } from "@opengeni/storage";
-import type { ResourceRef } from "@opengeni/contracts";
+import { desktopCapableBackend, sandboxRunAs } from "@opengeni/runtime";
+import { CAPABILITY_DESCRIPTORS, type ResourceRef } from "@opengeni/contracts";
+import { randomUUID } from "node:crypto";
 
 // How long the session workflow holds the loop after a retryable provider
 // failure before the goal continuation re-enters the model. Azure/OpenAI TPM
@@ -190,6 +197,25 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
     let activityError: unknown;
     let turnId: string | undefined;
     let heartbeatTimer: ReturnType<typeof startActivityHeartbeat> | undefined;
+    // P1.2 ownership inversion: when sandboxOwnershipEnabled, the turn resolves
+    // the one box by id from the group lease and injects it NON-OWNED into the
+    // run. null when the flag is off (byte-for-byte the legacy build-and-discard
+    // path) OR when the backend is "none". Released + dropped in `finally`.
+    let resolvedSandbox: ResumedTurnSandbox | null = null;
+    // The lease holder id (Temporal activityId, unique per scheduled execution)
+    // + the group id, captured so the lease heartbeat can refresh the lease TTL
+    // epoch-fenced (a superseded owner self-evicts) and finally can release.
+    let sandboxHolderId: string | null = null;
+    let sandboxGroupId: string | null = null;
+    // Lease-TTL refresh timer (parallels the activity heartbeat): while the turn
+    // runs it refreshes expires_at epoch-fenced so a legit multi-day turn is
+    // never TTL-reaped. Cleared in finally. Only set when the flag resolved a box.
+    let leaseHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
+    // P4.3 on-turn recording: when the desktop tier + recording are enabled and
+    // the box is desktop-capable, the turn films the SAME :0 the agent's
+    // computer-use drives, finalized to storage in this activity's `finally`
+    // (read+PUT in-process — never a Temporal payload, F10). null otherwise.
+    let activeRecording: ActiveRecording | null = null;
     let batcher: ReturnType<typeof createRuntimeBatcher> | null = null;
     let preparedTools: Awaited<ReturnType<OpenGeniRuntime["prepareTools"]>> | null = null;
     let publish: ((events: Array<Omit<AppendEventInput, "producerId" | "producerSeq" | "turnId">>, immediate?: boolean) => Promise<void>) | null = null;
@@ -387,7 +413,116 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       redact = createSecretRedactor(
         Object.entries(workspaceEnvironment?.values ?? {}).map(([name, value]) => ({ name, value })),
       );
+      // Computed exactly ONCE per turn and reused for BOTH the box manifest
+      // (resumeBoxForTurn -> establishSandboxSessionFromEnvelope, below) AND the
+      // agent (runtime.buildAgent, below). sandboxEnvironmentForRun mints a FRESH
+      // run-scoped GitHub installation token on every call, so a second call would
+      // yield a DIFFERENT token value and re-introduce the manifest-env delta the
+      // SDK's provided-session guard throws on — the box and the agent MUST share
+      // this same object.
       const sandboxEnvironment = await sandboxEnvironmentForRun(runSettings, turnResources, workspaceEnvironment?.values ?? {});
+
+      // P1.2 ownership inversion (gated, default OFF). With the flag off this
+      // block is skipped entirely: resolvedSandbox stays null and runStream
+      // takes the legacy per-run build-and-discard path — byte-for-byte today.
+      // With it on, acquire the group lease ('turn' holder = the activityId),
+      // resume the one box by id, and inject it NON-OWNED into the run. The box
+      // backend is "none" -> never resolve (no box to touch).
+      //
+      // Established AFTER sandboxEnvironment is computed (not before) so the box's
+      // manifest is created with the SAME environment the agent declares — the SDK
+      // applies the agent's manifest to this provided session and throws on ANY
+      // environment delta (validateNoEnvironmentDelta). Passing sandboxEnvironment
+      // here makes current==target so the delta is empty.
+      if (settings.sandboxOwnershipEnabled && turn.sandboxBackend !== "none") {
+        sandboxHolderId = dispatchId ?? `turn:${turnId}`;
+        sandboxGroupId = session.sandboxGroupId;
+        resolvedSandbox = await resumeBoxForTurn(
+          { db, settings },
+          {
+            accountId: input.accountId,
+            workspaceId: input.workspaceId,
+            sandboxGroupId: session.sandboxGroupId,
+            sessionId: input.sessionId,
+            backend: turn.sandboxBackend,
+            os: session.sandboxOs,
+            environment: sandboxEnvironment,
+          },
+          "turn",
+          sandboxHolderId,
+        );
+        // Refresh the lease TTL on the activity-heartbeat cadence (10s, well
+        // inside the 90s lease TTL). EPOCH-FENCED: a superseded owner's refresh
+        // is rejected (returns false) and we stop refreshing — the box rides the
+        // provider idle-timeout and the next dispatch re-establishes it. Best-
+        // effort: a transient DB error must never fail the turn.
+        const heartbeatEpoch = resolvedSandbox.leaseEpoch;
+        const heartbeatHolderId = sandboxHolderId;
+        const heartbeatGroupId = sandboxGroupId;
+        // P2.1 warm-meter (tick A): while a turn runs, the heartbeat is also the
+        // warm-seconds tick. GROUP+epoch+tick keyed (one box = one stream, shared
+        // box metered once); epoch-fenced (a stale tick no-ops). Warm-cost is
+        // metered when a per-backend rate is configured. Best-effort: a metering
+        // failure must never fail the turn.
+        const warmRate = sandboxWarmRateMicrosPerSecond(settings, turn.sandboxBackend);
+        leaseHeartbeatTimer = setInterval(() => {
+          void heartbeatLeaseHolder(db, {
+            accountId: input.accountId,
+            workspaceId: input.workspaceId,
+            sandboxGroupId: heartbeatGroupId,
+            kind: "turn",
+            holderId: heartbeatHolderId,
+            leaseTtlMs: settings.sandboxLeaseTtlMs,
+            expectedEpoch: heartbeatEpoch,
+          }).catch(() => undefined);
+          void accrueWarmSeconds(db, {
+            accountId: input.accountId,
+            workspaceId: input.workspaceId,
+            sandboxGroupId: heartbeatGroupId,
+            expectedEpoch: heartbeatEpoch,
+            warmRateMicrosPerSecond: warmRate,
+            subjectId: input.sessionId,
+          }).catch(() => undefined);
+        }, 10_000);
+        if ("unref" in leaseHeartbeatTimer && typeof leaseHeartbeatTimer.unref === "function") {
+          leaseHeartbeatTimer.unref();
+        }
+      }
+
+      // P4.3 on-turn recording. The box's :0 display stack was brought up by
+      // resumeBoxForTurn (spawner path) / is up from a prior turn; film it for
+      // the duration of this turn so the human can watch the agent work and the
+      // agent's computer-use proofs are captured. Best-effort: a recording start
+      // failure NEVER fails the turn (the desktop is a value-add). Finalized in
+      // `finally` (read+PUT in this same activity — never a Temporal payload).
+      if (
+        resolvedSandbox
+        && settings.sandboxDesktopEnabled
+        && settings.recordingEnabled
+        && desktopCapableBackend(resolvedSandbox.established.backendId)
+      ) {
+        try {
+          const begun = await beginRecording({
+            settings,
+            db,
+            accountId: input.accountId,
+            workspaceId: input.workspaceId,
+            sessionId: input.sessionId,
+            turnId: turnId!,
+            recordingId: randomUUID(),
+            mode: "on-turn",
+            session: resolvedSandbox.established.session,
+            runAs: sandboxRunAs(settings),
+            reason: null,
+          });
+          activeRecording = begun.active;
+          await publish([{ type: "recording.started", payload: begun.started }]);
+        } catch (recordingError) {
+          activeRecording = null;
+          console.error("on-turn recording start failed (turn outcome unaffected)", recordingError);
+        }
+      }
+
       const fileResourceDownloads = await sandboxFileDownloadsForRun(runSettings, db, objectStorage, input.workspaceId, turnResources);
       throwIfWorkerShuttingDown();
       preparedTools = await runtime.prepareTools(runSettings, turnTools, {
@@ -522,6 +657,17 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
         onRuntimeEvent: async (event) => {
           await publish!([{ type: event.type, payload: event.payload }], true);
         },
+        // P1.2: inject the resumed box NON-OWNED (the SDK never reaps it — the
+        // keystone). Absent when the flag is off -> legacy build-and-discard.
+        ...(resolvedSandbox
+          ? {
+            ownedSandbox: {
+              client: resolvedSandbox.established.client,
+              session: resolvedSandbox.established.session,
+              sessionState: resolvedSandbox.established.sessionState,
+            },
+          }
+          : {}),
       });
       batcher = createRuntimeBatcher(async (events) => {
         await publish!(events);
@@ -682,6 +828,20 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       // back to the workflow-claimed turn when the local lookup had not
       // finished yet.
       const preemptTurnId = turnId ?? input.turnId;
+      // P1.2: a lease supersession during resume (a newer epoch re-established
+      // the box concurrently) is NOT a session failure — re-dispatch the turn so
+      // it re-resumes by id under the current epoch. Requeue + idle, mirroring
+      // the worker-death re-dispatch (any worker re-resumes by id).
+      if (error instanceof SandboxLeaseSupersededError && preemptTurnId) {
+        try {
+          await requeuePreemptedTurn(db, input.workspaceId, preemptTurnId, input.triggerEventId);
+          await setSessionStatus(db, input.workspaceId, input.sessionId, "queued", null).catch(() => undefined);
+          activityStatus = "preempted";
+          return { status: "preempted" };
+        } catch (requeueError) {
+          console.error("sandbox lease supersession requeue failed; falling back", requeueError);
+        }
+      }
       if (isWorkerShutdownCancellation(error) && preemptTurnId) {
         try {
           await batcher?.flush().catch(() => undefined);
@@ -919,6 +1079,51 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       if (heartbeatTimer) {
         clearInterval(heartbeatTimer);
       }
+      // P1.2: stop the lease-TTL refresh, release the turn holder (idempotent
+      // delete-my-row; refcount-- and warm->draining if it hit 0 with no turns),
+      // and DROP the in-memory handle. Release NEVER stops the box — the reaper
+      // (P1.3) issues the provider stop() past the drain grace at refcount 0; the
+      // box rides the provider idle-timeout in the meantime. Best-effort: a
+      // release failure must never mask the turn's real outcome.
+      if (leaseHeartbeatTimer) {
+        clearInterval(leaseHeartbeatTimer);
+      }
+      // P4.3: finalize the on-turn recording BEFORE releasing the box handle
+      // (the read+PUT needs the live session). read bytes → storage PUT →
+      // updateRecording(available) → publish recording.available; the box file is
+      // deleted only after the PUT confirms (F9). Best-effort: a finalize failure
+      // emits recording.failed and never masks the turn outcome (F10: the bytes
+      // never become a Temporal payload — read+PUT happen here in-process).
+      if (activeRecording && resolvedSandbox) {
+        try {
+          const outcome = await finalizeRecording({
+            settings,
+            db,
+            objectStorage,
+            accountId: input.accountId,
+            workspaceId: input.workspaceId,
+            sessionId: input.sessionId,
+            active: activeRecording,
+            session: resolvedSandbox.established.session,
+            runAs: sandboxRunAs(settings),
+          });
+          if (publish) {
+            await publish(outcome.ok
+              ? [{ type: "recording.available", payload: outcome.available }]
+              : [{ type: "recording.failed", payload: { recordingId: activeRecording.recordingId, turnId: activeRecording.turnId, reason: outcome.reason, detail: outcome.detail } }]);
+          }
+        } catch (finalizeError) {
+          console.error("recording finalize failed (turn outcome unaffected)", finalizeError);
+        } finally {
+          activeRecording = null;
+        }
+      }
+      if (resolvedSandbox) {
+        await resolvedSandbox.release().catch((releaseError) => {
+          console.error("sandbox lease release failed (turn outcome unaffected)", releaseError);
+        });
+        resolvedSandbox = null;   // drop the handle; the box survives the turn
+      }
     }
   };
 }
@@ -1103,10 +1308,14 @@ async function sandboxFileDownloadsForRun(
 }
 
 function requiresSignedFileResourceDownloads(settings: Settings): boolean {
+  // A nativeBucketMount backend (modal) cannot mount Azure Blob entries, so it
+  // needs pre-signed downloads for that store. Keying on the descriptor (not the
+  // "modal" literal) keeps this correct as bucket-mount backends are added.
+  const nativeBucketMount = CAPABILITY_DESCRIPTORS[settings.sandboxBackend].nativeBucketMount;
   return (settings.sandboxBackend === "docker" && settings.objectStorageBackend === "s3-compatible")
     || settings.objectStorageBackend === "aws-s3"
     || settings.objectStorageBackend === "gcs"
-    || (settings.sandboxBackend === "modal" && settings.objectStorageBackend === "azure-blob");
+    || (nativeBucketMount && settings.objectStorageBackend === "azure-blob");
 }
 
 function objectStorageForSandboxDownloads(settings: Settings, objectStorage: ObjectStorage): ObjectStorage {

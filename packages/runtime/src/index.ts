@@ -1,6 +1,6 @@
 import type { ConfiguredModel, ContextCompactionMode, ModelProviderApi, ResolvedModelProvider, Settings } from "@opengeni/config";
 import { AGENT_INSTRUCTIONS_CORE_PLACEHOLDER, collectSandboxEnvironment, contextServerCompactThreshold, parseExposedPorts, resolveContextCompactionMode, resolveModelProvider, sandboxLifecycleHookIds } from "@opengeni/config";
-import { isClearedRunStateBlob, signDelegatedAccessToken, type Permission, type ReasoningEffort, type ResourceRef, type SessionEventType, type ToolRef } from "@opengeni/contracts";
+import { CAPABILITY_DESCRIPTORS, isClearedRunStateBlob, signDelegatedAccessToken, type Permission, type ReasoningEffort, type ResourceRef, type SessionEventType, type ToolRef } from "@opengeni/contracts";
 import {
   Agent,
   AgentsError,
@@ -39,9 +39,7 @@ import {
   type RunStreamEvent,
 } from "@openai/agents";
 import {
-  DockerSandboxClient,
   localDirLazySkillSource,
-  UnixLocalSandboxClient,
 } from "@openai/agents/sandbox/local";
 import {
   Capabilities,
@@ -68,15 +66,43 @@ import {
   type SandboxRunConfig,
   type SkillIndexEntry,
 } from "@openai/agents/sandbox";
-import { ModalCloudBucketMountStrategy, ModalImageSelector, ModalSandboxClient } from "@openai/agents-extensions/sandbox/modal";
+import { ModalCloudBucketMountStrategy } from "@openai/agents-extensions/sandbox/modal";
 import OpenAI from "openai";
 import { cpSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { userInfo } from "node:os";
 import { dirname, isAbsolute, join, posix as posixPath, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { sanitizeHistoryItemsForModel } from "./history-sanitizer";
+import { computerCallNormalizingFetch, normalizeComputerCallActions, sanitizeHistoryItemsForModel } from "./history-sanitizer";
 import { enforceInputBudget, estimateItemTokens } from "./context-compaction";
+import {
+  createSandboxClient,
+  deserializeSandboxSessionStateEnvelope,
+  desktopCapableBackend,
+  restoredSandboxSessionStateFromEntry,
+} from "./sandbox";
+import { computerUse } from "./sandbox-computer";
+
+// P4.3 computer-use surface (the agent's :0 driver). Re-exported from the barrel
+// so callers (the worker, live proofs) reach SandboxComputer/ComputerUseCapability
+// alongside the rest of the runtime. NOT part of the agent-loop-free leaf (it
+// imports computerTool from the @openai/agents root).
+export {
+  SandboxComputer,
+  ComputerUseCapability,
+  computerUse,
+  ComputerUnavailableError,
+  ComputerReadOnlyError,
+  ComputerActionError,
+  type SandboxComputerOptions,
+  type ComputerUseArgs,
+} from "./sandbox-computer";
+
+// The agent-loop-free sandbox leaf (createSandboxClient + resume/recovery
+// helpers + the config-owned env/port re-exports). Re-exported verbatim so the
+// barrel surface is unchanged for apps/worker while @opengeni/runtime/sandbox
+// stays importable by the API without the agent loop.
+export * from "./sandbox";
 
 export { sanitizeHistoryItemsForModel } from "./history-sanitizer";
 export type { HistoryItem } from "./history-sanitizer";
@@ -247,6 +273,12 @@ export function buildOpenAIClientFromSettings(settings: Settings): OpenAI {
       defaultHeaders: settings.azureOpenaiAdToken && !settings.azureOpenaiApiKey
         ? { Authorization: `Bearer ${settings.azureOpenaiAdToken}` }
         : undefined,
+      // Rewrite every outbound /responses computer_call to the ACTIONS-ONLY shape
+      // the GA Azure computer tool (gpt-5.5) accepts. This is the lowest reachable
+      // seam — below the SDK responses converter, which always re-synthesizes BOTH
+      // `action` and `actions` (rejected 400 "exactly one of action or actions").
+      // See computerCallNormalizingFetch / rewriteComputerCallsToActionsOnly.
+      fetch: computerCallNormalizingFetch(globalThis.fetch),
     });
   }
   return new OpenAI({
@@ -733,6 +765,24 @@ export function buildAgentCapabilities(
     caps.push(compaction({ policy: new StaticCompactionPolicy(contextServerCompactThreshold({ ...settings, contextWindowTokens })) }));
   }
   caps.push(skills({ lazyFrom: lazySkillSourceWithPackSkills(packSkills) }));
+  // P4.3 computer-use: the agent drives the SAME :0 humans watch (xdotool/XTEST +
+  // scrot), but only when the desktop tier is ON, computer-use is enabled, and the
+  // backend is one whose image carries the X stack (descriptorgate — honest about
+  // which backends are desktop-capable today; headless/dev backends never get the
+  // tool, so a misconfigured non-desktop box can't register a tool that always
+  // fails). The capability's tools() bind to the live externally-owned session at
+  // run time (the SandboxAgent merge); xdotool drives :0 regardless of whether any
+  // viewer is attached, so no pixel-tunnel dependency.
+  if (
+    settings.computerUseEnabled
+    && settings.sandboxDesktopEnabled
+    && desktopCapableBackend(settings.sandboxBackend)
+  ) {
+    caps.push(computerUse({
+      dimensions: [settings.streamResolutionWidth, settings.streamResolutionHeight],
+      readOnly: settings.computerUseReadOnly,
+    }) as unknown as ReturnType<typeof Capabilities.default>[number]);
+  }
   return caps;
 }
 
@@ -995,79 +1045,8 @@ class PrefixedMcpServer implements MCPServer {
   }
 }
 
-export function createSandboxClient(settings: Settings, environment = collectSandboxEnvironment(settings)): unknown {
-  if (settings.sandboxBackend === "docker") {
-    return withDockerNetwork(new DockerSandboxClient({
-      image: settings.dockerImage,
-      exposedPorts: parseExposedPorts(settings.dockerExposedPorts),
-    }), settings.dockerNetwork);
-  }
-  if (settings.sandboxBackend === "modal") {
-    const options: ConstructorParameters<typeof ModalSandboxClient>[0] = {
-      appName: settings.modalAppName,
-      timeoutMs: settings.modalTimeoutSeconds * 1000,
-      exposedPorts: parseExposedPorts(settings.dockerExposedPorts),
-      env: environment,
-    };
-    if (settings.modalImageRef) {
-      options.image = ModalImageSelector.fromTag(settings.modalImageRef);
-    }
-    if (settings.modalTokenId) {
-      options.tokenId = settings.modalTokenId;
-    }
-    if (settings.modalTokenSecret) {
-      options.tokenSecret = settings.modalTokenSecret;
-    }
-    if (settings.modalEnvironment) {
-      options.environment = settings.modalEnvironment;
-    }
-    return new ModalSandboxClient(options);
-  }
-  if (settings.sandboxBackend === "local") {
-    return new UnixLocalSandboxClient();
-  }
-  return undefined;
-}
-
-function withDockerNetwork(client: SandboxClient, network: string | undefined): SandboxClient {
-  const trimmed = network?.trim();
-  if (!trimmed) {
-    return client;
-  }
-  const wrapSession = async <T extends SandboxSessionLike>(session: T): Promise<T> => {
-    const containerId = (session as { state?: { containerId?: unknown } }).state?.containerId;
-    if (typeof containerId === "string" && containerId.length > 0) {
-      await connectDockerNetwork(trimmed, containerId);
-    }
-    return session;
-  };
-  return {
-    backendId: client.backendId,
-    ...(client.supportsDefaultOptions !== undefined ? { supportsDefaultOptions: client.supportsDefaultOptions } : {}),
-    ...(client.create ? { create: async (...args: any[]) => await wrapSession(await (client.create as any)(...args)) } : {}),
-    ...(client.resume ? { resume: async (state: SandboxSessionState) => await wrapSession(await client.resume!(state)) } : {}),
-    ...(client.delete ? { delete: async (state: SandboxSessionState) => await client.delete!(state) } : {}),
-    ...(client.serializeSessionState ? { serializeSessionState: async (state: SandboxSessionState, options) => await client.serializeSessionState!(state, options) } : {}),
-    ...(client.canPersistOwnedSessionState ? { canPersistOwnedSessionState: async (state: SandboxSessionState) => await client.canPersistOwnedSessionState!(state) } : {}),
-    ...(client.canReusePreservedOwnedSession ? { canReusePreservedOwnedSession: async (state: SandboxSessionState) => await client.canReusePreservedOwnedSession!(state) } : {}),
-    ...(client.deserializeSessionState ? { deserializeSessionState: async (state: Record<string, unknown>) => await client.deserializeSessionState!(state) } : {}),
-  };
-}
-
-async function connectDockerNetwork(network: string, containerId: string): Promise<void> {
-  const result = Bun.spawnSync(["docker", "network", "connect", network, containerId], {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  if (result.exitCode === 0) {
-    return;
-  }
-  const stderr = new TextDecoder().decode(result.stderr);
-  if (stderr.includes("already exists")) {
-    return;
-  }
-  throw new Error(`Failed to connect Docker sandbox container to network ${network}: ${stderr.trim()}`);
-}
+// createSandboxClient (+ withDockerNetwork / connectDockerNetwork) moved to the
+// agent-loop-free leaf ./sandbox; re-exported via `export * from "./sandbox"`.
 
 export type PrepareInputOptions = {
   sandboxClient?: unknown;
@@ -1204,6 +1183,22 @@ export type RunAgentStreamOptions = {
   sandboxClient?: unknown;
   sandboxEnvironment?: Record<string, string>;
   onRuntimeEvent?: (event: NormalizedRuntimeEvent) => Promise<void> | void;
+  // OWNERSHIP INVERSION (P1.2): an externally-owned, already-live sandbox
+  // session resolved by the per-turn resume-by-id path. When present,
+  // runAgentStream does NOT build (or resume, or discard) a client — it threads
+  // these straight into runOptions.sandbox as a NON-OWNED session. The SDK
+  // registers a provided session non-owned (manager.js) and NEVER reaps it on a
+  // normal finish (proven by spikes/sdk-keystone) — that is the keystone: the
+  // one box survives across turns. Mutually exclusive with the per-run
+  // createSandboxClient path (the owned branch takes precedence when both set).
+  // Agent-dependent decorators (file-downloads, lifecycle/repo-clone hooks) are
+  // re-applied around the resumed client here; the live `session`/`sessionState`
+  // carry the box, so no create()/resume() is re-invoked inside run().
+  ownedSandbox?: {
+    client: unknown;          // built by the per-turn resume path (the raw provider client)
+    session: unknown;         // SandboxSessionLike — the live, NON-OWNED handle (never reaped)
+    sessionState?: unknown;   // SandboxSessionState the box was resumed from
+  };
 };
 
 /**
@@ -1230,14 +1225,101 @@ export const stripProviderItemIdsFilter: CallModelInputFilter = ({ modelData }) 
   }),
 });
 
-/** The model-input filter the configured provider item id policy selects. */
+/**
+ * callModelInputFilter that normalizes every `computer_call` carrying BOTH
+ * `action` and `actions` down to EXACTLY ONE (keeps `actions`, drops `action`).
+ * The Azure computer-use endpoint rejects a request whose computer_call has
+ * both with `400 Computer call input must include exactly one of `action` or
+ * `actions``; and (live-proven against gpt-5.5's GA computer tool) it also
+ * rejects the `action`-only form, accepting ONLY the batched plural `actions`.
+ * The SDK 0.11.6 schema allows both, so a freshly-emitted
+ * screenshot call carries the redundant pair. This filter runs before EVERY
+ * model call — the turn-start history replay AND every mid-turn follow-up — so
+ * it covers the just-emitted (non-replayed) computer_call on the same turn,
+ * which the turn-start `prepareRunInput` sanitizer never sees. Items are cloned,
+ * never mutated.
+ */
+export const normalizeComputerCallsFilter: CallModelInputFilter = ({ modelData }) => ({
+  ...modelData,
+  input: normalizeComputerCallActions(
+    modelData.input as unknown as Array<Record<string, unknown>>,
+  ) as unknown as AgentInputItem[],
+});
+
+/**
+ * Compose a list of callModelInputFilters into one, applied left-to-right so
+ * each sees the prior filter's output.
+ */
+function composeCallModelInputFilters(filters: CallModelInputFilter[]): CallModelInputFilter {
+  return async (args) => {
+    let modelData = args.modelData;
+    for (const filter of filters) {
+      modelData = await filter({ ...args, modelData });
+    }
+    return modelData;
+  };
+}
+
+/**
+ * The model-input filter applied before every model call. The computer_call
+ * action/actions normalizer is ALWAYS on (the Azure endpoint 400s without it);
+ * the provider-item-id strip is layered on top when the configured policy
+ * selects it.
+ */
 export function callModelInputFilterForSettings(settings: Settings): CallModelInputFilter | undefined {
-  return settings.openaiProviderItemIds === "strip" ? stripProviderItemIdsFilter : undefined;
+  const filters: CallModelInputFilter[] = [normalizeComputerCallsFilter];
+  if (settings.openaiProviderItemIds === "strip") {
+    filters.push(stripProviderItemIdsFilter);
+  }
+  return composeCallModelInputFilters(filters);
 }
 
 export async function runAgentStream(agent: Agent<any, any>, input: PreparedAgentInput | string | RunState<any, any>, settings: Settings, overrides: RunAgentStreamOptions = {}) {
   const prepared: PreparedAgentInput = typeof input === "string" || input instanceof RunState ? { input } : input;
   const environment = overrides.sandboxEnvironment ?? collectSandboxEnvironment(settings);
+
+  // OWNED PATH (P1.2 ownership inversion): the per-turn resume path injected a
+  // live, externally-owned box. We thread the live `session` straight into
+  // runOptions.sandbox so the SDK registers it NON-OWNED and never reaps it on
+  // a normal finish (the keystone). We re-apply ONLY the agent-dependent
+  // decorators (file-downloads + lifecycle/repo-clone hooks) around the resumed
+  // client — the manifest-refresh-on-resume wrap is a no-op when a live
+  // `session` is supplied (resume is not re-invoked). This branch is reached
+  // ONLY when sandboxOwnershipEnabled gated the activity into resolving a box;
+  // with the flag off the activity never sets `ownedSandbox` and this whole
+  // block is skipped (byte-for-byte the legacy path).
+  if (overrides.ownedSandbox) {
+    const { client: ownedClient, session, sessionState } = overrides.ownedSandbox;
+    const runAs = sandboxRunAs(settings);
+    const fileDownloads = sandboxFileDownloadsForAgent(agent);
+    const resourceClient = fileDownloads.length > 0
+      ? withSandboxFileDownloads(ownedClient as SandboxClient, fileDownloads, {
+        ...(overrides.onRuntimeEvent ? { onRuntimeEvent: overrides.onRuntimeEvent } : {}),
+        ...(runAs ? { runAs } : {}),
+      })
+      : (ownedClient as SandboxClient);
+    const decoratedClient = withSandboxLifecycleHooks(resourceClient, [
+      ...sandboxLifecycleHooksForIds(sandboxLifecycleHookIds(settings)),
+      ...sandboxRepositoryCloneHooksForAgent(agent),
+    ], {
+      environment,
+      ...(overrides.onRuntimeEvent ? { onRuntimeEvent: overrides.onRuntimeEvent } : {}),
+      ...(runAs ? { runAs } : {}),
+    });
+    const ownedFilter = callModelInputFilterForSettings(settings);
+    const ownedRunOptions: Parameters<typeof run>[2] = {
+      stream: true,
+      maxTurns: settings.agentMaxModelCallsPerTurn,
+      ...(ownedFilter ? { callModelInputFilter: ownedFilter } : {}),
+    };
+    ownedRunOptions.sandbox = {
+      client: decoratedClient,
+      session,
+      ...(sessionState ? { sessionState } : {}),
+    } as SandboxRunConfig;
+    return await run(agent, prepared.input, ownedRunOptions);
+  }
+
   const rawClient = overrides.sandboxClient ?? createSandboxClient(settings, environment);
   const refreshedClient = rawClient
     ? withManifestRefreshOnResume(rawClient as SandboxClient, (agent as { defaultManifest?: Manifest }).defaultManifest)
@@ -1714,8 +1796,13 @@ function sandboxDownloadDirectory(download: SandboxFileDownload, mountPath: stri
 }
 
 function objectStorageFileMount(settings: Settings, prefix: string): any {
+  // Descriptor-driven: a nativeBucketMount backend (modal) mounts via the
+  // provider's own bucket-mount strategy and cannot mount Azure Blob entries —
+  // it needs pre-signed downloads instead. Reading the descriptor (not a
+  // hard-coded backend name) keeps this honest as providers are added.
+  const nativeBucketMount = CAPABILITY_DESCRIPTORS[settings.sandboxBackend].nativeBucketMount;
   if (settings.objectStorageBackend === "azure-blob") {
-    if (settings.sandboxBackend === "modal") {
+    if (nativeBucketMount) {
       throw new Error("Modal sandbox Azure Blob file resources require pre-signed download materialization because the current OpenAI Agents SDK Modal client does not support Azure Blob mount entries.");
     }
     const config = azureBlobMountConfig(settings);
@@ -1742,7 +1829,7 @@ function objectStorageFileMount(settings: Settings, prefix: string): any {
     accessKeyId: config.accessKeyId,
     secretAccessKey: config.secretAccessKey,
     readOnly: true,
-    mountStrategy: settings.sandboxBackend === "modal"
+    mountStrategy: nativeBucketMount
       ? new ModalCloudBucketMountStrategy()
       : inContainerMountStrategy({ pattern: { type: "rclone", mode: "fuse" } }),
   });
@@ -1892,72 +1979,11 @@ async function restoredSandboxSessionState(state: RunState<any, any>, client: un
   return await deserializeSandboxSessionStateEnvelope(client as SandboxClient, entry.sessionState);
 }
 
-/**
- * Extract the sandbox recovery entry from a run state as a plain JSON record,
- * for storage decoupled from the RunState blob (issue #35). Encapsulates the
- * underscore-internal `_sandbox` read in exactly one place.
- */
-export function sandboxStateEntryFromRunState(state: unknown): Record<string, unknown> | null {
-  const sandboxState = (state as any)?._sandbox;
-  if (!sandboxState) {
-    return null;
-  }
-  const entry = sandboxState.sessionsByAgent?.[sandboxState.currentAgentKey]
-    ?? (sandboxState.currentAgentKey && sandboxState.sessionState
-      ? {
-        backendId: sandboxState.backendId,
-        currentAgentKey: sandboxState.currentAgentKey,
-        currentAgentName: sandboxState.currentAgentName,
-        sessionState: sandboxState.sessionState,
-      }
-      : null);
-  if (!entry || !entry.sessionState) {
-    return null;
-  }
-  return entry as Record<string, unknown>;
-}
-
-/**
- * Items-mode counterpart of restoredSandboxSessionState: rebuild the live
- * sandbox session state from a stored entry (as produced by
- * sandboxStateEntryFromRunState) instead of from a RunState blob.
- */
-export async function restoredSandboxSessionStateFromEntry(entry: Record<string, unknown>, client: unknown): Promise<SandboxSessionState | undefined> {
-  if (!client || !entry || typeof entry !== "object" || !("sessionState" in entry)) {
-    return undefined;
-  }
-  if (entry.backendId && (client as SandboxClient).backendId !== entry.backendId) {
-    throw new Error("Stored sandbox envelope backend does not match the configured sandbox client");
-  }
-  return await deserializeSandboxSessionStateEnvelope(client as SandboxClient, entry.sessionState);
-}
-
-export async function deserializeSandboxSessionStateEnvelope(client: SandboxClient, envelope: unknown): Promise<SandboxSessionState | undefined> {
-  if (!envelope || typeof envelope !== "object") {
-    return undefined;
-  }
-  if (!client.deserializeSessionState) {
-    throw new Error("Sandbox client must implement deserializeSessionState() to resume RunState sandbox state");
-  }
-  const state = envelope as {
-    providerState?: Record<string, unknown>;
-    manifest?: unknown;
-    snapshot?: unknown;
-    snapshotFingerprint?: unknown;
-    snapshotFingerprintVersion?: unknown;
-    workspaceReady?: unknown;
-    exposedPorts?: unknown;
-  };
-  return await client.deserializeSessionState({
-    ...(state.providerState ?? {}),
-    manifest: state.manifest,
-    ...(state.snapshot !== undefined ? { snapshot: state.snapshot } : {}),
-    ...(state.snapshotFingerprint !== undefined ? { snapshotFingerprint: state.snapshotFingerprint } : {}),
-    ...(state.snapshotFingerprintVersion !== undefined ? { snapshotFingerprintVersion: state.snapshotFingerprintVersion } : {}),
-    workspaceReady: state.workspaceReady,
-    ...(state.exposedPorts ? { exposedPorts: structuredClone(state.exposedPorts) } : {}),
-  });
-}
+// sandboxStateEntryFromRunState + restoredSandboxSessionStateFromEntry +
+// deserializeSandboxSessionStateEnvelope moved to the agent-loop-free leaf
+// ./sandbox; re-exported via `export * from "./sandbox"`. The private
+// restoredSandboxSessionState above (which takes an agent-loop RunState) calls
+// the moved deserializeSandboxSessionStateEnvelope, imported from ./sandbox.
 
 export type SandboxLifecycleHookPhase = "beforeAgentStart";
 
@@ -2208,7 +2234,7 @@ export function sandboxCommandExitCode(result: unknown): number | null {
   return null;
 }
 
-function sandboxCommandOutput(result: unknown): string {
+export function sandboxCommandOutput(result: unknown): string {
   if (!result || typeof result !== "object") {
     return "";
   }
@@ -2236,7 +2262,7 @@ function assertSandboxCommandSucceeded(result: unknown, operation: string): void
   }
 }
 
-function sandboxCommandStillRunning(result: unknown): boolean {
+export function sandboxCommandStillRunning(result: unknown): boolean {
   if (typeof result === "string") {
     return /Process running with session ID \d+/u.test(result);
   }

@@ -115,6 +115,19 @@ export const sessions = pgTable("sessions", {
   metadata: jsonb("metadata").$type<Record<string, unknown>>().notNull().default({}),
   model: text("model").notNull(),
   sandboxBackend: text("sandbox_backend").notNull(),
+  // The OS this session's box runs. Defaults to 'linux' (today's only OS, so
+  // every existing + new row is a behavior-preserving no-op). CHECK-constrained
+  // to the SandboxOs enum (linux|macos|windows) in migration 0018.
+  sandboxOs: text("sandbox_os").notNull().default("linux"),
+  // The shared-sandbox group this session's box belongs to. Defaults to the
+  // session's OWN id (a singleton group: group === session — today's 1:1
+  // behavior). When spawned shared via session_create, set to the PARENT's
+  // sandboxGroupId so both run in ONE box. Immutable once set. NOT an FK (the
+  // value is this row's id or an ancestor session's id in the same workspace;
+  // the live lease row, not a sandbox_groups table, materializes the group).
+  // The app generates the uuid and uses it for both id and sandbox_group_id in
+  // one insert — it cannot SQL-default to id (id is defaultRandom()).
+  sandboxGroupId: uuid("sandbox_group_id").notNull(),
   environmentId: uuid("environment_id").references(() => workspaceEnvironments.id, { onDelete: "set null" }),
   // Non-default first-party MCP token permissions (manager-style sessions);
   // null means the fixed worker default set in @opengeni/runtime.
@@ -151,6 +164,9 @@ export const sessions = pgTable("sessions", {
   workspaceCreated: index("sessions_workspace_created_idx").on(table.workspaceId, table.createdAt),
   environment: index("sessions_environment_idx").on(table.workspaceId, table.environmentId),
   parent: index("sessions_parent_idx").on(table.workspaceId, table.parentSessionId),
+  // Routing index: resolve session_id -> sandbox_group_id at every lease entry
+  // point and enumerate all sessions in a group for attribution/disclosure.
+  sandboxGroup: index("sessions_sandbox_group_idx").on(table.workspaceId, table.sandboxGroupId),
   // Partial unique index: one session per (workspace, create_idempotency_key)
   // when a key is present. Concurrent creates racing on the same key see a
   // unique violation on all but one; the domain layer catches it and returns
@@ -258,6 +274,9 @@ export const sessionTurns = pgTable("session_turns", {
   model: text("model").notNull(),
   reasoningEffort: text("reasoning_effort").notNull(),
   sandboxBackend: text("sandbox_backend").notNull(),
+  // Per-turn OS override. NULL = inherit the session's sandbox_os. CHECK-
+  // constrained to the SandboxOs enum (or NULL) in migration 0018.
+  sandboxOs: text("sandbox_os"),
   metadata: jsonb("metadata").$type<Record<string, unknown>>().notNull().default({}),
   startedAt: timestamp("started_at", { withTimezone: true }),
   finishedAt: timestamp("finished_at", { withTimezone: true }),
@@ -367,6 +386,157 @@ export const sandboxSessionEnvelopes = pgTable("sandbox_session_envelopes", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => ({
   sessionIdx: uniqueIndex("sandbox_session_envelopes_session_idx").on(table.workspaceId, table.sessionId),
+}));
+
+// The 4 liveness states of the singleton lease. Exported so the query layer and
+// the stateless resume-by-id path share one source of truth for the domain.
+export const sandboxLeaseLivenessValues = ["cold", "warming", "warm", "draining"] as const;
+
+// One row per GROUP: the SOLE enforcer of the strict-singleton-box invariant.
+// uniqueIndex(workspaceId, sandboxGroupId) + SELECT…FOR UPDATE + cold->warming
+// CAS + integer lease_epoch fence. Re-keyed to sandboxGroupId from the start
+// (addendum B.2) so today's 1:1 world (sandboxGroupId == session id, set in
+// 0018) is a behavior-preserving no-op. Mirrors the account/workspace FK chain
+// of sandboxSessionEnvelopes; sandboxGroupId is a BARE uuid (NOT an FK — the
+// value is a session id or an ancestor's, and an FK would let a founder's
+// deletion cascade-kill a box still in use by a spawned session).
+export const sandboxLeases = pgTable("sandbox_leases", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  accountId: uuid("account_id").notNull().references(() => managedAccounts.id, { onDelete: "cascade" }),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  sandboxGroupId: uuid("sandbox_group_id").notNull(),
+
+  liveness: text("liveness", { enum: sandboxLeaseLivenessValues }).notNull().default("cold"),
+  refcount: integer("refcount").notNull().default(0),
+  turnHolders: integer("turn_holders").notNull().default(0),
+  viewerHolders: integer("viewer_holders").notNull().default(0),
+
+  instanceId: text("instance_id"),
+  backend: text("backend").notNull(),
+  os: text("os").notNull().default("linux"),
+  dataPlaneUrl: text("data_plane_url"),
+  // The REAL PTY terminal (ttyd pty-ws) rides a SEPARATE provider tunnel (7681)
+  // from the desktop noVNC (6080), so its resolved URL is cached independently.
+  // Recorded under the epoch fence by recordLeaseTerminalDataPlaneUrl; reset to
+  // null on every box re-key (warm-commit / fail / drain), symmetric with
+  // data_plane_url.
+  terminalDataPlaneUrl: text("terminal_data_plane_url"),
+
+  // integer (NOT bigint): the lease-epoch spike proved a raw int8 read returns a
+  // JS STRING from postgres-js, breaking the strict epoch-fence comparison (it
+  // was always-true → every turn fenced); int4 returns a JS number, the fix.
+  // Epochs never approach 2^31, so the narrower type loses nothing.
+  leaseEpoch: integer("lease_epoch").notNull().default(0),
+
+  // The group box-envelope (the "envelope split" Critical): the small recovery
+  // descriptor to resume()-by-id the group's box without a per-session join.
+  resumeBackendId: text("resume_backend_id"),
+  resumeState: jsonb("resume_state").$type<Record<string, unknown>>(),
+
+  // Warm-time billing cursor: last_meter_at = accrual cursor; last_meter_tick =
+  // idempotency tick (warm_seconds accrued idempotent on
+  // (sandbox_group_id, lease_epoch, last_meter_tick) in P2.1).
+  lastMeterAt: timestamp("last_meter_at", { withTimezone: true }),
+  lastMeterTick: integer("last_meter_tick").notNull().default(0),
+
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+  groupIdx: uniqueIndex("sandbox_leases_group_idx").on(table.workspaceId, table.sandboxGroupId),
+  reaperIdx: index("sandbox_leases_reaper_idx").on(table.expiresAt)
+    .where(sql`${table.liveness} in ('warming','warm','draining')`),
+}));
+
+// N rows per group: one per live holder. Makes release idempotent
+// (delete-my-row, never blind decrement) and lets the reaper recompute refcount.
+export const sandboxLeaseHolders = pgTable("sandbox_lease_holders", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  accountId: uuid("account_id").notNull().references(() => managedAccounts.id, { onDelete: "cascade" }),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  leaseId: uuid("lease_id").notNull().references(() => sandboxLeases.id, { onDelete: "cascade" }),
+  kind: text("kind", { enum: ["turn", "viewer"] }).notNull(),
+  holderId: text("holder_id").notNull(),
+  // The attributing session within the (possibly shared) group.
+  subjectId: uuid("subject_id"),
+  lastHeartbeatAt: timestamp("last_heartbeat_at", { withTimezone: true }).notNull().defaultNow(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => ({
+  holderIdx: uniqueIndex("sandbox_lease_holders_holder_idx").on(table.leaseId, table.kind, table.holderId),
+  staleIdx: index("sandbox_lease_holders_stale_idx").on(table.kind, table.lastHeartbeatAt),
+  leaseIdx: index("sandbox_lease_holders_lease_idx").on(table.leaseId),
+}));
+
+// The recording lifecycle states (P4.3). Exported so the activity + the query
+// layer share one source of truth for the §3.1 state machine.
+export const sessionRecordingStateValues = ["recording", "finalizing", "available", "failed"] as const;
+export const sessionRecordingModeValues = ["manual", "on-turn", "on-verify"] as const;
+export const sessionRecordingCodecValues = ["h264-mp4", "vp9-webm"] as const;
+
+// One row per recording — the durable index for the "agent films itself proving
+// the fix" loop. ffmpeg x11grab of the SAME :0 humans watch, finalized by
+// reading the bytes off the box and PUTting them to @opengeni/storage in the
+// process that holds the resumed-by-id handle (never a Temporal payload, F10).
+// Mirrors the account/workspace/session FK chain of sandboxSessionEnvelopes;
+// turnId is ON DELETE SET NULL (a deleted turn must not kill the artifact row).
+export const sessionRecordings = pgTable("session_recordings", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  accountId: uuid("account_id").notNull().references(() => managedAccounts.id, { onDelete: "cascade" }),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  sessionId: uuid("session_id").notNull().references(() => sessions.id, { onDelete: "cascade" }),
+  turnId: uuid("turn_id").references(() => sessionTurns.id, { onDelete: "set null" }),
+
+  state: text("state", { enum: sessionRecordingStateValues }).notNull(),
+  mode: text("mode", { enum: sessionRecordingModeValues }).notNull(),
+  codec: text("codec", { enum: sessionRecordingCodecValues }).notNull(),
+
+  storageKey: text("storage_key"),
+  sizeBytes: bigint("size_bytes", { mode: "number" }),
+  durationSeconds: numeric("duration_seconds").$type<number>(),
+
+  width: integer("width").notNull(),
+  height: integer("height").notNull(),
+
+  reason: text("reason"),
+
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  finalizedAt: timestamp("finalized_at", { withTimezone: true }),
+}, (table) => ({
+  sessionIdx: index("session_recordings_session_idx").on(table.workspaceId, table.sessionId, table.createdAt),
+}));
+
+// Channel-A interactive PTY sessions (P4.4 / modules/08-channel-a.md §3.1). The
+// ONLY new persistent state Channel A needs — FS/Git reads are stateless point
+// queries; an interactive PTY is a live in-box process keyed by the SDK's numeric
+// exec-session id (writeStdin({sessionId})). We map our UUID ptyId <-> that id,
+// the owning workspace/session, the lease_epoch that fences it to the box it was
+// opened on (a box re-key strands the PTY -> reaped with reason owner_gone), and
+// a last_input_at heartbeat so the reaper can kill idle/orphaned PTYs. Mirrors
+// the account/workspace/session FK chain of sandboxSessionEnvelopes.
+export const sandboxPtySessions = pgTable("sandbox_pty_sessions", {
+  id: uuid("id").primaryKey().defaultRandom(), // == ptyId on the wire
+  accountId: uuid("account_id").notNull().references(() => managedAccounts.id, { onDelete: "cascade" }),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  sessionId: uuid("session_id").notNull().references(() => sessions.id, { onDelete: "cascade" }),
+  // The SDK numeric exec-session id used by writeStdin({ sessionId }). Null until
+  // the open exec yields a still-running process (a fast-exiting shell has none).
+  execSessionId: integer("exec_session_id"),
+  leaseEpoch: integer("lease_epoch").notNull(), // fenced to the box that opened it
+  cols: integer("cols").notNull(),
+  rows: integer("rows").notNull(),
+  shell: text("shell").notNull(),
+  cwd: text("cwd").notNull(),
+  status: text("status").notNull().default("open"), // 'open' | 'closed'
+  // The viewer grant/subject that opened it (free-text — access subjects are not
+  // always UUIDs, M5; so a text column, never a uuid NOT NULL).
+  openedBy: text("opened_by").notNull(),
+  lastInputAt: timestamp("last_input_at", { withTimezone: true }).notNull().defaultNow(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  closedAt: timestamp("closed_at", { withTimezone: true }),
+}, (table) => ({
+  openIdx: index("sandbox_pty_sessions_session_idx")
+    .on(table.workspaceId, table.sessionId)
+    .where(sql`${table.status} = 'open'`),
 }));
 
 export const scheduledTasks = pgTable("scheduled_tasks", {

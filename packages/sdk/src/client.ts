@@ -52,6 +52,42 @@ import type {
   SessionEvent,
   SessionGoal,
   SessionTurn,
+  // Stream surfacing (Phase 5): capability negotiation + viewer lifecycle + config.
+  SessionCapabilities,
+  AttachViewerRequest,
+  AttachViewerResponse,
+  AcknowledgeStreamRequest,
+  AcknowledgeStreamResponse,
+  ViewerHeartbeatRequest,
+  ViewerHeartbeatResponse,
+  // Channel-A structured services (P4.4).
+  FsListRequest,
+  FsListResponse,
+  FsReadRequest,
+  FsReadResponse,
+  FsWriteRequest,
+  FsWriteResponse,
+  FsDeleteRequest,
+  FsDeleteResponse,
+  FsMoveRequest,
+  FsMoveResponse,
+  FsMkdirRequest,
+  FsMkdirResponse,
+  GitStatusRequest,
+  GitStatusResponse,
+  GitDiffRequest,
+  GitDiffResponse,
+  GitLogRequest,
+  GitLogResponse,
+  GitShowRequest,
+  GitShowResponse,
+  TerminalExecRequest,
+  TerminalExecResponse,
+  PtyOpenRequest,
+  PtyOpenResponse,
+  PtyWriteRequest,
+  PtyResizeRequest,
+  PtyCloseRequest,
   ToolRef,
   UpdateScheduledTaskRequest,
   UpdateSessionGoalRequest,
@@ -401,6 +437,144 @@ export class OpenGeniClient {
    */
   async compactSessionContext(workspaceId: string, sessionId: string): Promise<CompactSessionContextResult> {
     return await this.requestJson<CompactSessionContextResult>("POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/context/compact`, {});
+  }
+
+  // --- Channel-A structured services (P4.4) ------------------------------------
+  // FileSystem (Pierre tree), Git (Pierre diff), Terminal (exec + PTY). Each is a
+  // synchronous API-direct point query; the fs.changed/git.changed/terminal.pty.*
+  // notifications + the PTY output stream arrive on the existing event SSE.
+
+  /** FileSystem: list a directory tree (feeds the Pierre file tree). */
+  async fsList(workspaceId: string, sessionId: string, request: FsListRequest = {}): Promise<FsListResponse> {
+    return await this.requestJson<FsListResponse>("POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/fs/list`, request);
+  }
+
+  /** FileSystem: read a file (text or base64; binary-safe, size-capped). */
+  async fsRead(workspaceId: string, sessionId: string, request: FsReadRequest): Promise<FsReadResponse> {
+    return await this.requestJson<FsReadResponse>("POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/fs/read`, request);
+  }
+
+  /** FileSystem: write a file (last-writer-wins; emits fs.changed). */
+  async fsWrite(workspaceId: string, sessionId: string, request: FsWriteRequest): Promise<FsWriteResponse> {
+    return await this.requestJson<FsWriteResponse>("POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/fs/write`, request);
+  }
+
+  /** FileSystem: delete a path (emits fs.changed). */
+  async fsDelete(workspaceId: string, sessionId: string, request: FsDeleteRequest): Promise<FsDeleteResponse> {
+    return await this.requestJson<FsDeleteResponse>("POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/fs/delete`, request);
+  }
+
+  /** FileSystem: move/rename a path (emits fs.changed; 409 if destination exists and overwrite is false). */
+  async fsMove(workspaceId: string, sessionId: string, request: FsMoveRequest): Promise<FsMoveResponse> {
+    return await this.requestJson<FsMoveResponse>("POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/fs/move`, request);
+  }
+
+  /** FileSystem: create a directory (emits fs.changed; recursive defaults to true). */
+  async fsMkdir(workspaceId: string, sessionId: string, request: FsMkdirRequest): Promise<FsMkdirResponse> {
+    return await this.requestJson<FsMkdirResponse>("POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/fs/mkdir`, request);
+  }
+
+  /** Git: working-tree/index status (the Pierre file-status feed). */
+  async gitStatus(workspaceId: string, sessionId: string, request: GitStatusRequest = {}): Promise<GitStatusResponse> {
+    return await this.requestJson<GitStatusResponse>("POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/git/status`, request);
+  }
+
+  /** Git: structured diff hunks (the Pierre diff feed). */
+  async gitDiff(workspaceId: string, sessionId: string, request: GitDiffRequest = {}): Promise<GitDiffResponse> {
+    return await this.requestJson<GitDiffResponse>("POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/git/diff`, request);
+  }
+
+  /** Git: commit log. */
+  async gitLog(workspaceId: string, sessionId: string, request: GitLogRequest = {}): Promise<GitLogResponse> {
+    return await this.requestJson<GitLogResponse>("POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/git/log`, request);
+  }
+
+  /** Git: show a commit (diff vs first parent) or fetch a raw blob at a ref. */
+  async gitShow(workspaceId: string, sessionId: string, request: GitShowRequest): Promise<GitShowResponse> {
+    return await this.requestJson<GitShowResponse>("POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/git/show`, request);
+  }
+
+  /** Terminal: run a bounded command, returning buffered stdout/stderr inline. */
+  async terminalExec(workspaceId: string, sessionId: string, request: TerminalExecRequest): Promise<TerminalExecResponse> {
+    return await this.requestJson<TerminalExecResponse>("POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/terminal/exec`, request);
+  }
+
+  /** Terminal: open an interactive PTY. Output streams on the event SSE as
+   *  terminal.pty.output.delta; drive it with terminalPtyWrite. */
+  async terminalPtyOpen(workspaceId: string, sessionId: string, request: PtyOpenRequest = {}): Promise<PtyOpenResponse> {
+    return await this.requestJson<PtyOpenResponse>("POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/terminal/pty`, request);
+  }
+
+  /** Terminal: send stdin to an open PTY (output rides A1). */
+  async terminalPtyWrite(workspaceId: string, sessionId: string, request: PtyWriteRequest): Promise<void> {
+    await this.requestVoid("POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/terminal/pty/write`, request);
+  }
+
+  /** Terminal: resize an open PTY. */
+  async terminalPtyResize(workspaceId: string, sessionId: string, request: PtyResizeRequest): Promise<void> {
+    await this.requestVoid("POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/terminal/pty/resize`, request);
+  }
+
+  /** Terminal: close an open PTY (idempotent). */
+  async terminalPtyClose(workspaceId: string, sessionId: string, request: PtyCloseRequest): Promise<void> {
+    await this.requestVoid("POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/terminal/pty/close`, request);
+  }
+
+  // --- Stream surfacing: capability negotiation + viewer lifecycle (Phase 5) ---
+  // The capability doc is the single source of UI truth (degradation is always a
+  // value, never a crash). The desktop pixel plane (Channel B) is gated behind an
+  // un-redacted-acknowledgment + a viewer holder; the structured terminal/files/
+  // git surfaces (Channel A) ride the methods above and the event SSE.
+
+  /** Read the negotiated capability doc for a session WITHOUT acquiring a viewer
+   *  holder (no warm, no spawn). Drives capability-gated rendering: which
+   *  surfaces mount, the per-surface unavailability reasons, and the lease
+   *  liveness the client polls on while `cold`/`warming`. The desktop URL/token
+   *  are minted in-process only when the box is warm AND the principal has
+   *  acknowledged the un-redacted plane. */
+  async getStreamCapabilities(workspaceId: string, sessionId: string): Promise<SessionCapabilities> {
+    return await this.requestJson<SessionCapabilities>(
+      "GET", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/stream-capabilities`);
+  }
+
+  /** Record the calling principal's acknowledgment of the un-redacted desktop
+   *  pixel plane (and, when the box is shared, the shared-exposure disclosure).
+   *  The desktop viewer-attach path returns 409 until this is recorded. */
+  async acknowledgeStream(
+    workspaceId: string, sessionId: string, request: AcknowledgeStreamRequest = {},
+  ): Promise<AcknowledgeStreamResponse> {
+    return await this.requestJson<AcknowledgeStreamResponse>(
+      "POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/stream-capabilities/acknowledge`, request);
+  }
+
+  /** Attach a viewer holder (refcounted liveness — keeps the box warm while
+   *  watched/used), spinning the box up in-process when cold, and mint the scoped
+   *  direct-to-provider URLs for the requested plane(s). `request.desktop:true`
+   *  opts into the un-redacted pixel plane and mints the noVNC URL — that plane
+   *  alone throws `OpenGeniApiError(409)` when the un-redacted/shared
+   *  acknowledgment is missing (the consent gate). A terminal-only attach
+   *  (`desktop` omitted/false) warms the box + mints the pty-ws terminal cell with
+   *  NO consent gate. An omitted `viewerId` mints a fresh one. */
+  async attachViewer(
+    workspaceId: string, sessionId: string, request: AttachViewerRequest = {},
+  ): Promise<AttachViewerResponse> {
+    return await this.requestJson<AttachViewerResponse>(
+      "POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/viewers`, request);
+  }
+
+  /** Heartbeat a viewer holder (Channel-A app-level liveness). A closed laptop
+   *  stops sending these → the reaper drops the holder within ~90s. Echoes
+   *  `leaseEpoch` so a superseded epoch is rejected (`alive:false` → re-attach). */
+  async heartbeatViewer(
+    workspaceId: string, sessionId: string, viewerId: string, request: ViewerHeartbeatRequest,
+  ): Promise<ViewerHeartbeatResponse> {
+    return await this.requestJson<ViewerHeartbeatResponse>(
+      "POST", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/viewers/${viewerId}/heartbeat`, request);
+  }
+
+  /** Detach a viewer (delete this holder; idempotent delete-my-row). */
+  async detachViewer(workspaceId: string, sessionId: string, viewerId: string): Promise<void> {
+    await this.requestVoid("DELETE", `/v1/workspaces/${workspaceId}/sessions/${sessionId}/viewers/${viewerId}`);
   }
 
   // --- Access + workspaces -----------------------------------------------------

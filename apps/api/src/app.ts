@@ -14,6 +14,7 @@ import { HTTPException } from "hono/http-exception";
 import type { ApiRouteDeps, AppDependencies, ObjectStorageDependency, SessionWorkflowClient } from "./dependencies";
 import { requireAccessGrant } from "./access";
 import { createManagedAuth } from "./auth/managed-auth";
+import { createApiSandboxClient, makeResumeBoxById } from "./sandbox/access";
 import { requireLimit } from "./billing/limits";
 import { buildOpenGeniMcpServer } from "./mcp/server";
 import { requireAccessKey } from "./http/auth";
@@ -70,6 +71,12 @@ export function createApp(deps: AppDependencies): Hono {
       });
     },
   };
+  // The API process's own agent-loop-free sandbox client — the API-direct
+  // control-plane seam. Constructed from settings (resumes boxes by id
+  // in-process) unless a client was injected (tests). resumeBoxById is always
+  // concrete for routes; it throws SandboxResumeError when sandboxBackend=none.
+  const sandboxClient = deps.sandboxClient ?? createApiSandboxClient(deps.settings);
+  const resumeBoxById = deps.resumeBoxById ?? makeResumeBoxById(sandboxClient);
   const routeDeps: ApiRouteDeps = {
     ...deps,
     githubStateSecret: deps.githubStateSecret ?? deps.settings.githubAppManifestStateSecret ?? crypto.randomUUID(),
@@ -77,6 +84,8 @@ export function createApp(deps: AppDependencies): Hono {
     objectStorage,
     documentIndexer,
     getDocumentServices,
+    ...(sandboxClient ? { sandboxClient } : {}),
+    resumeBoxById,
   };
   const app = new Hono();
   const observability = deps.observability ?? createObservability(deps.settings, { component: "api" });
@@ -188,6 +197,10 @@ export function createApp(deps: AppDependencies): Hono {
     },
     productAccessMode: deps.settings.productAccessMode,
     auth: clientAuthConfig(deps.settings),
+    // Channel-A structured services (P4.4) ride exec/readFile/createEditor,
+    // available on every real backend; `none` has no box so they are all off.
+    // Per-session availability is still negotiated on /stream-capabilities.
+    structuredServices: structuredServicesHint(deps.settings.sandboxBackend),
   })));
 
   app.all("/v1/workspaces/:workspaceId/mcp", async (c) => {
@@ -228,6 +241,11 @@ function clientAuthConfig(settings: AppDependencies["settings"]) {
   return { mode: "none" as const };
 }
 
+function structuredServicesHint(backend: string): { fileSystem: boolean; git: boolean; terminalEvents: boolean } {
+  const hasBox = backend !== "none";
+  return { fileSystem: hasBox, git: hasBox, terminalEvents: hasBox };
+}
+
 export function allowedCorsOrigin(pattern: string, origin: string): boolean {
   return new RegExp(`^(?:${pattern})$`).test(origin);
 }
@@ -256,6 +274,10 @@ const routeLabelPatterns: Array<{ pattern: RegExp; label: string }> = [
   { pattern: /^\/v1\/workspaces\/[^/]+\/sessions\/[^/]+\/turns\/reorder$/, label: "/v1/workspaces/:workspaceId/sessions/:id/turns/reorder" },
   { pattern: /^\/v1\/workspaces\/[^/]+\/sessions\/[^/]+\/turns\/[^/]+$/, label: "/v1/workspaces/:workspaceId/sessions/:id/turns/:turnId" },
   { pattern: /^\/v1\/workspaces\/[^/]+\/sessions\/[^/]+\/turns$/, label: "/v1/workspaces/:workspaceId/sessions/:id/turns" },
+  { pattern: /^\/v1\/workspaces\/[^/]+\/sessions\/[^/]+\/stream-capabilities$/, label: "/v1/workspaces/:workspaceId/sessions/:id/stream-capabilities" },
+  { pattern: /^\/v1\/workspaces\/[^/]+\/sessions\/[^/]+\/viewers\/[^/]+\/heartbeat$/, label: "/v1/workspaces/:workspaceId/sessions/:id/viewers/:viewerId/heartbeat" },
+  { pattern: /^\/v1\/workspaces\/[^/]+\/sessions\/[^/]+\/viewers\/[^/]+$/, label: "/v1/workspaces/:workspaceId/sessions/:id/viewers/:viewerId" },
+  { pattern: /^\/v1\/workspaces\/[^/]+\/sessions\/[^/]+\/viewers$/, label: "/v1/workspaces/:workspaceId/sessions/:id/viewers" },
   { pattern: /^\/v1\/workspaces\/[^/]+\/sessions\/[^/]+\/goal$/, label: "/v1/workspaces/:workspaceId/sessions/:id/goal" },
   { pattern: /^\/v1\/workspaces\/[^/]+\/sessions\/[^/]+$/, label: "/v1/workspaces/:workspaceId/sessions/:id" },
   { pattern: /^\/v1\/workspaces\/[^/]+\/files\/uploads$/, label: "/v1/workspaces/:workspaceId/files/uploads" },

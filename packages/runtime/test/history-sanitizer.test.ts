@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { sanitizeHistoryItemsForModel } from "../src/history-sanitizer";
+import {
+  computerCallNormalizingFetch,
+  normalizeComputerCallActions,
+  rewriteComputerCallsToActionsOnly,
+  sanitizeHistoryItemsForModel,
+} from "../src/history-sanitizer";
 
 // Item shapes mirror the SDK's canonical history representation
 // (`type` discriminator, camelCase `callId`) that is persisted verbatim into
@@ -128,5 +133,173 @@ describe("sanitizeHistoryItemsForModel", () => {
     sanitizeHistoryItemsForModel(items);
     expect(items).toHaveLength(2);
     expect(JSON.stringify(items)).toBe(snapshot);
+  });
+});
+
+describe("normalizeComputerCallActions", () => {
+  test("normalizes a computer_call carrying BOTH action and actions to exactly one (keeps actions)", () => {
+    // The live Azure 400: a freshly-emitted screenshot computer_call carries
+    // both the legacy singular `action` and the GA batched `actions`. The GA
+    // computer tool (how gpt-5.5 serializes it) accepts ONLY the plural
+    // `actions`; the `action`-only form is rejected too. So we keep `actions`.
+    const conflicted = {
+      type: "computer_call",
+      callId: "cu_1",
+      status: "completed",
+      action: { type: "screenshot" },
+      actions: [{ type: "screenshot" }],
+    };
+    const items = [userMessage("take a screenshot"), conflicted];
+    const result = normalizeComputerCallActions(items);
+    const normalized = result[1] as Record<string, unknown>;
+    expect("actions" in normalized).toBe(true);
+    expect("action" in normalized).toBe(false);
+    expect(normalized.actions).toEqual([{ type: "screenshot" }]);
+    // Other identifying fields survive untouched.
+    expect(normalized.callId).toBe("cu_1");
+    expect(normalized.status).toBe("completed");
+    // The non-computer item passes through by reference (byte-identical).
+    expect(result[0]).toBe(items[0]);
+  });
+
+  test("passes through items without the conflict byte-identical (same references)", () => {
+    const actionOnly = { type: "computer_call", callId: "cu_a", status: "completed", action: { type: "screenshot" } };
+    const actionsOnly = { type: "computer_call", callId: "cu_b", status: "completed", actions: [{ type: "click", x: 1, y: 2 }] };
+    const items = [userMessage("hi"), actionOnly, functionCall("call_1"), actionsOnly];
+    const result = normalizeComputerCallActions(items);
+    // No conflict anywhere → every item is the same reference, order preserved.
+    expect(result).toHaveLength(items.length);
+    result.forEach((item, i) => expect(item).toBe(items[i]));
+  });
+
+  test("does not mutate the input array or its items", () => {
+    const conflicted = {
+      type: "computer_call",
+      callId: "cu_1",
+      status: "completed",
+      action: { type: "screenshot" },
+      actions: [{ type: "screenshot" }],
+    };
+    const items = [conflicted];
+    const snapshot = JSON.stringify(items);
+    normalizeComputerCallActions(items);
+    expect(JSON.stringify(items)).toBe(snapshot);
+    expect("actions" in conflicted).toBe(true);
+  });
+
+  test("empty input returns empty", () => {
+    expect(normalizeComputerCallActions([])).toEqual([]);
+  });
+});
+
+describe("rewriteComputerCallsToActionsOnly", () => {
+  test("collapses a both-fields computer_call to actions-only", () => {
+    const body = {
+      model: "gpt-5.5",
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "screenshot" }] },
+        {
+          type: "computer_call",
+          call_id: "cu_1",
+          status: "completed",
+          action: { type: "screenshot" },
+          actions: [{ type: "screenshot" }],
+        },
+      ],
+    };
+    const changed = rewriteComputerCallsToActionsOnly(body);
+    expect(changed).toBe(true);
+    const cc = body.input[1] as Record<string, unknown>;
+    expect("action" in cc).toBe(false);
+    expect(cc.actions).toEqual([{ type: "screenshot" }]);
+    // Identifying fields and the non-computer item survive.
+    expect(cc.call_id).toBe("cu_1");
+    expect(body.input[0]).toEqual({
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "screenshot" }],
+    });
+  });
+
+  test("wraps an action-only computer_call into actions-only", () => {
+    const body = {
+      input: [{ type: "computer_call", call_id: "cu_x", action: { type: "click", x: 3, y: 4 } }],
+    };
+    const changed = rewriteComputerCallsToActionsOnly(body);
+    expect(changed).toBe(true);
+    const cc = body.input[0] as Record<string, unknown>;
+    expect("action" in cc).toBe(false);
+    expect(cc.actions).toEqual([{ type: "click", x: 3, y: 4 }]);
+  });
+
+  test("leaves an already actions-only computer_call unchanged (no-op)", () => {
+    const body = {
+      input: [{ type: "computer_call", call_id: "cu_y", actions: [{ type: "scroll" }] }],
+    };
+    const changed = rewriteComputerCallsToActionsOnly(body);
+    expect(changed).toBe(false);
+  });
+
+  test("ignores bodies with no computer_call and non-array input", () => {
+    expect(rewriteComputerCallsToActionsOnly({ input: [{ type: "message" }] })).toBe(false);
+    expect(rewriteComputerCallsToActionsOnly({ input: "nope" })).toBe(false);
+    expect(rewriteComputerCallsToActionsOnly(null)).toBe(false);
+    expect(rewriteComputerCallsToActionsOnly("string")).toBe(false);
+  });
+});
+
+describe("computerCallNormalizingFetch", () => {
+  test("rewrites a both-fields computer_call request body to actions-only on the wire", async () => {
+    let seenBody: string | undefined;
+    const base = (async (_url: unknown, init?: { body?: unknown }) => {
+      seenBody = init?.body as string;
+      return new Response("{}");
+    }) as unknown as typeof fetch;
+
+    const wrapped = computerCallNormalizingFetch(base);
+    const originalBody = JSON.stringify({
+      input: [
+        {
+          type: "computer_call",
+          call_id: "cu_1",
+          action: { type: "screenshot" },
+          actions: [{ type: "screenshot" }],
+        },
+      ],
+    });
+    await wrapped("https://aoai/openai/v1/responses", { method: "POST", body: originalBody });
+
+    expect(seenBody).toBeDefined();
+    const sent = JSON.parse(seenBody as string);
+    const cc = sent.input[0];
+    expect("action" in cc).toBe(false);
+    expect(cc.actions).toEqual([{ type: "screenshot" }]);
+  });
+
+  test("forwards a non-computer_call request untouched (same init reference)", async () => {
+    let seenInit: unknown;
+    const base = (async (_url: unknown, init?: unknown) => {
+      seenInit = init;
+      return new Response("{}");
+    }) as unknown as typeof fetch;
+
+    const wrapped = computerCallNormalizingFetch(base);
+    const init = { method: "POST", body: JSON.stringify({ input: [{ type: "message" }] }) };
+    await wrapped("https://aoai/openai/v1/responses", init);
+    // No computer_call → original init forwarded by reference (untouched).
+    expect(seenInit).toBe(init);
+  });
+
+  test("forwards non-string / streaming bodies untouched", async () => {
+    let seenInit: unknown;
+    const base = (async (_url: unknown, init?: unknown) => {
+      seenInit = init;
+      return new Response("{}");
+    }) as unknown as typeof fetch;
+
+    const wrapped = computerCallNormalizingFetch(base);
+    const init = { method: "GET" };
+    await wrapped("https://aoai/openai/v1/responses", init);
+    expect(seenInit).toBe(init);
   });
 });

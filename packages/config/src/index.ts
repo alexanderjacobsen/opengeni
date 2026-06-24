@@ -1,5 +1,6 @@
 import {
   BillingMode,
+  CAPABILITY_DESCRIPTORS,
   Entitlements,
   EntitlementsMode,
   ProductAccessMode,
@@ -123,6 +124,16 @@ const SettingsSchema = z.object({
   staticEntitlementsJson: z.string().default("{}"),
   staticUsageLimitsJson: z.string().default("{}"),
   delegationSecret: z.string().optional(),
+  // Sandbox-surfacing scoped stream-token HMAC secret (master-spine §C.3 / I8).
+  // When unset, the API falls back to `delegationSecret` (the same HMAC envelope
+  // family, `ogs_` vs `ogd_` prefix). REQUIRED-WHEN-DESKTOP, but the absence of
+  // BOTH while sandboxDesktopEnabled=true is a GRACEFUL DEGRADE (DesktopStream
+  // transport:null + a loud boot warning), NOT a hard boot-fail (I8/OD-8).
+  streamTokenSecret: z.string().optional(),
+  // The desktop input plane (raw stream:control writes) is OFF in v1: even a
+  // holder of stream:control gets 403 until this flips. Keeps stream:control a
+  // declared-but-inert permission so later hardening is a flag flip.
+  streamControlEnabled: EnvBoolean.default(false),
   environmentsEncryptionKey: z.string().optional(),
   // Session goal guard rails. Goals are designed for runs that legitimately
   // span days, so length is bounded by pathology detection (no-progress
@@ -245,10 +256,140 @@ const SettingsSchema = z.object({
   dockerNetwork: z.string().optional(),
   modalAppName: z.string().default("opengeni-sandbox"),
   modalImageRef: z.string().optional(),
-  modalTimeoutSeconds: z.coerce.number().int().positive().default(900),
+  // Modal's hard sandbox lifetime (timeoutMs = this * 1000), counted from each
+  // create/resume — it is the BACKSTOP that reclaims a box if the reaper/worker is
+  // down, NOT the warm-window controller (that's sandboxIdleGraceMs). It must
+  // comfortably exceed reaperPeriod + idleGrace so the reaper terminates a
+  // genuinely-idle box FIRST; the boot invariant below enforces that. Default 1h
+  // (was 900s/15min): the 15-min drain grace counts from the user's LAST release,
+  // but Modal's clock starts at the preceding turn's resume — so a 15-min grace on
+  // top of a 900s lifetime would let Modal kill the box mid-warm-window. 3600s
+  // leaves ~45min of headroom for the active turn before the warm window opens.
+  // Knob: OPENGENI_MODAL_TIMEOUT_SECONDS.
+  modalTimeoutSeconds: z.coerce.number().int().positive().default(3600),
   modalTokenId: z.string().optional(),
   modalTokenSecret: z.string().optional(),
   modalEnvironment: z.string().optional(),
+  // modal gap-fill: idleTimeoutMs + workspacePersistence were unmapped (module 03 §4.1).
+  modalIdleTimeoutSeconds: z.coerce.number().int().positive().optional(),
+  modalWorkspacePersistence: z.enum(["tar", "snapshot_filesystem", "snapshot_directory"]).optional(),
+  // Shared desktop toggle: this module reads it for the 6080 port-merge; the
+  // owner module (P4.x) acts on it to launch the display stack.
+  sandboxDesktopEnabled: EnvBoolean.default(false),
+  // Human take-control toggle: when ON (default) the negotiated DesktopStream
+  // cell advertises mode "interactive" — the noVNC viewer can drive mouse+keyboard
+  // into :0 (x11vnc runs without -viewonly). Turn it OFF for a genuinely read-only
+  // deployment: the cell reports mode "read-only" and the client disables the
+  // "Take control" affordance. Independent of computerUseReadOnly (the AGENT
+  // driver); this gates the HUMAN viewer plane.
+  sandboxDesktopInteractive: EnvBoolean.default(true),
+  // REAL PTY terminal toggle (P5.t): gates the ttyd pty-ws plane (7681) the API
+  // mints over the SAME tunnel as the desktop. Defaults ON — the interactive
+  // terminal is a baseline structured-service surface (unlike the heavier desktop
+  // pixel plane); a deployment can turn it off to fall back to the read-only
+  // sse-events command firehose. The 7681 port-merge tracks sandboxDesktopEnabled
+  // (a desktop-capable image is the one that bakes ttyd).
+  sandboxTerminalEnabled: EnvBoolean.default(true),
+  // The desktop framebuffer geometry the pixel plane advertises + launches the
+  // display stack with (P4.2). v1 has no live RANDR resize; a change is a full
+  // down→up restart. Defaults match the proven spike geometry (1280x800).
+  streamResolutionWidth: z.coerce.number().int().positive().default(1280),
+  streamResolutionHeight: z.coerce.number().int().positive().default(800),
+  // P4.3 computer-use: the agent drives the SAME :0 humans watch (xdotool/XTEST +
+  // scrot). Gated by sandboxDesktopEnabled + a desktop-capable backend in
+  // buildAgentCapabilities; computerUseReadOnly:false is the agent-driver default
+  // (it must click/type — the human viewer plane is the read-only one).
+  computerUseEnabled: EnvBoolean.default(true),
+  computerUseReadOnly: EnvBoolean.default(false),
+  // P4.3 recording loop: ffmpeg x11grab of :0 → mp4/webm → @opengeni/storage.
+  // recordingMaxBytes caps the in-memory finalize buffer (≤ storage single-PUT);
+  // recordingMaxSeconds is the ffmpeg -t hard ceiling (bounds a multi-day turn).
+  recordingEnabled: EnvBoolean.default(true),
+  recordingDefaultCodec: z.enum(["h264-mp4", "vp9-webm"]).default("h264-mp4"),
+  recordingFramerate: z.coerce.number().int().positive().default(15),
+  recordingMaxSeconds: z.coerce.number().int().positive().default(600),
+  recordingMaxBytes: z.coerce.number().int().positive().default(268_435_456), // 256 MB
+  // --- daytona ---
+  daytonaApiKey: z.string().optional(),
+  daytonaApiUrl: z.string().url().optional(),
+  daytonaTarget: z.string().optional(),
+  daytonaImage: z.string().optional(),
+  daytonaSnapshotName: z.string().optional(),
+  daytonaAutoStopInterval: z.coerce.number().int().nonnegative().optional(), // 0 disables idle-kill
+  daytonaTimeoutSeconds: z.coerce.number().int().positive().optional(),
+  daytonaExposedPortUrlTtlSeconds: z.coerce.number().int().positive().optional(),
+  // --- runloop ---
+  runloopApiKey: z.string().optional(),
+  runloopBaseUrl: z.string().url().optional(),
+  runloopBlueprintName: z.string().optional(),
+  runloopBlueprintId: z.string().optional(),
+  runloopTunnel: EnvBoolean.default(true),
+  runloopKeepAliveSeconds: z.coerce.number().int().positive().optional(),
+  // --- e2b (SDK reads E2B_API_KEY from env; mirrored for validation + forwarding) ---
+  e2bApiKey: z.string().optional(),
+  e2bTemplate: z.string().optional(),
+  e2bTimeoutSeconds: z.coerce.number().int().positive().optional(),
+  e2bTimeoutAction: z.enum(["pause", "kill"]).optional(),
+  e2bAllowInternetAccess: EnvBoolean.optional(),
+  e2bAutoResume: EnvBoolean.optional(),
+  e2bWorkspacePersistence: z.enum(["tar", "snapshot"]).optional(),
+  // --- blaxel ---
+  blaxelApiKey: z.string().optional(),
+  blaxelImage: z.string().optional(),
+  blaxelRegion: z.string().optional(),
+  blaxelExposedPortPublic: EnvBoolean.optional(), // public vs bl_preview_token
+  blaxelExposedPortUrlTtlSeconds: z.coerce.number().int().positive().optional(),
+  blaxelMemoryMb: z.coerce.number().int().positive().optional(),
+  blaxelTtl: z.string().optional(),
+  // --- cloudflare (headless) ---
+  cloudflareWorkerUrl: z.string().url().optional(),
+  cloudflareApiKey: z.string().optional(),
+  // --- vercel (headless) ---
+  vercelToken: z.string().optional(),
+  vercelProjectId: z.string().optional(),
+  vercelTeamId: z.string().optional(),
+  vercelRuntime: z.string().optional(),
+  // --- sandbox ownership inversion (P1.2 rollout flag, default OFF) ---
+  // The keystone flag for the stateless resume-by-id model. When FALSE the
+  // agent-turn path is BYTE-FOR-BYTE today's build-and-discard behavior (no
+  // lease acquire, no resume-by-id, no non-owned injection). When TRUE the turn
+  // activity acquires the group lease, resumes the one box by id from the lease
+  // envelope, injects it as a NON-OWNED RunConfig session (the SDK never reaps
+  // it — the proven keystone), and releases the holder in finally. Uses
+  // EnvBoolean (NOT z.coerce.boolean(), which would coerce "false" -> true and
+  // turn the flag ON the moment anyone set the env var to disable it).
+  sandboxOwnershipEnabled: EnvBoolean.default(false),
+  // --- sandbox lease cadences (cadence invariant validated at boot below) ---
+  // reaperPeriod < viewerHolderTTL, and reaperPeriod + idleGrace < providerIdleTimeout
+  // (modalTimeoutSeconds*1000). No keep-alive knob: between turns the box survives
+  // on the provider's existing idle-timeout; there is no keepalive loop to bound.
+  sandboxLeaseReaperPeriodMs: z.coerce.number().int().positive().default(30_000),
+  sandboxViewerHolderTtlMs: z.coerce.number().int().positive().default(90_000),
+  // The DRAIN grace: how long a refcount-0 (draining) lease stays WARM before the
+  // reaper resume-by-ids the box and terminates it. This is the cost-vs-snappiness
+  // dial — when the user navigates away the box keeps refcount 0, but it survives
+  // this whole window so a "glanced away then came back" re-arms the SAME warm box
+  // (acquireLease re-arms draining->warm; the reaper's BEFORE-terminate re-read
+  // skips a re-armed box). Default 15min so a brief detour never cold-creates a
+  // fresh EMPTY box; lower it to trade warm cost for a snappier reclaim. Knob:
+  // OPENGENI_SANDBOX_IDLE_GRACE_MS.
+  sandboxIdleGraceMs: z.coerce.number().int().positive().default(900_000),
+  // expires_at refresh window for a held lease (>> the turn 10s heartbeat so a
+  // single missed heartbeat never TTL-reaps a live turn). The warming TTL is the
+  // window a cold->warming spawner has to commit warm before a reaper resets it.
+  sandboxLeaseTtlMs: z.coerce.number().int().positive().default(90_000),
+  sandboxLeaseWarmingTtlMs: z.coerce.number().int().positive().default(120_000),
+  // --- sandbox warm-time billing (P2.1) ---
+  // Per-backend warm rate (usd_micros/sec), like modelPricingJson: an empty {}
+  // means warm-cost is not debited (warm-seconds are still metered for audit).
+  // Shape: { "modal": 5, "runloop": 4, ... }. Backends absent here meter
+  // warm-seconds but accrue NO warm_cost / debit (rate 0).
+  sandboxWarmRateMicrosPerSecondJson: z.string().default("{}"),
+  // Per-workspace warm cap (cumulative warm-seconds since the start of the UTC
+  // month, summed over sandbox.warm_seconds). 0 = unbounded. A workspace over the
+  // cap force-drains its VIEWER-ONLY boxes (guarded AND turn_holders=0 — a paying
+  // turn is never killed); the reaper then stop()s at refcount 0.
+  sandboxMaxWarmSecondsPerWorkspace: z.coerce.number().int().nonnegative().default(0),
   sandboxPreparationProfiles: z.string().default("none"),
   sandboxEnvAllowlist: z.string().default(""),
   objectStorageEndpoint: z.string().url().optional(),
@@ -479,6 +620,61 @@ export const defaultModelPricing: Record<string, ModelPricing> = {
   },
 };
 
+// --- backend-gated required-credential table (the single source of truth) ---
+// Each sandbox backend declares ONLY its own required credentials: a deployment
+// configured for `sandboxBackend=modal` must carry the Modal token, but a
+// daytona/e2b/local/none deployment must NOT be forced to set Modal creds (and
+// vice versa). validateSettings() iterates this table for the *active* backend
+// only — so the cred a backend doesn't use is never a boot blocker — and the
+// deployment package mirrors the same table to drive its env-render + the
+// required-env manifest (one table, two consumers).
+//
+// `field` is the parsed Settings key (boot validation reads the typed value);
+// `env` is the OPENGENI_* variable name (deployment renders/requires it). The
+// modal token is a both-or-neither pair handled by an extra refine in
+// validateSettings — this table holds the hard "must be present when active"
+// requirements.
+export type SandboxRequiredEnv = {
+  field: keyof Settings;
+  env: string;
+};
+
+export const SANDBOX_REQUIRED_ENV: Record<z.infer<typeof SandboxBackend>, readonly SandboxRequiredEnv[]> = {
+  // docker/local/none need no credentials (local dev container / in-process / off).
+  docker: [],
+  local: [],
+  none: [],
+  modal: [
+    { field: "modalAppName", env: "OPENGENI_MODAL_APP_NAME" },
+    { field: "modalTokenId", env: "OPENGENI_MODAL_TOKEN_ID" },
+    { field: "modalTokenSecret", env: "OPENGENI_MODAL_TOKEN_SECRET" },
+  ],
+  daytona: [
+    { field: "daytonaApiKey", env: "OPENGENI_DAYTONA_API_KEY" },
+  ],
+  runloop: [
+    { field: "runloopApiKey", env: "OPENGENI_RUNLOOP_API_KEY" },
+  ],
+  e2b: [
+    { field: "e2bApiKey", env: "OPENGENI_E2B_API_KEY" },
+  ],
+  blaxel: [
+    { field: "blaxelApiKey", env: "OPENGENI_BLAXEL_API_KEY" },
+  ],
+  cloudflare: [
+    { field: "cloudflareWorkerUrl", env: "OPENGENI_CLOUDFLARE_WORKER_URL" },
+  ],
+  vercel: [
+    { field: "vercelToken", env: "OPENGENI_VERCEL_TOKEN" },
+    { field: "vercelProjectId", env: "OPENGENI_VERCEL_PROJECT_ID" },
+  ],
+};
+
+/** The required OPENGENI_* env var names for a backend (for the deployment manifest). */
+export function requiredSandboxEnvForBackend(backend: z.infer<typeof SandboxBackend>): string[] {
+  return (SANDBOX_REQUIRED_ENV[backend] ?? []).map((entry) => entry.env);
+}
+
 function optional(name: string): string | undefined {
   const value = process.env[name];
   return value && value.trim().length > 0 ? value : undefined;
@@ -509,6 +705,8 @@ export function getSettings(): Settings {
     staticEntitlementsJson: optional("OPENGENI_STATIC_ENTITLEMENTS_JSON"),
     staticUsageLimitsJson: optional("OPENGENI_STATIC_USAGE_LIMITS_JSON"),
     delegationSecret: optional("OPENGENI_DELEGATION_SECRET"),
+    streamTokenSecret: optional("OPENGENI_STREAM_TOKEN_SECRET"),
+    streamControlEnabled: optional("OPENGENI_STREAM_CONTROL_ENABLED"),
     environmentsEncryptionKey: optional("OPENGENI_ENVIRONMENTS_ENCRYPTION_KEY"),
     goalMaxAutoContinuations: optional("OPENGENI_GOAL_MAX_AUTO_CONTINUATIONS"),
     goalNoProgressLimit: optional("OPENGENI_GOAL_NO_PROGRESS_LIMIT"),
@@ -562,6 +760,62 @@ export function getSettings(): Settings {
     modalTokenId: optional("OPENGENI_MODAL_TOKEN_ID"),
     modalTokenSecret: optional("OPENGENI_MODAL_TOKEN_SECRET"),
     modalEnvironment: optional("OPENGENI_MODAL_ENVIRONMENT"),
+    modalIdleTimeoutSeconds: optional("OPENGENI_MODAL_IDLE_TIMEOUT_SECONDS"),
+    modalWorkspacePersistence: optional("OPENGENI_MODAL_WORKSPACE_PERSISTENCE"),
+    sandboxDesktopEnabled: optional("OPENGENI_SANDBOX_DESKTOP_ENABLED"),
+    sandboxDesktopInteractive: optional("OPENGENI_SANDBOX_DESKTOP_INTERACTIVE"),
+    sandboxTerminalEnabled: optional("OPENGENI_SANDBOX_TERMINAL_ENABLED"),
+    streamResolutionWidth: optional("OPENGENI_STREAM_RESOLUTION_WIDTH"),
+    streamResolutionHeight: optional("OPENGENI_STREAM_RESOLUTION_HEIGHT"),
+    computerUseEnabled: optional("OPENGENI_COMPUTER_USE_ENABLED"),
+    computerUseReadOnly: optional("OPENGENI_COMPUTER_USE_READONLY"),
+    recordingEnabled: optional("OPENGENI_RECORDING_ENABLED"),
+    recordingDefaultCodec: optional("OPENGENI_RECORDING_DEFAULT_CODEC"),
+    recordingFramerate: optional("OPENGENI_RECORDING_FRAMERATE"),
+    recordingMaxSeconds: optional("OPENGENI_RECORDING_MAX_SECONDS"),
+    recordingMaxBytes: optional("OPENGENI_RECORDING_MAX_BYTES"),
+    daytonaApiKey: optional("OPENGENI_DAYTONA_API_KEY"),
+    daytonaApiUrl: optional("OPENGENI_DAYTONA_API_URL"),
+    daytonaTarget: optional("OPENGENI_DAYTONA_TARGET"),
+    daytonaImage: optional("OPENGENI_DAYTONA_IMAGE"),
+    daytonaSnapshotName: optional("OPENGENI_DAYTONA_SNAPSHOT_NAME"),
+    daytonaAutoStopInterval: optional("OPENGENI_DAYTONA_AUTO_STOP_INTERVAL"),
+    daytonaTimeoutSeconds: optional("OPENGENI_DAYTONA_TIMEOUT_SECONDS"),
+    daytonaExposedPortUrlTtlSeconds: optional("OPENGENI_DAYTONA_EXPOSED_PORT_URL_TTL_SECONDS"),
+    runloopApiKey: optional("OPENGENI_RUNLOOP_API_KEY"),
+    runloopBaseUrl: optional("OPENGENI_RUNLOOP_BASE_URL"),
+    runloopBlueprintName: optional("OPENGENI_RUNLOOP_BLUEPRINT_NAME"),
+    runloopBlueprintId: optional("OPENGENI_RUNLOOP_BLUEPRINT_ID"),
+    runloopTunnel: optional("OPENGENI_RUNLOOP_TUNNEL"),
+    runloopKeepAliveSeconds: optional("OPENGENI_RUNLOOP_KEEP_ALIVE_SECONDS"),
+    e2bApiKey: optional("OPENGENI_E2B_API_KEY"),
+    e2bTemplate: optional("OPENGENI_E2B_TEMPLATE"),
+    e2bTimeoutSeconds: optional("OPENGENI_E2B_TIMEOUT_SECONDS"),
+    e2bTimeoutAction: optional("OPENGENI_E2B_TIMEOUT_ACTION"),
+    e2bAllowInternetAccess: optional("OPENGENI_E2B_ALLOW_INTERNET_ACCESS"),
+    e2bAutoResume: optional("OPENGENI_E2B_AUTO_RESUME"),
+    e2bWorkspacePersistence: optional("OPENGENI_E2B_WORKSPACE_PERSISTENCE"),
+    blaxelApiKey: optional("OPENGENI_BLAXEL_API_KEY"),
+    blaxelImage: optional("OPENGENI_BLAXEL_IMAGE"),
+    blaxelRegion: optional("OPENGENI_BLAXEL_REGION"),
+    blaxelExposedPortPublic: optional("OPENGENI_BLAXEL_EXPOSED_PORT_PUBLIC"),
+    blaxelExposedPortUrlTtlSeconds: optional("OPENGENI_BLAXEL_EXPOSED_PORT_URL_TTL_SECONDS"),
+    blaxelMemoryMb: optional("OPENGENI_BLAXEL_MEMORY_MB"),
+    blaxelTtl: optional("OPENGENI_BLAXEL_TTL"),
+    cloudflareWorkerUrl: optional("OPENGENI_CLOUDFLARE_WORKER_URL"),
+    cloudflareApiKey: optional("OPENGENI_CLOUDFLARE_API_KEY"),
+    vercelToken: optional("OPENGENI_VERCEL_TOKEN"),
+    vercelProjectId: optional("OPENGENI_VERCEL_PROJECT_ID"),
+    vercelTeamId: optional("OPENGENI_VERCEL_TEAM_ID"),
+    vercelRuntime: optional("OPENGENI_VERCEL_RUNTIME"),
+    sandboxOwnershipEnabled: optional("OPENGENI_SANDBOX_OWNERSHIP_ENABLED"),
+    sandboxLeaseReaperPeriodMs: optional("OPENGENI_SANDBOX_LEASE_REAPER_PERIOD_MS"),
+    sandboxViewerHolderTtlMs: optional("OPENGENI_SANDBOX_VIEWER_HOLDER_TTL_MS"),
+    sandboxIdleGraceMs: optional("OPENGENI_SANDBOX_IDLE_GRACE_MS"),
+    sandboxLeaseTtlMs: optional("OPENGENI_SANDBOX_LEASE_TTL_MS"),
+    sandboxLeaseWarmingTtlMs: optional("OPENGENI_SANDBOX_LEASE_WARMING_TTL_MS"),
+    sandboxWarmRateMicrosPerSecondJson: optional("OPENGENI_SANDBOX_WARM_RATE_MICROS_PER_SECOND_JSON"),
+    sandboxMaxWarmSecondsPerWorkspace: optional("OPENGENI_SANDBOX_MAX_WARM_SECONDS_PER_WORKSPACE"),
     sandboxPreparationProfiles: optional("OPENGENI_SANDBOX_PREPARATION_PROFILES"),
     sandboxEnvAllowlist: optional("OPENGENI_SANDBOX_ENV_ALLOWLIST"),
     objectStorageEndpoint: optional("OPENGENI_OBJECT_STORAGE_ENDPOINT"),
@@ -910,6 +1164,50 @@ export function collectGitIdentityEnvironment(settings: Settings): Record<string
   }).filter((entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].trim().length > 0));
 }
 
+/**
+ * The STABLE run-scoped sandbox environment: the subset of a run's box-manifest
+ * environment that is IDENTICAL whether the box is first warmed by the worker
+ * TURN or by an API-direct ATTACH (viewer / Channel-A / desktop / terminal). It
+ * is the layered base every cold box must be created with so a later turn's
+ * agent-manifest apply finds an EMPTY environment delta in the SDK's
+ * `validateNoEnvironmentDelta` (which throws "Live sandbox sessions cannot change
+ * manifest environment variables" on ANY key the agent declares that the box's
+ * manifest lacks or carries a different value for).
+ *
+ * Precedence (lowest → highest): deployment allowlist (`collectSandboxEnvironment`)
+ * < git identity (`collectGitIdentityEnvironment`) < the session's attached
+ * workspace environment < the backend-aware HOME default. Reserved-name validation
+ * at write time keeps workspace values from colliding with platform entries.
+ *
+ * DELIBERATELY EXCLUDES the per-run, ROTATING GitHub App installation token
+ * (GH_TOKEN/GITHUB_TOKEN/GIT_ASKPASS/GIT_CONFIG_*) that `sandboxEnvironmentForRun`
+ * layers on top when a repository resource is attached: that token is minted FRESH
+ * per call, so it is not a stable, attach-reproducible value and must not be part
+ * of the shared base. The attach surfaces have only the `Session` (no repo
+ * resources) and so cannot reproduce it anyway; the BLOCKING attach-vs-turn error
+ * this helper fixes is for the common (no-repo) and workspace-environment-attached
+ * cases. (A repo-attached turn re-attaching to an attach-warmed box is a separate,
+ * pre-existing rotating-secret concern — see sandboxEnvironmentForRun.)
+ */
+export function stableSandboxEnvironmentForRun(
+  settings: Settings,
+  workspaceEnvironment: Record<string, string> = {},
+): Record<string, string> {
+  const environment: Record<string, string> = {
+    ...collectSandboxEnvironment(settings),
+    ...collectGitIdentityEnvironment(settings),
+    ...workspaceEnvironment,
+  };
+  // Backend-aware HOME: a provisioned box (docker + every cloud provider) runs the
+  // agent under the descriptor's workspaceRoot. `local` runs in-process as the host
+  // unix user (keep its real $HOME); `none` has no box.
+  const descriptor = CAPABILITY_DESCRIPTORS[settings.sandboxBackend];
+  if (settings.sandboxBackend !== "none" && settings.sandboxBackend !== "local") {
+    environment.HOME ??= descriptor.workspaceRoot;
+  }
+  return environment;
+}
+
 export type StartupRetryOptions = {
   attempts?: number;
   initialDelayMs?: number;
@@ -1036,6 +1334,45 @@ export function parseModelPricingJson(raw: string): Record<string, ModelPricing>
     out[model] = ModelPricingSchema.parse(value);
   }
   return out;
+}
+
+// --- sandbox warm-rate table (P2.1) ---
+// Per-backend usd_micros/sec, parsed from sandboxWarmRateMicrosPerSecondJson the
+// same way model pricing is. An empty {} (the default) means no warm-cost is
+// debited — warm-seconds are still metered for audit, just at rate 0.
+export function parseSandboxWarmRateJson(raw: string): Record<string, number> {
+  if (!raw.trim() || raw.trim() === "{}") {
+    return {};
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`OPENGENI_SANDBOX_WARM_RATE_MICROS_PER_SECOND_JSON must be valid JSON: ${message}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("OPENGENI_SANDBOX_WARM_RATE_MICROS_PER_SECOND_JSON must be a JSON object keyed by backend name");
+  }
+  const out: Record<string, number> = {};
+  for (const [backend, value] of Object.entries(parsed)) {
+    if (!backend.trim()) {
+      throw new Error("OPENGENI_SANDBOX_WARM_RATE_MICROS_PER_SECOND_JSON contains an empty backend name");
+    }
+    const rate = typeof value === "number" ? value : Number(value);
+    if (!Number.isFinite(rate) || rate < 0) {
+      throw new Error(`OPENGENI_SANDBOX_WARM_RATE_MICROS_PER_SECOND_JSON rate for ${backend} must be a non-negative number`);
+    }
+    out[backend] = rate;
+  }
+  return out;
+}
+
+// Resolve the warm rate (usd_micros/sec) for a backend; 0 when the backend has no
+// configured rate (the box is metered in seconds but not cost-debited).
+export function sandboxWarmRateMicrosPerSecond(settings: Settings, backend: string): number {
+  const table = parseSandboxWarmRateJson(settings.sandboxWarmRateMicrosPerSecondJson);
+  return table[backend] ?? 0;
 }
 
 /**
@@ -1249,8 +1586,21 @@ function validateSettings(settings: Settings): void {
       throw new Error("Azure OpenAI requires an API key or AD token");
     }
   }
+  // The Modal token is a both-or-neither pair regardless of the active backend
+  // (a half-configured token is always a misconfiguration). This is orthogonal
+  // to the backend-gated required-cred sweep below.
   if (Boolean(settings.modalTokenId) !== Boolean(settings.modalTokenSecret)) {
     throw new Error("OPENGENI_MODAL_TOKEN_ID and OPENGENI_MODAL_TOKEN_SECRET must both be set or both omitted");
+  }
+  // Backend-gated required credentials: only the *active* backend's creds are
+  // required. A modal deployment must carry the Modal token; a daytona/e2b/none
+  // deployment must NOT be forced to (and is not). Drives off the single
+  // SANDBOX_REQUIRED_ENV table that the deployment package also mirrors.
+  for (const required of SANDBOX_REQUIRED_ENV[settings.sandboxBackend] ?? []) {
+    const value = settings[required.field];
+    if (value === undefined || value === null || (typeof value === "string" && value.trim().length === 0)) {
+      throw new Error(`${required.env} is required when OPENGENI_SANDBOX_BACKEND=${settings.sandboxBackend}`);
+    }
   }
   if (settings.objectStorageBackend === "s3-compatible" || settings.objectStorageBackend === "aws-s3") {
     if (Boolean(settings.objectStorageAccessKeyId) !== Boolean(settings.objectStorageSecretAccessKey)) {
@@ -1294,12 +1644,67 @@ function validateSettings(settings: Settings): void {
   parseExposedPorts(settings.dockerExposedPorts);
   sandboxEnvironmentVariableNames(settings);
   sandboxLifecycleHookIds(settings);
+  // Fail fast on a malformed warm-rate table (P2.1).
+  parseSandboxWarmRateJson(settings.sandboxWarmRateMicrosPerSecondJson);
   const serverIds = new Set<string>();
   for (const server of settings.mcpServers) {
     if (serverIds.has(server.id)) {
       throw new Error(`OPENGENI_MCP_SERVERS contains duplicate id ${server.id}`);
     }
     serverIds.add(server.id);
+  }
+  // --- sandbox lease cadence invariant (fail fast at boot) ---
+  // reaperPeriod (30s) < viewerHolderTTL (90s), and reaperPeriod + idleGrace must
+  // be strictly less than the provider lifetime (modalTimeoutSeconds*1000):
+  //   - the reaper must run more often than the TTL it polices; and
+  //   - the reaper must terminate a genuinely-idle box (after the full drain grace,
+  //     observed on the NEXT sweep) BEFORE the provider's hard lifetime reclaims it
+  //     out from under us — the provider lifetime is the backstop, not the
+  //     warm-window controller. idleGrace counts from the user's last release;
+  //     the provider clock counts from the preceding resume, so we leave the
+  //     active-turn headroom in modalTimeoutSeconds (default 3600s).
+  {
+    const reaperPeriod = settings.sandboxLeaseReaperPeriodMs;
+    const viewerTtl = settings.sandboxViewerHolderTtlMs;
+    const idleGraceMs = settings.sandboxIdleGraceMs;
+    const providerLifetimeMs = settings.modalTimeoutSeconds * 1000;
+    if (!(reaperPeriod < viewerTtl)) {
+      throw new Error(
+        `OPENGENI_SANDBOX_LEASE_REAPER_PERIOD_MS (${reaperPeriod}) must be strictly less than `
+        + `OPENGENI_SANDBOX_VIEWER_HOLDER_TTL_MS (${viewerTtl}): the reaper must run more often `
+        + `than the TTL it polices, or stale viewer holders outlive a full reaper period.`);
+    }
+    if (!(viewerTtl < providerLifetimeMs)) {
+      throw new Error(
+        `OPENGENI_SANDBOX_VIEWER_HOLDER_TTL_MS (${viewerTtl}) must be strictly less than the provider `
+        + `lifetime (OPENGENI_MODAL_TIMEOUT_SECONDS*1000 = ${providerLifetimeMs}): a viewer holder must be `
+        + `reapable before the box idles out from under it (the provider idle-timeout is the backstop).`);
+    }
+    if (!(reaperPeriod + idleGraceMs < providerLifetimeMs)) {
+      throw new Error(
+        `OPENGENI_SANDBOX_LEASE_REAPER_PERIOD_MS + OPENGENI_SANDBOX_IDLE_GRACE_MS `
+        + `(${reaperPeriod} + ${idleGraceMs} = ${reaperPeriod + idleGraceMs}) must be strictly less than the `
+        + `provider lifetime (OPENGENI_MODAL_TIMEOUT_SECONDS*1000 = ${providerLifetimeMs}): the reaper must be `
+        + `able to terminate a genuinely-idle box on the sweep AFTER the drain grace elapses, before the `
+        + `provider's hard idle-timeout reclaims it (the provider timeout is the backstop). Raise `
+        + `OPENGENI_MODAL_TIMEOUT_SECONDS or lower OPENGENI_SANDBOX_IDLE_GRACE_MS.`);
+    }
+  }
+  // --- stream-token secret: required-when-desktop, but GRACEFULLY DEGRADE (I8) ---
+  // The desktop pixel plane needs an HMAC secret to mint scoped stream tokens.
+  // It is REQUIRED when desktop is enabled — but per OD-8 a missing secret is NOT
+  // a hard boot-fail: we emit a LOUD warning and the deployment ships with
+  // DesktopStream.transport:null (resolveStreamTokenSecret returns undefined ->
+  // negotiateCapabilities degrades the desktop cell). This keeps a desktop-
+  // configured deployment bootable (headless + Channel-A still work) instead of
+  // crashing the whole API on a missing secret.
+  if (settings.sandboxDesktopEnabled && resolveStreamTokenSecret(settings) === undefined) {
+    console.warn(
+      "[opengeni] OPENGENI_SANDBOX_DESKTOP_ENABLED=true but neither OPENGENI_STREAM_TOKEN_SECRET nor "
+      + "OPENGENI_DELEGATION_SECRET is set: the desktop pixel plane will GRACEFULLY DEGRADE "
+      + "(DesktopStream.transport=null — no scoped stream tokens can be minted). Set "
+      + "OPENGENI_STREAM_TOKEN_SECRET to enable the live desktop stream.",
+    );
   }
   // Model provider registry: parse it here so JSON/zod errors surface at boot,
   // reject a registry id colliding with the built-in provider id (it would
@@ -1323,6 +1728,31 @@ function validateSettings(settings: Settings): void {
       throw new Error(`OPENGENI_MODEL_PROVIDERS_JSON provider ${provider.id} requires a resolvable API key (set apiKey or apiKeyEnv)`);
     }
   }
+}
+
+/**
+ * Resolve the secret used to sign/verify scoped stream tokens (master-spine
+ * §C.3). Falls back to `delegationSecret` (the same HMAC envelope family —
+ * `ogs_` vs `ogd_` prefix) so a deployment that already carries a delegation
+ * secret does not need a second one. Returns undefined when neither is set,
+ * which drives the graceful-degrade (DesktopStream.transport:null).
+ */
+export function resolveStreamTokenSecret(settings: Settings): string | undefined {
+  const explicit = settings.streamTokenSecret?.trim();
+  if (explicit) {
+    return explicit;
+  }
+  const delegation = settings.delegationSecret?.trim();
+  return delegation ? delegation : undefined;
+}
+
+/**
+ * True iff the desktop pixel plane must GRACEFULLY DEGRADE because desktop is
+ * enabled but no stream-token secret is resolvable (I8/OD-8). When true,
+ * negotiateCapabilities forces DesktopStream.transport:null.
+ */
+export function streamTokenDegraded(settings: Settings): boolean {
+  return settings.sandboxDesktopEnabled && resolveStreamTokenSecret(settings) === undefined;
 }
 
 function splitCsv(raw: string): string[] {

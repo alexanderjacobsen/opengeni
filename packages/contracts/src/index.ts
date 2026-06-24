@@ -10,8 +10,347 @@ export const SessionStatus = z.enum([
 ]);
 export type SessionStatus = z.infer<typeof SessionStatus>;
 
-export const SandboxBackend = z.enum(["docker", "modal", "local", "none"]);
+// 10 backends; 3-way enum parity (contracts / sdk / deployment) is pinned by
+// `packages/sdk/test/contract-parity.test.ts`. The existing four keep their
+// positions; the six new backends are additive.
+export const SandboxBackend = z.enum([
+  "docker",
+  "modal",
+  "local",
+  "none",
+  "daytona",
+  "runloop",
+  "e2b",
+  "blaxel",
+  "cloudflare",
+  "vercel",
+]);
 export type SandboxBackend = z.infer<typeof SandboxBackend>;
+
+// OS axis. Only "linux" is reachable in v1; macos/windows are seam placeholders.
+export const SandboxOs = z.enum(["linux", "macos", "windows"]);
+export type SandboxOs = z.infer<typeof SandboxOs>;
+
+// The five surfaceable sandbox capabilities (PascalCase, the canonical names).
+export const SandboxCapabilityName = z.enum([
+  "FileSystem", // Channel A: list/read/write/search (Pierre tree)
+  "Terminal", // Channel A: command-output firehose (+ future pty-ws)
+  "Git", // Channel A: status/diff/log/show (Pierre diff)
+  "DesktopStream", // Channel B: noVNC pixels over a scoped tunnel URL
+  "Recording", // ffmpeg x11grab -> object storage
+]);
+export type SandboxCapabilityName = z.infer<typeof SandboxCapabilityName>;
+
+// How a backend exposes a network port to the data plane.
+export type PortExposureKind = "provider-tunnel" | "preview-url" | "local-port" | "none";
+
+// Static per-backend metadata — pure data, no runtime state. This table lives
+// in CONTRACTS (not runtime) so config can read it without an import cycle
+// through runtime (ledger CR8). Everything downstream (config boot-validation,
+// OS image selection, capability negotiation, env/mount branch) reads this
+// data, never a hard-coded backend name.
+export type CapabilityDescriptor = {
+  backend: SandboxBackend;
+  backendId: string; // asserted === SDK client.backendId at registry build (deferred to P0.3)
+  tier: "desktop" | "headless" | "dev" | "none";
+  os: { supported: SandboxOs[]; default: SandboxOs };
+  capabilities: {
+    FileSystem: { available: boolean; readOnly: boolean };
+    Terminal: { available: boolean; transport: "sse-events" | "pty-ws" | null; pty: boolean };
+    Git: { available: boolean };
+    DesktopStream: { available: boolean; transport: "vnc-ws" | "rdp-ws" | "webrtc" | null };
+    // Feasibility only (== DesktopStream.available && os==linux); NOT a request.
+    Recording: { available: boolean };
+  };
+  lifetime: {
+    hardLifetimeMs?: number; // modal 24h, vercel 5h
+    requiresSnapshotRollover: boolean;
+    hasIdleKiller: boolean;
+    supportsSuspendResume: boolean; // runloop/e2b/vercel/modal true
+    resumeIsLockFree: boolean; // modal true (fromId, no lock)
+    idleKillDisableHint?: string;
+  };
+  snapshot: {
+    kind: "native-fs" | "native-dir" | "native-snapshot-id" | "tar-only" | "none";
+    hasTarFallback: boolean;
+  };
+  portExposure: { kind: PortExposureKind; supportsOnDemandPorts: boolean }; // runloop=false; blaxel only true
+  workspaceRoot: string; // os-overridable; per-backend default (providers owns; os defers)
+  nativeBucketMount: boolean; // modal true -> mount/signed-download branch
+  persistable: boolean;
+  supportsRunAs: boolean;
+};
+
+// The websockify/noVNC desktop port that is merged into `exposedPorts` for
+// every desktop-capable (backend, os). Asserted present by boot-validation.
+export const DESKTOP_STREAM_PORT = 6080;
+
+// The ttyd PTY-over-websocket port that is exposed over the SAME Modal raw-TLS
+// tunnel as the desktop, for the REAL interactive terminal (Channel-B-symmetric).
+// ttyd's default; the box bakes ttyd and launches it on this port. The pty-ws
+// Terminal cell's `url` is the tunnel address resolved against this port.
+export const TERMINAL_STREAM_PORT = 7681;
+
+// The Part-D matrix (master-spine PART D + module 03-providers). One row per
+// backend (10 rows). v1 reachable cells are all Linux; macos/windows are seam
+// placeholders (no enum members shipped). Reading rule: a capability cell is
+// `available:false` + a reason in the negotiated doc, never absent.
+export const CAPABILITY_DESCRIPTORS: Record<SandboxBackend, CapabilityDescriptor> = {
+  modal: {
+    backend: "modal",
+    backendId: "modal",
+    tier: "desktop",
+    os: { supported: ["linux"], default: "linux" },
+    capabilities: {
+      FileSystem: { available: true, readOnly: false },
+      Terminal: { available: true, transport: "sse-events", pty: true },
+      Git: { available: true },
+      DesktopStream: { available: true, transport: "vnc-ws" },
+      Recording: { available: true },
+    },
+    lifetime: {
+      hardLifetimeMs: 24 * 60 * 60 * 1000,
+      requiresSnapshotRollover: true,
+      hasIdleKiller: true,
+      supportsSuspendResume: true,
+      resumeIsLockFree: true,
+    },
+    snapshot: { kind: "native-fs", hasTarFallback: true },
+    portExposure: { kind: "provider-tunnel", supportsOnDemandPorts: false }, // pre-declare 6080
+    workspaceRoot: "/workspace",
+    nativeBucketMount: true,
+    persistable: true,
+    supportsRunAs: true,
+  },
+  daytona: {
+    backend: "daytona",
+    backendId: "daytona",
+    tier: "desktop",
+    os: { supported: ["linux"], default: "linux" },
+    capabilities: {
+      FileSystem: { available: true, readOnly: false },
+      Terminal: { available: true, transport: "sse-events", pty: true },
+      Git: { available: true },
+      DesktopStream: { available: true, transport: "vnc-ws" },
+      Recording: { available: true },
+    },
+    lifetime: {
+      requiresSnapshotRollover: false,
+      hasIdleKiller: true,
+      supportsSuspendResume: true,
+      resumeIsLockFree: false,
+    },
+    snapshot: { kind: "native-snapshot-id", hasTarFallback: true },
+    portExposure: { kind: "preview-url", supportsOnDemandPorts: false },
+    workspaceRoot: "/workspace",
+    nativeBucketMount: false,
+    persistable: true,
+    supportsRunAs: true,
+  },
+  runloop: {
+    backend: "runloop",
+    backendId: "runloop",
+    tier: "desktop",
+    os: { supported: ["linux"], default: "linux" },
+    capabilities: {
+      FileSystem: { available: true, readOnly: false },
+      Terminal: { available: true, transport: "sse-events", pty: false },
+      Git: { available: true },
+      DesktopStream: { available: true, transport: "vnc-ws" },
+      Recording: { available: true },
+    },
+    lifetime: {
+      requiresSnapshotRollover: false,
+      hasIdleKiller: true,
+      supportsSuspendResume: true,
+      resumeIsLockFree: false,
+    },
+    snapshot: { kind: "native-snapshot-id", hasTarFallback: true },
+    portExposure: { kind: "provider-tunnel", supportsOnDemandPorts: false }, // CR9: pre-declare 6080
+    workspaceRoot: "/workspace",
+    nativeBucketMount: false,
+    persistable: true,
+    supportsRunAs: false,
+  },
+  e2b: {
+    backend: "e2b",
+    backendId: "e2b",
+    tier: "desktop",
+    os: { supported: ["linux"], default: "linux" },
+    capabilities: {
+      FileSystem: { available: true, readOnly: false },
+      Terminal: { available: true, transport: "sse-events", pty: false }, // pty-until-proven=no
+      Git: { available: true },
+      DesktopStream: { available: true, transport: "vnc-ws" },
+      Recording: { available: true },
+    },
+    lifetime: {
+      requiresSnapshotRollover: false,
+      hasIdleKiller: true,
+      supportsSuspendResume: true,
+      resumeIsLockFree: false,
+    },
+    snapshot: { kind: "native-snapshot-id", hasTarFallback: true },
+    portExposure: { kind: "preview-url", supportsOnDemandPorts: false },
+    workspaceRoot: "/home/user",
+    nativeBucketMount: false,
+    persistable: true,
+    supportsRunAs: false,
+  },
+  blaxel: {
+    backend: "blaxel",
+    backendId: "blaxel",
+    tier: "desktop",
+    os: { supported: ["linux"], default: "linux" },
+    capabilities: {
+      FileSystem: { available: true, readOnly: false },
+      Terminal: { available: true, transport: "sse-events", pty: false }, // pty-until-proven=no
+      Git: { available: true },
+      DesktopStream: { available: true, transport: "vnc-ws" },
+      Recording: { available: true },
+    },
+    lifetime: {
+      requiresSnapshotRollover: false,
+      hasIdleKiller: true,
+      supportsSuspendResume: false,
+      resumeIsLockFree: false,
+    },
+    snapshot: { kind: "tar-only", hasTarFallback: true },
+    portExposure: { kind: "provider-tunnel", supportsOnDemandPorts: true }, // only on-demand backend
+    workspaceRoot: "/workspace",
+    nativeBucketMount: false,
+    persistable: true,
+    supportsRunAs: false,
+  },
+  cloudflare: {
+    backend: "cloudflare",
+    backendId: "cloudflare",
+    tier: "headless",
+    os: { supported: ["linux"], default: "linux" },
+    capabilities: {
+      FileSystem: { available: true, readOnly: false },
+      Terminal: { available: true, transport: "sse-events", pty: true },
+      Git: { available: true },
+      DesktopStream: { available: false, transport: null },
+      Recording: { available: false },
+    },
+    lifetime: {
+      requiresSnapshotRollover: false,
+      hasIdleKiller: true,
+      supportsSuspendResume: false,
+      resumeIsLockFree: false,
+    },
+    snapshot: { kind: "tar-only", hasTarFallback: true },
+    portExposure: { kind: "provider-tunnel", supportsOnDemandPorts: false },
+    workspaceRoot: "/workspace",
+    nativeBucketMount: false,
+    persistable: true,
+    supportsRunAs: true,
+  },
+  vercel: {
+    backend: "vercel",
+    backendId: "vercel",
+    tier: "headless",
+    os: { supported: ["linux"], default: "linux" },
+    capabilities: {
+      FileSystem: { available: true, readOnly: false },
+      Terminal: { available: true, transport: "sse-events", pty: false },
+      Git: { available: true },
+      DesktopStream: { available: false, transport: null },
+      Recording: { available: false },
+    },
+    lifetime: {
+      hardLifetimeMs: 5 * 60 * 60 * 1000,
+      requiresSnapshotRollover: true,
+      hasIdleKiller: true,
+      supportsSuspendResume: true,
+      resumeIsLockFree: false,
+    },
+    snapshot: { kind: "tar-only", hasTarFallback: true },
+    portExposure: { kind: "preview-url", supportsOnDemandPorts: false },
+    workspaceRoot: "/vercel/sandbox",
+    nativeBucketMount: false,
+    persistable: true,
+    supportsRunAs: false,
+  },
+  docker: {
+    backend: "docker",
+    backendId: "docker",
+    tier: "dev",
+    os: { supported: ["linux"], default: "linux" },
+    capabilities: {
+      FileSystem: { available: true, readOnly: false },
+      Terminal: { available: true, transport: "sse-events", pty: true },
+      Git: { available: true },
+      DesktopStream: { available: false, transport: null }, // local
+      Recording: { available: false },
+    },
+    lifetime: {
+      requiresSnapshotRollover: false,
+      hasIdleKiller: false,
+      supportsSuspendResume: false,
+      resumeIsLockFree: true,
+    },
+    snapshot: { kind: "native-dir", hasTarFallback: true },
+    portExposure: { kind: "local-port", supportsOnDemandPorts: false },
+    workspaceRoot: "/workspace",
+    nativeBucketMount: false,
+    persistable: true,
+    supportsRunAs: true,
+  },
+  local: {
+    backend: "local",
+    // The SDK's UnixLocalSandboxClient reports backendId "unix_local" — this MUST
+    // match it (it is the resume-fence field compared against client.backendId).
+    backendId: "unix_local",
+    tier: "dev",
+    os: { supported: ["linux"], default: "linux" },
+    capabilities: {
+      FileSystem: { available: true, readOnly: false },
+      Terminal: { available: true, transport: "sse-events", pty: true },
+      Git: { available: true },
+      DesktopStream: { available: false, transport: null },
+      Recording: { available: false },
+    },
+    lifetime: {
+      requiresSnapshotRollover: false,
+      hasIdleKiller: false,
+      supportsSuspendResume: false,
+      resumeIsLockFree: true,
+    },
+    snapshot: { kind: "native-dir", hasTarFallback: true },
+    portExposure: { kind: "local-port", supportsOnDemandPorts: false },
+    workspaceRoot: "/workspace",
+    nativeBucketMount: false,
+    persistable: false,
+    supportsRunAs: false,
+  },
+  none: {
+    backend: "none",
+    backendId: "none",
+    tier: "none",
+    os: { supported: ["linux"], default: "linux" },
+    capabilities: {
+      FileSystem: { available: false, readOnly: true },
+      Terminal: { available: false, transport: null, pty: false },
+      Git: { available: false },
+      DesktopStream: { available: false, transport: null },
+      Recording: { available: false },
+    },
+    lifetime: {
+      requiresSnapshotRollover: false,
+      hasIdleKiller: false,
+      supportsSuspendResume: false,
+      resumeIsLockFree: true,
+    },
+    snapshot: { kind: "none", hasTarFallback: false },
+    portExposure: { kind: "none", supportsOnDemandPorts: false },
+    workspaceRoot: "/workspace",
+    nativeBucketMount: false,
+    persistable: false,
+    supportsRunAs: false,
+  },
+};
 
 export const ReasoningEffort = z.enum(["none", "minimal", "low", "medium", "high", "xhigh"]);
 export type ReasoningEffort = z.infer<typeof ReasoningEffort>;
@@ -66,8 +405,28 @@ export const Permission = z.enum([
   "sessions:create",
   "sessions:read",
   "sessions:control",
+  // Sandbox-surfacing (master-spine §C.3 / crosscut PART 1.2). stream:view is a
+  // REAL, distinct permission — strictly BROADER than sessions:read — because the
+  // pixel plane (Channel B) is UN-REDACTED: a viewer of raw pixels can see cloud
+  // creds the agent cat's into a terminal, which the redacted Channel-A event log
+  // never exposes. sessions:read is NOT permission to watch raw pixels.
+  "stream:view",
+  // SEPARATE from stream:view: raw input to the desktop (bypasses approvalQueue /
+  // interrupt). NEVER granted by default in v1 (the input plane is OFF —
+  // streamControlEnabled=false); the permission exists so later hardening is a
+  // flag flip, not a redesign.
+  "stream:control",
+  // Accept the pixel-plane secret-leak acknowledgment (consent gate before the
+  // un-redacted desktop URL is handed out).
+  "stream:acknowledge",
   "files:upload",
   "files:read",
+  // Channel-A structured write surface (FS writes / apply-patch); distinct from
+  // files:read so a read-only viewer can't mutate the box filesystem.
+  "files:write",
+  // Attach to an interactive PTY (terminal-as-pty, Channel A); distinct from
+  // sessions:read which only reads the command-output firehose.
+  "terminal:attach",
   "documents:manage",
   "documents:search",
   "scheduled_tasks:manage",
@@ -196,6 +555,84 @@ export async function verifyDelegatedAccessToken(secret: string, token: string, 
   return payload.data;
 }
 
+// --- Scoped data-plane stream token (master-spine §C.3 / crosscut PART 1.3) ---
+//
+// REUSES the existing HMAC envelope (sign/verifyDelegatedAccessToken's
+// base64Url + hmacSha256Base64Url) — NOT a second crypto — but with a distinct
+// `ogs_` prefix and a HARD-NARROW claim set. The token is a CLAIM the OpenGeni
+// control plane mints; it is NOT the provider's tunnel secret. The browser
+// receives { providerUrl, streamToken }; the provider tunnel URL is the
+// transport, the streamToken is what the in-box edge validates (websockify
+// TokenFile is later-hardening; in v1 the URL's short TTL + the acknowledged
+// stream:view gate are the real boundary). The token is minted + recorded
+// against the holder from day one. It is NEVER appended to the URL as a query
+// param (the provider's own scoped token already lives in the URL).
+//
+// `leaseEpoch` is the fence: when the box is re-elected (warming→warm bumps the
+// epoch) the URL is re-minted with epoch+1 and the old tunnel is torn down, so a
+// stale token points at a dead tunnel. Epoch mismatch is enforced at USE (by the
+// caller comparing the claim against the live lease), not inside verify.
+export const StreamTokenPayload = z.object({
+  workspaceId: z.string().uuid(),
+  sessionId: z.string().uuid(),
+  // Identifies the sandbox_lease_holders row (the viewer holder).
+  viewerId: z.string().uuid(),
+  // Fence: the token logically dies when the box is re-elected (epoch++).
+  leaseEpoch: z.number().int().nonnegative(),
+  // v1 is always "view"; "control" is the never-granted raw-input plane.
+  mode: z.enum(["view", "control"]),
+  // 6080 (noVNC); pins the token to ONE exposed port.
+  port: z.number().int().positive(),
+  // Short TTL (120s default); rotation is event-driven under the epoch fence,
+  // not on a keepalive clock.
+  exp: z.number().int().positive(),
+});
+export type StreamTokenPayload = z.infer<typeof StreamTokenPayload>;
+
+export async function signStreamToken(secret: string, payload: StreamTokenPayload): Promise<string> {
+  const encodedPayload = base64UrlEncode(JSON.stringify(StreamTokenPayload.parse(payload)));
+  const signature = await hmacSha256Base64Url(secret, encodedPayload);
+  return `ogs_${encodedPayload}.${signature}`;
+}
+
+/**
+ * Verify a stream token: rejects (returns null) on a bad prefix, malformed
+ * envelope, bad HMAC signature (constant-time), schema-invalid claims, or an
+ * expired token (`exp < now`). Mirrors verifyDelegatedAccessToken exactly.
+ *
+ * The epoch fence (claim.leaseEpoch vs the LIVE lease epoch) and the
+ * workspace/session scope are checked by the CALLER at use against the live
+ * lease + route params — verify proves the token is authentic + unexpired, the
+ * caller proves it is for THIS box's current epoch and THIS workspace+session.
+ */
+export async function verifyStreamToken(secret: string, token: string, nowSeconds = Math.floor(Date.now() / 1000)): Promise<StreamTokenPayload | null> {
+  if (!token.startsWith("ogs_")) {
+    return null;
+  }
+  const withoutPrefix = token.slice("ogs_".length);
+  const dot = withoutPrefix.lastIndexOf(".");
+  if (dot <= 0) {
+    return null;
+  }
+  const encodedPayload = withoutPrefix.slice(0, dot);
+  const signature = withoutPrefix.slice(dot + 1);
+  const expected = await hmacSha256Base64Url(secret, encodedPayload);
+  if (!constantTimeEqual(signature, expected)) {
+    return null;
+  }
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(base64UrlDecode(encodedPayload));
+  } catch {
+    return null;
+  }
+  const payload = StreamTokenPayload.safeParse(decoded);
+  if (!payload.success || payload.data.exp < nowSeconds) {
+    return null;
+  }
+  return payload.data;
+}
+
 export const CreateWorkspaceRequest = z.object({
   accountId: z.string().uuid().optional(),
   name: z.string().min(1),
@@ -288,6 +725,15 @@ export const UsageEventType = z.enum([
   "document.indexed",
   "scheduled_task.fired",
   "api_key.request",
+  // --- sandbox warm-time metering (P2.1) ---
+  // Wall-clock seconds a box was warm — the billable warm-time meter. Accrued on
+  // the two stateless ticks (turn heartbeat + reaper sweep), idempotent on
+  // (sandbox_group_id, lease_epoch, tick) so a shared box (N sessions) is metered
+  // EXACTLY ONCE per tick (N sessions != N x bill). Orthogonal to model.tokens /
+  // model.cost (model API cost vs provider compute cost — both real, no overlap).
+  "sandbox.warm_seconds",
+  // usd_micros: warm-seconds x the per-provider per-second warm rate.
+  "sandbox.warm_cost",
 ]);
 export type UsageEventType = z.infer<typeof UsageEventType>;
 
@@ -726,6 +1172,8 @@ export const SessionTurn = z.object({
   model: z.string().min(1),
   reasoningEffort: ReasoningEffort,
   sandboxBackend: SandboxBackend,
+  // Per-turn OS override. NULL = inherit the session's sandboxOs.
+  sandboxOs: SandboxOs.nullable(),
   metadata: z.record(z.string(), z.unknown()),
   startedAt: z.string().nullable(),
   finishedAt: z.string().nullable(),
@@ -1274,6 +1722,12 @@ export const Session = z.object({
   metadata: z.record(z.string(), z.unknown()),
   model: z.string(),
   sandboxBackend: SandboxBackend,
+  // The OS the session's box runs. Defaults to 'linux' (today's only OS).
+  sandboxOs: SandboxOs,
+  // The shared-sandbox group the session's box belongs to. Equals the session's
+  // own id for a singleton group (today's 1:1 default); equals the parent's
+  // group when spawned shared (both sessions run in ONE box).
+  sandboxGroupId: z.string().uuid(),
   environmentId: z.string().uuid().nullable(),
   // Non-default first-party MCP token permissions (manager-style sessions);
   // null means the fixed worker default set.
@@ -1332,8 +1786,496 @@ export const SessionEventType = z.enum([
   "goal.paused",
   "goal.resumed",
   "goal.continuation",
+  // Channel-B desktop pixel-plane signals (07-channel-b §1.2). The pixel socket
+  // carries opaque RFB and cannot carry a control message the client can act on,
+  // so these ride the durable, sequenced, gap-filled Channel-A SSE spine.
+  "stream.url.rotated", // re-minted {url,token,expiresAt} on box rollover (event-driven)
+  "stream.opened", // a viewer attached (audit + refcount visibility)
+  "stream.closed", // a viewer detached / was reaped
+  "stream.revoked", // a grant was revoked → connected clients MUST disconnect now
+  // Channel-B recording signals (P4.3 / module 05 §3.4). The "agent films itself
+  // proving the fix" loop: ffmpeg x11grab of the SAME :0 humans watch → artifact
+  // → storage. The artifact ref rides the AVAILABLE event (storageKey, NOT a
+  // long-lived URL — clients mint a short-TTL signed GET via the route).
+  "recording.started", // ffmpeg launched on :0 (mode/codec/dimensions)
+  "recording.available", // finalized: bytes PUT to storage, replayable
+  "recording.failed", // ffmpeg/box-death/rollover/upload error — no artifact
+  // Channel-A structured-service notifications (P4.4 / modules/08-channel-a.md
+  // §2.2). The A2 reads (fs/git/terminal exec) are SYNCHRONOUS API-direct point
+  // queries (their result is the HTTP response, NEVER an event). What rides A1
+  // here are the side-effect NOTIFICATIONS — a path changed, git state changed,
+  // a pty opened/printed/exited — durable, sequenced, gap-filled like every
+  // other session event, so any viewer's Pierre tree / diff / terminal stays
+  // live. fs.changed/git.changed are cache-invalidation signals; the pty.*
+  // events carry the interactive terminal byte stream.
+  "fs.changed", // a path was created/modified/deleted (write or agent mutation)
+  "git.changed", // working-tree/index/HEAD changed (debounced re-probe)
+  "terminal.pty.started", // an interactive PTY session opened (carries ptyId)
+  "terminal.pty.output.delta", // PTY stdout/stderr bytes (separate from command.output)
+  "terminal.pty.exited", // PTY session ended (exitCode/reason)
 ]);
 export type SessionEventType = z.infer<typeof SessionEventType>;
+
+// Channel-B stream-event payloads (07-channel-b §1.2). SessionEvent.payload is
+// z.unknown() (NOT a discriminated union) — these are standalone schemas parsed
+// explicitly at the producer (the API-direct handshake/rotation) and the SDK/
+// React consumer. The rotation payload carries the freshly-minted data-plane URL
+// + the scoped stream token so a connected client hot-swaps its noVNC socket.
+export const StreamUrlRotatedPayload = z.object({
+  url: z.string().url(),
+  token: z.string().nullable(),
+  expiresAt: z.string().datetime().nullable(),
+  // The epoch the new URL was minted under (the box-rollover fence the client
+  // reconciles against). A client must drop a rotation event whose epoch it has
+  // already advanced past.
+  leaseEpoch: z.number().int().nonnegative(),
+  transport: z.literal("vnc-ws"),
+  // The viewer holder this URL is for (so a client filters out other viewers').
+  viewerId: z.string().uuid().nullable().default(null),
+});
+export type StreamUrlRotatedPayload = z.infer<typeof StreamUrlRotatedPayload>;
+
+export const StreamOpenedPayload = z.object({
+  viewerId: z.string().uuid(),
+  shared: z.boolean().default(false),
+  viewerCount: z.number().int().nonnegative(),
+});
+export type StreamOpenedPayload = z.infer<typeof StreamOpenedPayload>;
+
+export const StreamClosedPayload = z.object({
+  viewerId: z.string().uuid(),
+  reason: z.enum(["client-disconnect", "reaped", "revoked", "box-rollover"]),
+  viewerCount: z.number().int().nonnegative(),
+});
+export type StreamClosedPayload = z.infer<typeof StreamClosedPayload>;
+
+export const StreamRevokedPayload = z.object({
+  viewerId: z.string().uuid().nullable().default(null),
+  reason: z.enum(["grant-revoked", "session-failed", "admin"]),
+});
+export type StreamRevokedPayload = z.infer<typeof StreamRevokedPayload>;
+
+// ── Recording payloads (P4.3 / module 05 §3.4) ──────────────────────────────
+// SessionEvent.payload is z.unknown() (NOT a discriminated union) — these are
+// standalone schemas parsed explicitly at the producer (the recording activity)
+// and the SDK/React consumer. The codec/contentType pair stays consistent
+// (h264-mp4↔video/mp4, vp9-webm↔video/webm).
+export const RecordingMode = z.enum(["manual", "on-turn", "on-verify"]);
+export type RecordingMode = z.infer<typeof RecordingMode>;
+export const RecordingCodec = z.enum(["h264-mp4", "vp9-webm"]);
+export type RecordingCodec = z.infer<typeof RecordingCodec>;
+export const RecordingContentType = z.enum(["video/mp4", "video/webm"]);
+export type RecordingContentType = z.infer<typeof RecordingContentType>;
+
+export const RecordingStartedPayload = z.object({
+  recordingId: z.string().uuid(),
+  turnId: z.string().uuid().nullable(),
+  mode: RecordingMode,
+  codec: RecordingCodec,
+  dimensions: z.tuple([z.number().int().positive(), z.number().int().positive()]),
+  framerate: z.number().int().positive(),
+  startedAt: z.string(), // ISO
+  // The verification rationale ("agent-verification: tf apply succeeded"). Agent-
+  // authored free text — the producer caps + scrubs it before emit.
+  reason: z.string().nullable().optional(),
+});
+export type RecordingStartedPayload = z.infer<typeof RecordingStartedPayload>;
+
+export const RecordingAvailablePayload = z.object({
+  recordingId: z.string().uuid(),
+  turnId: z.string().uuid().nullable(),
+  codec: RecordingCodec,
+  contentType: RecordingContentType,
+  // The @opengeni/storage object key. NO long-lived URL in the event — clients
+  // mint a short-TTL signed GET via GET …/recordings/:id/url.
+  storageKey: z.string(),
+  durationSeconds: z.number().nonnegative().nullable(),
+  sizeBytes: z.number().int().nonnegative(),
+  dimensions: z.tuple([z.number().int().positive(), z.number().int().positive()]),
+});
+export type RecordingAvailablePayload = z.infer<typeof RecordingAvailablePayload>;
+
+// `max-bytes-exceeded` is distinct from `timeout` (the -t ceiling hitting is a
+// SUCCESSFUL finalize, never a failure) — the adversarial-review F7 fix.
+export const RecordingFailedReason = z.enum([
+  "ffmpeg-error",
+  "box-death",
+  "box-rollover",
+  "upload-failed",
+  "max-bytes-exceeded",
+  "display-unavailable",
+]);
+export type RecordingFailedReason = z.infer<typeof RecordingFailedReason>;
+
+export const RecordingFailedPayload = z.object({
+  recordingId: z.string().uuid(),
+  turnId: z.string().uuid().nullable(),
+  reason: RecordingFailedReason,
+  // ffmpeg-stderr tail / error detail — agent/ffmpeg-controlled, so the producer
+  // caps + scrubs it before emit (it rides redact() like every payload).
+  detail: z.string().nullable().optional(),
+});
+export type RecordingFailedPayload = z.infer<typeof RecordingFailedPayload>;
+
+// ── Channel-A structured services (P4.4 / modules/08-channel-a.md) ───────────
+// Two transports on one spine: the A2 request/response shapes (FsNode tree,
+// GitDiff hunks, terminal exec) are returned INLINE on synchronous API-direct
+// routes (never the bus); the A1 notification payloads below ride the durable
+// SSE event log so every viewer's Pierre tree / diff / terminal stays live.
+
+// --- A1 event payloads -------------------------------------------------------
+
+// The agent's command-output firehose, enriched. Backward-compatible widening
+// of the existing sandbox.command.output.delta (consumers read `chunk`); the
+// producer may now also stamp stream/commandId/seq for finer terminal rendering.
+export const SandboxCommandOutputDeltaPayload = z.object({
+  stream: z.enum(["stdout", "stderr"]).default("stdout"),
+  chunk: z.string(), // raw bytes, utf-8 (lossy) — terminal is opaque-ish
+  commandId: z.string().optional(), // groups deltas to one agent command
+  seq: z.number().int().nonnegative().optional(), // intra-command ordering hint
+});
+export type SandboxCommandOutputDeltaPayload = z.infer<typeof SandboxCommandOutputDeltaPayload>;
+
+export const FsChangeKind = z.enum(["created", "modified", "deleted", "renamed"]);
+export type FsChangeKind = z.infer<typeof FsChangeKind>;
+export const FsChangedPayload = z.object({
+  changes: z.array(z.object({
+    path: z.string(), // workspace-relative POSIX path
+    kind: FsChangeKind,
+    isDir: z.boolean().default(false),
+    sizeBytes: z.number().int().nonnegative().nullable().default(null),
+    oldPath: z.string().optional(), // for "renamed"
+  })).min(1),
+  source: z.enum(["write", "watch", "agent"]).default("write"),
+  // Monotonic FS revision (per-lease, paired with leaseEpoch for staleness).
+  revision: z.number().int().nonnegative(),
+  // The lease epoch the revision was minted under: a client invalidates on a
+  // (leaseEpoch, revision) tuple change, never a bare revision compare (H3 —
+  // revision resets to 0 on box re-key, so a bare monotonic compare goes stale).
+  leaseEpoch: z.number().int().nonnegative().default(0),
+});
+export type FsChangedPayload = z.infer<typeof FsChangedPayload>;
+
+export const GitChangedPayload = z.object({
+  head: z.string().nullable(), // current branch or detached SHA
+  dirty: z.boolean(), // working tree has uncommitted changes
+  ahead: z.number().int().nonnegative().default(0),
+  behind: z.number().int().nonnegative().default(0),
+  changedFileCount: z.number().int().nonnegative(),
+  reason: z.enum(["commit", "checkout", "stage", "worktree", "fetch", "unknown"]).default("unknown"),
+  revision: z.number().int().nonnegative().default(0),
+  leaseEpoch: z.number().int().nonnegative().default(0),
+});
+export type GitChangedPayload = z.infer<typeof GitChangedPayload>;
+
+export const TerminalPtyStartedPayload = z.object({
+  ptyId: z.string().uuid(),
+  cols: z.number().int().positive(),
+  rows: z.number().int().positive(),
+  shell: z.string(), // resolved shell, e.g. "/bin/bash"
+  cwd: z.string(),
+});
+export type TerminalPtyStartedPayload = z.infer<typeof TerminalPtyStartedPayload>;
+
+export const TerminalPtyOutputDeltaPayload = z.object({
+  ptyId: z.string().uuid(),
+  stream: z.enum(["stdout", "stderr"]).default("stdout"),
+  chunk: z.string(), // raw terminal bytes (incl. ANSI), utf-8 lossy
+  seq: z.number().int().nonnegative(), // strict per-pty ordering (owner-assigned)
+});
+export type TerminalPtyOutputDeltaPayload = z.infer<typeof TerminalPtyOutputDeltaPayload>;
+
+export const TerminalPtyExitedPayload = z.object({
+  ptyId: z.string().uuid(),
+  exitCode: z.number().int().nullable(),
+  reason: z.enum(["exit", "killed", "owner_gone", "timeout"]),
+});
+export type TerminalPtyExitedPayload = z.infer<typeof TerminalPtyExitedPayload>;
+
+// --- A2 FileSystem request/response (NOT events; returned inline) ------------
+export const FsNodeType = z.enum(["file", "dir", "symlink", "other"]);
+export type FsNodeType = z.infer<typeof FsNodeType>;
+// The Pierre-tree node. `children` is present only when the dir was listed with
+// depth>0; the tree lazy-expands via repeated depth-1 lists at deeper paths.
+export interface FsTreeNode {
+  name: string;
+  path: string; // workspace-relative POSIX, no leading slash
+  type: z.infer<typeof FsNodeType>;
+  sizeBytes: number | null; // null for dirs
+  mtimeMs: number | null;
+  mode: number | null; // unix mode bits, for Pierre tree icons/perms
+  children?: FsTreeNode[] | undefined;
+  truncated: boolean; // dir had more entries than the cap
+}
+export const FsTreeNode: z.ZodType<FsTreeNode> = z.lazy(() => z.object({
+  name: z.string(),
+  path: z.string(),
+  type: FsNodeType,
+  sizeBytes: z.number().int().nonnegative().nullable(),
+  mtimeMs: z.number().int().nonnegative().nullable(),
+  mode: z.number().int().nullable(),
+  children: z.array(FsTreeNode).optional(),
+  truncated: z.boolean().default(false),
+})) as z.ZodType<FsTreeNode>;
+
+export const FsListRequest = z.object({
+  path: z.string().default(""), // "" = workspace root
+  depth: z.number().int().min(0).max(8).default(1),
+  maxEntries: z.number().int().positive().max(20_000).default(2_000),
+  includeHidden: z.boolean().default(true),
+});
+export type FsListRequest = z.infer<typeof FsListRequest>;
+export const FsListResponse = z.object({
+  root: FsTreeNode,
+  revision: z.number().int().nonnegative(),
+  truncated: z.boolean(), // global cap hit
+});
+export type FsListResponse = z.infer<typeof FsListResponse>;
+
+export const FsEncoding = z.enum(["utf8", "base64"]);
+export type FsEncoding = z.infer<typeof FsEncoding>;
+export const FsReadRequest = z.object({
+  path: z.string(),
+  encoding: FsEncoding.default("utf8"),
+  maxBytes: z.number().int().positive().max(25 * 1024 * 1024).default(5 * 1024 * 1024),
+});
+export type FsReadRequest = z.infer<typeof FsReadRequest>;
+export const FsReadResponse = z.object({
+  path: z.string(),
+  encoding: FsEncoding,
+  content: z.string(), // text or base64 per encoding
+  sizeBytes: z.number().int().nonnegative(), // bytes returned (== content size)
+  truncated: z.boolean(), // sizeBytes hit maxBytes; content is the prefix
+  isBinary: z.boolean(), // sniffed NUL byte in first 8KB
+  revision: z.number().int().nonnegative(),
+});
+export type FsReadResponse = z.infer<typeof FsReadResponse>;
+
+export const FsWriteRequest = z.object({
+  path: z.string(),
+  encoding: FsEncoding.default("utf8"),
+  content: z.string(),
+  overwrite: z.boolean().default(true), // false + existing path => 409
+  createParents: z.boolean().default(true),
+});
+export type FsWriteRequest = z.infer<typeof FsWriteRequest>;
+export const FsWriteResponse = z.object({
+  path: z.string(),
+  sizeBytes: z.number().int().nonnegative(),
+  revision: z.number().int().nonnegative(), // == the fs.changed revision
+});
+export type FsWriteResponse = z.infer<typeof FsWriteResponse>;
+
+export const FsDeleteRequest = z.object({
+  path: z.string(),
+  recursive: z.boolean().default(false), // required true to delete a non-empty dir
+});
+export type FsDeleteRequest = z.infer<typeof FsDeleteRequest>;
+export const FsDeleteResponse = z.object({ revision: z.number().int().nonnegative() });
+export type FsDeleteResponse = z.infer<typeof FsDeleteResponse>;
+
+export const FsMoveRequest = z.object({
+  path: z.string(),
+  newPath: z.string(),
+  overwrite: z.boolean().default(false), // false + existing destination => 409
+  createParents: z.boolean().default(true),
+});
+export type FsMoveRequest = z.infer<typeof FsMoveRequest>;
+export const FsMoveResponse = z.object({
+  path: z.string(),
+  newPath: z.string(),
+  revision: z.number().int().nonnegative(), // == the fs.changed revision
+});
+export type FsMoveResponse = z.infer<typeof FsMoveResponse>;
+
+export const FsMkdirRequest = z.object({
+  path: z.string(),
+  recursive: z.boolean().default(true), // false + existing path => 400
+});
+export type FsMkdirRequest = z.infer<typeof FsMkdirRequest>;
+export const FsMkdirResponse = z.object({
+  path: z.string(),
+  revision: z.number().int().nonnegative(), // == the fs.changed revision
+});
+export type FsMkdirResponse = z.infer<typeof FsMkdirResponse>;
+
+// --- A2 Git request/response (read-only; feeds Pierre diff/tree) -------------
+export const GitFileStatusCode = z.enum([
+  "added", "modified", "deleted", "renamed", "copied", "untracked", "ignored", "conflicted", "typechange",
+]);
+export type GitFileStatusCode = z.infer<typeof GitFileStatusCode>;
+export const GitFileStatus = z.object({
+  path: z.string(),
+  oldPath: z.string().nullable(), // for renamed/copied
+  index: GitFileStatusCode.nullable(), // staged change (X in porcelain XY)
+  worktree: GitFileStatusCode.nullable(), // unstaged change (Y in porcelain XY)
+  isConflicted: z.boolean().default(false),
+});
+export type GitFileStatus = z.infer<typeof GitFileStatus>;
+export const GitStatusRequest = z.object({
+  path: z.string().default(""), // repo root within workspace (multi-repo support)
+});
+export type GitStatusRequest = z.infer<typeof GitStatusRequest>;
+export const GitStatusResponse = z.object({
+  isRepo: z.boolean(),
+  head: z.string().nullable(), // branch name
+  detached: z.boolean().default(false),
+  upstream: z.string().nullable(),
+  ahead: z.number().int().nonnegative().default(0),
+  behind: z.number().int().nonnegative().default(0),
+  files: z.array(GitFileStatus),
+  revision: z.number().int().nonnegative(),
+});
+export type GitStatusResponse = z.infer<typeof GitStatusResponse>;
+
+// The structured hunk shape that feeds Pierre diff — the whole point of Git.
+export const GitDiffLineType = z.enum(["context", "add", "del", "meta"]);
+export type GitDiffLineType = z.infer<typeof GitDiffLineType>;
+export const GitDiffLine = z.object({
+  type: GitDiffLineType,
+  // null on the side that doesn't have the line (add => oldNo null; del => newNo null)
+  oldNo: z.number().int().positive().nullable(),
+  newNo: z.number().int().positive().nullable(),
+  text: z.string(), // line WITHOUT leading +/-/space marker
+});
+export type GitDiffLine = z.infer<typeof GitDiffLine>;
+export const GitDiffHunk = z.object({
+  oldStart: z.number().int().nonnegative(),
+  oldLines: z.number().int().nonnegative(),
+  newStart: z.number().int().nonnegative(),
+  newLines: z.number().int().nonnegative(),
+  header: z.string(), // the @@ ... @@ section heading
+  lines: z.array(GitDiffLine),
+});
+export type GitDiffHunk = z.infer<typeof GitDiffHunk>;
+export const GitFileDiff = z.object({
+  path: z.string(),
+  oldPath: z.string().nullable(),
+  status: GitFileStatusCode,
+  isBinary: z.boolean().default(false),
+  isImage: z.boolean().default(false),
+  additions: z.number().int().nonnegative(),
+  deletions: z.number().int().nonnegative(),
+  hunks: z.array(GitDiffHunk), // empty if binary or truncated
+  truncated: z.boolean().default(false), // diff exceeded maxBytes; hunks omitted
+});
+export type GitFileDiff = z.infer<typeof GitFileDiff>;
+export const GitDiffRequest = z.object({
+  path: z.string().default(""), // repo root
+  // diff selectors, mutually exclusive precedence: refs > staged > worktree
+  staged: z.boolean().default(false), // --cached (index vs HEAD)
+  fromRef: z.string().optional(),
+  toRef: z.string().optional(),
+  pathspec: z.array(z.string()).default([]),
+  contextLines: z.number().int().min(0).max(10).default(3),
+  maxBytesPerFile: z.number().int().positive().max(2 * 1024 * 1024).default(512 * 1024),
+});
+export type GitDiffRequest = z.infer<typeof GitDiffRequest>;
+export const GitDiffResponse = z.object({
+  files: z.array(GitFileDiff),
+  revision: z.number().int().nonnegative(),
+});
+export type GitDiffResponse = z.infer<typeof GitDiffResponse>;
+
+export const GitLogRequest = z.object({
+  path: z.string().default(""),
+  ref: z.string().default("HEAD"),
+  maxCount: z.number().int().positive().max(1_000).default(100),
+  skip: z.number().int().nonnegative().default(0),
+  pathspec: z.array(z.string()).default([]),
+});
+export type GitLogRequest = z.infer<typeof GitLogRequest>;
+export const GitCommit = z.object({
+  sha: z.string(),
+  shortSha: z.string(),
+  parents: z.array(z.string()),
+  author: z.object({ name: z.string(), email: z.string(), timestamp: z.number().int() }),
+  committer: z.object({ name: z.string(), email: z.string(), timestamp: z.number().int() }),
+  subject: z.string(),
+  body: z.string(),
+  refs: z.array(z.string()).default([]), // decorations: branch/tag pointers
+});
+export type GitCommit = z.infer<typeof GitCommit>;
+export const GitLogResponse = z.object({ commits: z.array(GitCommit), hasMore: z.boolean() });
+export type GitLogResponse = z.infer<typeof GitLogResponse>;
+
+export const GitShowRequest = z.object({
+  path: z.string().default(""),
+  ref: z.string(), // a commit/tag/tree-ish
+  filePath: z.string().optional(), // ref + filePath => raw blob ("open file at commit")
+  encoding: FsEncoding.default("utf8"),
+  maxBytesPerFile: z.number().int().positive().max(2 * 1024 * 1024).default(512 * 1024),
+});
+export type GitShowRequest = z.infer<typeof GitShowRequest>;
+export const GitShowResponse = z.object({
+  commit: GitCommit.nullable(), // null when fetching a raw blob
+  files: z.array(GitFileDiff), // commit diff vs first parent
+  blob: z.object({ content: z.string(), encoding: FsEncoding, sizeBytes: z.number().int(), truncated: z.boolean() }).nullable(),
+  revision: z.number().int().nonnegative(),
+});
+export type GitShowResponse = z.infer<typeof GitShowResponse>;
+
+// --- A2 Terminal exec (run a command in-box, stream stdout/stderr) -----------
+// The command-output FIREHOSE rides A1 (sandbox.command.output.delta). This is
+// the SYNCHRONOUS exec: run a bounded command and return its stdout/stderr +
+// exit code inline (the result IS the HTTP response). Full interactive PTY
+// (open/write/resize) layers on top via the pty.* events; exec ships now.
+export const TerminalExecRequest = z.object({
+  command: z.string().min(1),
+  cwd: z.string().default(""), // workspace-relative
+  // Soft per-call wall-clock bound (the box yields output back when reached).
+  timeoutMs: z.number().int().positive().max(120_000).default(30_000),
+  // Stream the deltas onto A1 as the agent firehose (so other viewers see it),
+  // in addition to returning the buffered result inline.
+  emitStream: z.boolean().default(true),
+});
+export type TerminalExecRequest = z.infer<typeof TerminalExecRequest>;
+export const TerminalExecResponse = z.object({
+  stdout: z.string(),
+  stderr: z.string(),
+  exitCode: z.number().int().nullable(),
+  // True when the process was still running when the call yielded (a long
+  // command); the remaining output drains onto A1 if emitStream was set.
+  running: z.boolean(),
+  wallTimeSeconds: z.number().nonnegative(),
+});
+export type TerminalExecResponse = z.infer<typeof TerminalExecResponse>;
+
+// --- A2 Terminal PTY control (output rides A1) -------------------------------
+export const PtyOpenRequest = z.object({
+  cols: z.number().int().positive().max(500).default(80),
+  rows: z.number().int().positive().max(300).default(24),
+  cwd: z.string().default(""), // workspace-relative
+  shell: z.string().optional(), // default: resolved login shell
+});
+export type PtyOpenRequest = z.infer<typeof PtyOpenRequest>;
+export const PtyOpenResponse = z.object({
+  ptyId: z.string().uuid(),
+  // output streams as terminal.pty.output.delta on the SSE channel the client holds
+  streamVia: z.literal("sse-events"),
+  supportsInput: z.boolean(), // false on backends without writeStdin
+});
+export type PtyOpenResponse = z.infer<typeof PtyOpenResponse>;
+export const PtyWriteRequest = z.object({ ptyId: z.string().uuid(), data: z.string() }); // utf-8 stdin
+export type PtyWriteRequest = z.infer<typeof PtyWriteRequest>;
+export const PtyResizeRequest = z.object({ ptyId: z.string().uuid(), cols: z.number().int().positive(), rows: z.number().int().positive() });
+export type PtyResizeRequest = z.infer<typeof PtyResizeRequest>;
+export const PtyCloseRequest = z.object({ ptyId: z.string().uuid() });
+export type PtyCloseRequest = z.infer<typeof PtyCloseRequest>;
+
+// Per-session structured-service capabilities (the Channel-A slice of the
+// negotiation). The full SessionCapabilities doc already carries FileSystem /
+// Terminal / Git blocks (P0.1); this is the compact projection the SDK mirrors.
+export const SessionStructuredCapabilities = z.object({
+  FileSystem: z.object({ available: z.boolean(), readOnly: z.boolean(), root: z.string() }),
+  Terminal: z.object({
+    events: z.boolean(), // command.output firehose (always on if a box exists)
+    exec: z.boolean(), // synchronous terminal exec
+    pty: z.object({ available: z.boolean() }), // interactive stdin (writeStdin)
+  }),
+  Git: z.object({ available: z.boolean(), repos: z.array(z.string()) }),
+});
+export type SessionStructuredCapabilities = z.infer<typeof SessionStructuredCapabilities>;
 
 export const SessionEvent = z.object({
   id: z.string().uuid(),
@@ -1373,6 +2315,23 @@ export const CreateSessionRequest = z.object({
   // the orchestration/environment/github tools. Capped at creation: every
   // requested permission must be held by the creating grant (no escalation).
   firstPartyMcpPermissions: z.array(Permission).optional(),
+  // Shared-sandbox placement (addendum 05 §D.1). Three-way union; OMITTED ⇒
+  // today's behavior (a context-dependent default resolved server-side: from
+  // inside a session → "shared" with the creator's box, top-level → "new").
+  //   - "shared":  join the CREATOR's box. Requires a parent session (inferred
+  //                from the worker-signed sessionId claim, never caller-supplied);
+  //                top-level "shared" is a 422.
+  //   - "new":     mint a fresh singleton box (group ≡ the new session's id).
+  //   - {groupId}: join a SPECIFIC sibling group in THIS workspace (manager
+  //                fan-out). Validated workspace-scoped (cross-workspace → 404).
+  // A shared spawn inherits the box's (backend, os) — it is literally the same
+  // box; the child cannot pick its own backend. Cross-workspace sharing is
+  // forbidden by construction (the parent/group reads are RLS-workspace-scoped).
+  sandbox: z.union([
+    z.literal("shared"),
+    z.literal("new"),
+    z.object({ groupId: z.string().uuid() }),
+  ]).optional(),
 });
 export type CreateSessionRequest = z.infer<typeof CreateSessionRequest>;
 
@@ -1454,6 +2413,174 @@ export const ClientAuthConfig = z.discriminatedUnion("mode", [
 ]);
 export type ClientAuthConfig = z.infer<typeof ClientAuthConfig>;
 
+// The negotiated capability handshake document (master-spine C.3). ONE shape;
+// collapses the parallel per-module definitions. A capability cell is always
+// present with `available`/`transport` + a `reason` when unavailable — never
+// absent.
+export const CapabilityUnavailableReason = z.enum([
+  "backend_unsupported",
+  "os_unsupported",
+  "not_provisioned",
+  "disabled_by_policy",
+  "lease_cold",
+  "tier_headless",
+]);
+export type CapabilityUnavailableReason = z.infer<typeof CapabilityUnavailableReason>;
+
+export const SessionCapabilities = z.object({
+  sessionId: z.string().uuid(),
+  backend: SandboxBackend,
+  os: SandboxOs,
+  liveness: z.enum(["cold", "warming", "warm", "draining"]),
+  // Echoed on viewer heartbeats (the split-brain fence).
+  leaseEpoch: z.number().int().nonnegative(),
+  viewerHeartbeatIntervalMs: z.number().int().positive().default(30_000),
+  FileSystem: z.object({
+    available: z.boolean(),
+    readOnly: z.boolean(),
+    root: z.string(),
+    pathSep: z.enum(["/", "\\"]),
+    treeMode: z.enum(["lazy", "snapshot"]),
+    reason: CapabilityUnavailableReason.nullable(),
+  }),
+  Terminal: z.object({
+    transport: z.enum(["sse-events", "pty-ws"]).nullable(),
+    ptyCapable: z.boolean(),
+    shell: z.string(),
+    // The direct-to-provider ttyd PTY-over-websocket URL (pty-ws) resolved on the
+    // SAME tunnel as the desktop; null on a cold lease / read-only sse-events
+    // firehose / degraded terminal. The scoped stream token is recorded against
+    // the holder (NEVER a URL query param), symmetric with DesktopStream.
+    url: z.string().url().nullable(),
+    token: z.string().nullable(),
+    // ISO absolute expiry of the minted stream token (symmetric with
+    // DesktopStream.expiresAt). Null when no live URL/token is minted.
+    expiresAt: z.string().nullable(),
+    reason: CapabilityUnavailableReason.nullable(),
+  }),
+  Git: z.object({
+    available: z.boolean(),
+    repos: z.array(z.string()),
+    reason: CapabilityUnavailableReason.nullable(),
+  }),
+  DesktopStream: z.object({
+    transport: z.enum(["vnc-ws", "rdp-ws", "webrtc"]).nullable(),
+    client: z.enum(["novnc", "web-rdp"]).nullable(),
+    mode: z.enum(["read-only", "interactive"]).default("read-only"),
+    url: z.string().url().nullable(),
+    token: z.string().nullable(),
+    expiresAt: z.string().nullable(),
+    resolution: z
+      .tuple([z.number().int().positive(), z.number().int().positive()])
+      .default([1024, 768]),
+    // REQUIRED, no default (the server must assert un-redacted pixels).
+    unredacted: z.boolean(),
+    requiresAcknowledgment: z.boolean(),
+    acknowledged: z.boolean(),
+    // SHARED-EXPOSURE disclosure (addendum E.1). `shared` is true when the box's
+    // group has >1 session: watching this desktop ALSO shows the sibling
+    // sessions' agents on the one :0 framebuffer (the pixels cannot be redacted).
+    // `sharedSessionIds` lists the OTHER sessions whose agents may appear — IDS
+    // ONLY, never their goal/metadata/conversation (a viewer of A must not be
+    // able to use "I can see B's id" to subscribe to B's events; stress g). When
+    // shared, the consent gate requires the shared-exposure acknowledgment (409
+    // shared_acknowledgment_required) before the desktop path is handed out.
+    shared: z.boolean().default(false),
+    sharedSessionIds: z.array(z.string().uuid()).default([]),
+    reason: CapabilityUnavailableReason.nullable(),
+  }),
+  Recording: z.object({
+    available: z.boolean(),
+    modes: z.array(z.enum(["manual", "on-turn", "on-verify"])),
+    codecs: z.array(z.enum(["h264-mp4", "vp9-webm"])),
+    reason: CapabilityUnavailableReason.nullable(),
+  }),
+  // The AGENT drives the SAME :0 (xdotool/XTEST + scrot) the human watches; the
+  // human viewer plane is read-only by default (§6). `available` == desktop-
+  // capable backend && computerUseEnabled; `readOnly` reports whether the agent
+  // driver itself is gated to no-op input (v1 default false — the agent clicks).
+  ComputerUse: z.object({
+    available: z.boolean(),
+    readOnly: z.boolean(),
+    reason: CapabilityUnavailableReason.nullable(),
+  }),
+  negotiatedAt: z.string(),
+});
+export type SessionCapabilities = z.infer<typeof SessionCapabilities>;
+
+// ── API-direct viewer attach (P1.4) ─────────────────────────────────────────
+// A viewer holds the GROUP lease (keeping the box warm while watched). These
+// shape the in-process attach/heartbeat/detach handlers. The scoped stream
+// token + the un-redacted-pixel acknowledgment are P3/P4 — here it is the
+// viewer-HOLDER lifecycle only.
+
+// POST .../viewers — acquire a viewer holder. An omitted viewerId mints a fresh
+// one (returned in the response, to carry through heartbeats + detach).
+//
+// `desktop` declares intent to attach the UN-REDACTED pixel plane (noVNC). ONLY
+// that plane carries the consent gate (the un-redacted/shared acknowledgment). A
+// terminal-only warm attach (`desktop:false`, the default) needs NO consent — a
+// shell is interactive by nature and the gate is the scoped tunnel URL + stream
+// token — so it warms the box and mints the pty-ws terminal cell WITHOUT a 409.
+// Omitted defaults to `false` so a terminal-only client never trips the gate.
+export const AttachViewerRequest = z.object({
+  viewerId: z.string().uuid().optional(),
+  desktop: z.boolean().optional(),
+});
+export type AttachViewerRequest = z.infer<typeof AttachViewerRequest>;
+
+export const ViewerHolder = z.object({
+  viewerId: z.string().uuid(),
+  sandboxGroupId: z.string().uuid(),
+  liveness: z.enum(["cold", "warming", "warm", "draining"]),
+  // The epoch the viewer is fenced on; echoed back on heartbeats.
+  leaseEpoch: z.number().int().nonnegative(),
+  viewerHeartbeatIntervalMs: z.number().int().positive(),
+  // The desktop pixel tunnel URL the viewer connects to directly; null until
+  // P4 mints it (gated until then).
+  dataPlaneUrl: z.string().nullable(),
+});
+export type ViewerHolder = z.infer<typeof ViewerHolder>;
+
+// POST .../stream-capabilities/acknowledge — record the calling principal's
+// acknowledgment of the un-redacted pixel plane (P3.2; modules/07-channel-b.md
+// §6 + addendum E.1). Reuses the acknowledgment machinery — no new endpoint
+// shape beyond this body, no new permission beyond stream:acknowledge.
+//
+// `acknowledgeShared` MUST be true when the box is shared (the group has >1
+// session): the un-redacted desktop path returns 409 shared_acknowledgment_required
+// until a shared box is acknowledged WITH the shared-exposure consent. For a
+// solo box `acknowledgeShared` is irrelevant (the un-redacted ack alone gates).
+export const AcknowledgeStreamRequest = z.object({
+  // The principal accepts that the desktop pixel plane is un-redacted (can show
+  // cloud creds the agent cat's into a terminal). Always true to record consent;
+  // present for self-documentation + a future explicit withdraw.
+  acknowledgeUnredacted: z.boolean().default(true),
+  // The principal accepts the shared-exposure disclosure: watching this desktop
+  // also shows sibling sessions' agents on the one framebuffer.
+  acknowledgeShared: z.boolean().default(false),
+});
+export type AcknowledgeStreamRequest = z.infer<typeof AcknowledgeStreamRequest>;
+
+export const AcknowledgeStreamResponse = z.object({
+  acknowledged: z.boolean(),
+  acknowledgedShared: z.boolean(),
+});
+export type AcknowledgeStreamResponse = z.infer<typeof AcknowledgeStreamResponse>;
+
+// POST .../viewers/:viewerId/heartbeat — refresh the holder TTL. Epoch-fenced:
+// a stale-epoch beat (a box re-established under a newer epoch) is rejected.
+export const ViewerHeartbeatRequest = z.object({
+  leaseEpoch: z.number().int().nonnegative(),
+});
+export type ViewerHeartbeatRequest = z.infer<typeof ViewerHeartbeatRequest>;
+
+export const ViewerHeartbeatResponse = z.object({
+  // false ⇒ the holder was reaped or the epoch is stale; the client re-attaches.
+  alive: z.boolean(),
+});
+export type ViewerHeartbeatResponse = z.infer<typeof ViewerHeartbeatResponse>;
+
 /**
  * A single host-exposed model + the provider that serves it, as surfaced to
  * clients (SDK + React composer) by GET /v1/config/client. The wire `api`
@@ -1490,6 +2617,15 @@ export const ClientConfig = z.object({
   }),
   productAccessMode: ProductAccessMode,
   auth: ClientAuthConfig.default({ mode: "none" }),
+  // Server-wide hint: does this deployment support Channel-A structured services
+  // at all (P4.4). Per-session availability is negotiated on /stream-capabilities
+  // (it depends on the session's pinned backend); this is the coarse on/off the
+  // client uses to decide whether to even attempt the fs/git/terminal panels.
+  structuredServices: z.object({
+    fileSystem: z.boolean(),
+    git: z.boolean(),
+    terminalEvents: z.boolean(),
+  }).default({ fileSystem: false, git: false, terminalEvents: false }),
 });
 export type ClientConfig = z.infer<typeof ClientConfig>;
 

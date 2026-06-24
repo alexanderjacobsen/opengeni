@@ -1,67 +1,22 @@
 import {
-  collectGitIdentityEnvironment,
-  collectSandboxEnvironment,
-  environmentsEncryptionKeyBytes,
+  stableSandboxEnvironmentForRun,
   type Settings,
 } from "@opengeni/config";
-import type { ResourceRef } from "@opengeni/contracts";
+import { type ResourceRef } from "@opengeni/contracts";
 import {
-  decryptEnvironmentValue,
-  getWorkspaceEnvironmentValuesForRun,
-  type Database,
+  loadWorkspaceEnvironmentForRun,
+  type WorkspaceEnvironmentForRun,
 } from "@opengeni/db";
 import {
   createGitHubAppInstallationToken,
   githubAppBotIdentity,
 } from "@opengeni/github";
 
-export type WorkspaceEnvironmentForRun = {
-  id: string;
-  name: string;
-  description: string | null;
-  values: Record<string, string>;
-};
-
-/**
- * Loads and decrypts the workspace environment attached to a run's session.
- * `environmentId === null` is the unattached path: zero DB work and behavior
- * byte-identical to deployments without this feature. Attached runs fail
- * closed: a missing key or a deleted environment throws (names/ids only in
- * messages) instead of silently running without the secrets the run expects.
- */
-export async function loadWorkspaceEnvironmentForRun(
-  db: Database,
-  settings: Settings,
-  workspaceId: string,
-  environmentId: string | null,
-): Promise<WorkspaceEnvironmentForRun | null> {
-  if (!environmentId) {
-    return null;
-  }
-  const key = environmentsEncryptionKeyBytes(settings);
-  if (!key) {
-    throw new Error("workspace environment attached but OPENGENI_ENVIRONMENTS_ENCRYPTION_KEY is not configured");
-  }
-  const stored = await getWorkspaceEnvironmentValuesForRun(db, workspaceId, environmentId);
-  if (!stored) {
-    throw new Error(`workspace environment not found: ${environmentId}`);
-  }
-  const values: Record<string, string> = {};
-  for (const [name, encrypted] of Object.entries(stored.values)) {
-    try {
-      values[name] = decryptEnvironmentValue(key, encrypted);
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      throw new Error(`failed to decrypt workspace environment variable ${name}: ${reason}`);
-    }
-  }
-  return {
-    id: stored.environment.id,
-    name: stored.environment.name,
-    description: stored.environment.description,
-    values,
-  };
-}
+// Re-exported from the shared @opengeni/db leaf (moved there so the API-direct
+// attach paths can load the SAME decrypted workspace environment the turn
+// declares — keeping the box-manifest env and agent-manifest env identical).
+// Existing worker import sites (agent-turn) continue importing from here.
+export { loadWorkspaceEnvironmentForRun, type WorkspaceEnvironmentForRun };
 
 export async function sandboxEnvironmentForRun(
   settings: Settings,
@@ -69,17 +24,11 @@ export async function sandboxEnvironmentForRun(
   workspaceEnvironment: Record<string, string> = {},
 ): Promise<Record<string, string>> {
   // Precedence: deployment allowlist < git identity < workspace environment
-  // < platform run-scoped GitHub auth (applied below, always last). Reserved
-  // name validation at write time prevents workspace values from colliding
-  // with the platform-managed entries.
-  const environment = {
-    ...collectSandboxEnvironment(settings),
-    ...collectGitIdentityEnvironment(settings),
-    ...workspaceEnvironment,
-  };
-  if (settings.sandboxBackend === "docker" || settings.sandboxBackend === "modal") {
-    environment.HOME ??= "/workspace";
-  }
+  // < backend-aware HOME (the STABLE base, shared with the API-direct attach
+  // paths via stableSandboxEnvironmentForRun) < platform run-scoped GitHub auth
+  // (applied below, always last). Reserved name validation at write time prevents
+  // workspace values from colliding with the platform-managed entries.
+  const environment = stableSandboxEnvironmentForRun(settings, workspaceEnvironment);
   const selection = githubRepositorySelection(resources);
   if (!selection) {
     return environment;

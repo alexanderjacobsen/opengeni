@@ -3367,6 +3367,18 @@ export async function commitWarmingToWarm(db: Database, input: {
 // §4.3 — caught spawn failure: warming -> cold (W3). Holders are intentionally
 // left intact — the arrival that triggered the spawn still wants a box, so the
 // next acquireLease re-CAS cold->warming.
+//
+// ARCHIVE PRESERVATION (sandbox-file-persistence): when the cold lease that was
+// selected for re-warm carried a persisted /workspace archive on its resume_state
+// (an archive-only envelope `{ backendId, sessionState: { workspaceArchive } }`
+// placed there by a prior drain), the spawn failed BEFORE commitWarmingToWarm,
+// so the LIVE box envelope was never folded onto resume_state. The warming row
+// still holds the ORIGINAL archive-only envelope. Nulling resume_state here would
+// destroy the snapshot the NEXT re-warm must replay — the same file-persistence
+// bug confirmDrainCold guards against. So we PRESERVE a minimal archive-only
+// envelope across this failure rollback (same shape confirmDrainCold keeps) and
+// retain resume_backend_id. No archive on the warming row (a never-persisted cold
+// start) -> resume_state is nulled as before.
 export async function failWarmingToCold(db: Database, input: {
   accountId: string; workspaceId: string; sandboxGroupId: string; expectedEpoch: number;
 }): Promise<void> {
@@ -3375,8 +3387,20 @@ export async function failWarmingToCold(db: Database, input: {
       await scopedDb.execute(sql`
         update sandbox_leases set
           liveness = 'cold', instance_id = null,
-          resume_backend_id = null, resume_state = null,
-          data_plane_url = null, terminal_data_plane_url = null, updated_at = now()
+          data_plane_url = null, terminal_data_plane_url = null, updated_at = now(),
+          resume_state = case
+            when (resume_state #>> '{sessionState,workspaceArchive}') is not null
+              then jsonb_build_object(
+                'backendId', coalesce(resume_state ->> 'backendId', to_jsonb(resume_backend_id) #>> '{}'),
+                'sessionState', jsonb_build_object(
+                  'workspaceArchive', resume_state #> '{sessionState,workspaceArchive}'))
+            else null
+          end,
+          resume_backend_id = case
+            when (resume_state #>> '{sessionState,workspaceArchive}') is not null
+              then resume_backend_id
+            else null
+          end
         where workspace_id = ${input.workspaceId} and sandbox_group_id = ${input.sandboxGroupId}
           and liveness = 'warming' and lease_epoch = ${input.expectedEpoch}
       `);
@@ -3636,16 +3660,130 @@ export async function confirmDrainCold(db: Database, input: {
 }): Promise<{ wentCold: boolean }> {
   return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId },
     async (scopedDb) => {
+      // draining->cold: the box is terminated, so EVERY live-box field is cleared
+      // (instance_id / data-plane URLs). resume_state, however, is NOT blindly
+      // nulled — if the reaper PERSISTED a /workspace snapshot onto it
+      // (persistDrainSnapshot folds the archive at resume_state.sessionState.
+      // workspaceArchive BEFORE this CAS, in the SAME sweep), nulling it here would
+      // immediately destroy the snapshot the next cold-restore must replay — the
+      // file-persistence bug. So we PRESERVE a MINIMAL archive-only envelope
+      // `{ backendId, sessionState: { workspaceArchive } }` (dropping the dead box's
+      // providerState/sandboxId — the box is gone, resume-by-id would only fail) and
+      // KEEP resume_backend_id so cold-restore knows which client to hydrate with.
+      // No archive (a non-persisted drain, or a 'none'/tar config that stored none)
+      // -> resume_state is nulled as before. The archive then rides the COLD lease's
+      // resume_state until the next spawner reads + hydrates it; it is re-superseded
+      // (GC'd) on the next drain and finally cleared on workspace teardown.
       const rows = await scopedDb.execute<{ id: string }>(sql`
         update sandbox_leases set
           liveness = 'cold', instance_id = null,
-          resume_backend_id = null, resume_state = null,
-          data_plane_url = null, terminal_data_plane_url = null, updated_at = now()
+          data_plane_url = null, terminal_data_plane_url = null, updated_at = now(),
+          resume_state = case
+            when (resume_state #>> '{sessionState,workspaceArchive}') is not null
+              then jsonb_build_object(
+                'backendId', coalesce(resume_state ->> 'backendId', to_jsonb(resume_backend_id) #>> '{}'),
+                'sessionState', jsonb_build_object(
+                  'workspaceArchive', resume_state #> '{sessionState,workspaceArchive}'))
+            else null
+          end,
+          resume_backend_id = case
+            when (resume_state #>> '{sessionState,workspaceArchive}') is not null
+              then resume_backend_id
+            else null
+          end
         where workspace_id = ${input.workspaceId} and sandbox_group_id = ${input.sandboxGroupId}
           and liveness = 'draining' and refcount = 0 and lease_epoch = ${input.expectedEpoch}
         returning id
       `);
       return { wentCold: rows.length > 0 };
+    });
+}
+
+// §4.8b — persist the /workspace snapshot archive onto the lease BEFORE the
+// reaper terminates a drained box (sandbox-file-persistence). The reaper, after
+// resuming the live box and capturing `session.persistWorkspace()` (a base64
+// snapshot-ref / tar archive), CAS-folds it onto the lease's resume_state under
+// the SAME epoch fence confirmDrainCold uses (draining AND refcount=0 AND
+// lease_epoch=expected). Folding it into resume_state.sessionState.workspaceArchive
+// means a later cold-restore (establishSandboxSessionFromEnvelope) reads it back
+// off the same envelope it already deserializes, and confirmDrainCold's
+// `resume_state = null` clears it on teardown for free (delete-on-teardown).
+//
+// When workspaceArchive is null this function acts as a PURE CAS-GATE: it checks
+// (draining AND refcount=0 AND epoch=expected) under a FOR UPDATE lock and returns
+// wrote:true/false WITHOUT writing anything. This allows the reaper to guard a
+// terminate that produced no archive (a backend with no persistWorkspace) against
+// the re-arm race: a re-arm during the snapshot window sets refcount>0 / liveness!=
+// draining, so wrote:false → the reaper MUST NOT delete the box.
+//
+// Returns `{ wrote, priorArchive }`:
+//   - wrote:false  -> the CAS missed (re-armed / newer epoch / vanished); the
+//                     caller must NOT terminate (the box is wanted again). No GC.
+//   - priorArchive -> the archive THIS lease carried before (if any), so the
+//                     caller can best-effort delete the superseded provider
+//                     snapshot (keep-latest-per-lease GC). null on the first
+//                     persist for this box or when workspaceArchive is null.
+// The fence is the split-brain guard: a stale-epoch reaper writes ZERO rows and
+// is told not to terminate.
+export async function persistDrainSnapshot(db: Database, input: {
+  accountId: string; workspaceId: string; sandboxGroupId: string;
+  expectedEpoch: number;
+  /** base64 of the provider snapshot-ref / tar archive from persistWorkspace().
+   *  Pass null to CAS-check without writing (for backends with no persistWorkspace). */
+  workspaceArchive: string | null;
+}): Promise<{ wrote: boolean; priorArchive: string | null }> {
+  // withRlsContext already runs `fn` inside ONE transaction with the RLS GUCs set,
+  // so the SELECT...FOR UPDATE + UPDATE below are atomic (one snapshot, one lock)
+  // WITHOUT an extra nested savepoint — nesting a second transaction here under
+  // the RLS-scoped connection wedges the postgres-js client ("Failed query").
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId },
+    async (scopedDb) => {
+      // (1) Lock + read the PRIOR archive under the CAS guard (draining AND
+      // refcount=0 AND lease_epoch=expected). A miss (re-armed / newer epoch /
+      // vanished) returns no row → wrote:false, the caller must NOT terminate.
+      const guard = await scopedDb.execute<{ prior_archive: string | null }>(sql`
+        select resume_state #>> '{sessionState,workspaceArchive}' as prior_archive
+        from sandbox_leases
+        where workspace_id = ${input.workspaceId} and sandbox_group_id = ${input.sandboxGroupId}
+          and liveness = 'draining' and refcount = 0 and lease_epoch = ${input.expectedEpoch}
+        for update
+      `);
+      if (guard.length === 0) {
+        return { wrote: false, priorArchive: null };
+      }
+      const priorArchive = guard[0]!.prior_archive ?? null;
+      // null workspaceArchive = pure CAS-check (re-arm guard for no-archive backends).
+      // The FOR UPDATE lock above is the only synchronization needed; no write.
+      if (input.workspaceArchive === null) {
+        return { wrote: true, priorArchive: null };
+      }
+      // (2) Merge the NEW archive into resume_state.sessionState.workspaceArchive.
+      // jsonb_set's create_missing does NOT create intermediate objects, so a
+      // direct set of '{sessionState,workspaceArchive}' is a silent no-op when
+      // `sessionState` is absent (a null resume_state, or a legacy flat envelope).
+      // Instead: rebuild `sessionState` as (existing sessionState OR '{}') merged
+      // (||) with `{workspaceArchive: <b64>}` — this CREATES sessionState if absent
+      // AND preserves its existing siblings (providerState/manifest/exposedPorts).
+      // The archive is bound as a jsonb string scalar (to_jsonb(text)). Re-asserting
+      // the CAS guard keeps the write atomic with the FOR UPDATE lock above.
+      await scopedDb.execute(sql`
+        update sandbox_leases set
+          resume_state = jsonb_set(
+            -- Defensive: only treat resume_state / its sessionState as an object
+            -- when it actually IS one; a null/scalar (legacy or malformed envelope)
+            -- starts from '{}' so jsonb_set never throws "cannot set path in scalar".
+            case when jsonb_typeof(resume_state) = 'object' then resume_state else '{}'::jsonb end,
+            '{sessionState}',
+            (case when jsonb_typeof(resume_state -> 'sessionState') = 'object'
+                  then resume_state -> 'sessionState' else '{}'::jsonb end)
+              || jsonb_build_object('workspaceArchive', to_jsonb(${input.workspaceArchive}::text)),
+            true
+          ),
+          updated_at = now()
+        where workspace_id = ${input.workspaceId} and sandbox_group_id = ${input.sandboxGroupId}
+          and liveness = 'draining' and refcount = 0 and lease_epoch = ${input.expectedEpoch}
+      `);
+      return { wrote: true, priorArchive };
     });
 }
 

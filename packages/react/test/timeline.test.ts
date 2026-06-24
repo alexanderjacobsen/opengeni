@@ -166,6 +166,33 @@ describe("buildTimeline", () => {
     expect(item.workerSessionId).toBe(worker.id);
   });
 
+  test("a worker spawn whose output carries an error flag settles to failed, not complete", () => {
+    reset();
+    const items = buildTimeline([
+      event("agent.toolCall.created", {
+        id: "call-1",
+        name: "session_create",
+        arguments: JSON.stringify({ initialMessage: "Run the drift check on prod" }),
+      }),
+      event("agent.toolCall.output", { id: "call-1", output: "spawn rejected", error: true }),
+    ]);
+    expect((items[0] as WorkerItem).kind).toBe("worker");
+    expect((items[0] as WorkerItem).status).toBe("failed");
+  });
+
+  test("a worker message whose MCP output isError settles to failed", () => {
+    reset();
+    const items = buildTimeline([
+      event("agent.toolCall.created", {
+        id: "call-1",
+        name: "session_send_message",
+        arguments: JSON.stringify({ sessionId: "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d", message: "go" }),
+      }),
+      event("agent.toolCall.output", { id: "call-1", output: { isError: true, content: [{ type: "text", text: "delivery failed" }] } }),
+    ]);
+    expect((items[0] as WorkerItem).status).toBe("failed");
+  });
+
   test("session_send_message becomes a worker message item targeting the session in the arguments", () => {
     reset();
     const items = buildTimeline([
@@ -243,6 +270,52 @@ describe("buildTimeline", () => {
     ]);
     expect((items[0] as ToolCallItem).status).toBe("complete");
     expect((items[1] as AgentMessageItem).streaming).toBe(false);
+  });
+
+  // Fix 3: in-flight tools when turn.failed must become "failed", not "complete"
+  test("turn.failed marks in-flight tool calls as failed (not complete)", () => {
+    reset();
+    const items = buildTimeline([
+      event("agent.toolCall.created", { id: "call-1", name: "exec_command", arguments: { cmd: "make build" } }),
+      event("turn.failed", { error: "model provider unavailable" }),
+    ]);
+    expect((items[0] as ToolCallItem).status).toBe("failed");
+  });
+
+  test("turn.cancelled marks in-flight tool calls as cancelled (not failed, not complete)", () => {
+    reset();
+    const items = buildTimeline([
+      event("agent.toolCall.created", { id: "call-1", name: "exec_command", arguments: { cmd: "make test" } }),
+      event("turn.cancelled", {}),
+    ]);
+    expect((items[0] as ToolCallItem).status).toBe("cancelled");
+  });
+
+  test("turn.failed marks in-flight sandbox operations as failed", () => {
+    reset();
+    const items = buildTimeline([
+      event("sandbox.operation.started", { name: "exec", command: "terraform apply" }),
+      event("turn.failed", { error: "storage error" }),
+    ]);
+    expect((items[0] as SandboxItem).status).toBe("failed");
+  });
+
+  test("turn.cancelled marks in-flight sandbox operations as cancelled (not failed)", () => {
+    reset();
+    const items = buildTimeline([
+      event("sandbox.operation.started", { name: "exec", command: "kubectl logs -f" }),
+      event("turn.cancelled", {}),
+    ]);
+    expect((items[0] as SandboxItem).status).toBe("cancelled");
+  });
+
+  test("turn.cancelled marks in-flight worker items as cancelled (not failed)", () => {
+    reset();
+    const items = buildTimeline([
+      event("agent.toolCall.created", { id: "call-1", name: "session_create", arguments: JSON.stringify({ initialMessage: "go" }) }),
+      event("turn.cancelled", {}),
+    ]);
+    expect((items[0] as WorkerItem).status).toBe("cancelled");
   });
 
   test("goal events become goal markers with text", () => {

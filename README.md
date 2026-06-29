@@ -59,7 +59,7 @@ flowchart LR
     Temporal["Temporal<br/>orchestration and signals"]
     Worker["Worker<br/>OpenAI Agents SDK harness"]
     NATS["NATS Core<br/>live fanout"]
-    Sandbox["Sandbox backend<br/>Docker, Modal, local, none"]
+    Sandbox["Sandbox backend<br/>Docker, Modal, cloud, or self-hosted"]
   end
 
   Web --> API
@@ -79,6 +79,8 @@ Postgres is the durable source of truth. NATS is only the realtime fanout bus. I
 
 Temporal coordinates the work, but token streams and tool output do not go through workflow history. Agent execution runs inside non-retryable activities because model calls, sandbox commands, GitHub operations, and cloud-provider actions are side-effectful.
 
+For a map of every app and package and how they fit together, see [docs/architecture.md](docs/architecture.md).
+
 ## Stack
 
 - Bun workspace
@@ -89,7 +91,7 @@ Temporal coordinates the work, but token streams and tool output do not go throu
 - NATS Core realtime bus
 - MinIO for local S3-compatible file storage and Azure Blob, AWS S3, or GCS for production object storage
 - OpenAI Agents SDK
-- Docker and Modal sandbox backends
+- Pluggable sandbox backends: Docker, Modal, local, and cloud providers, plus self-hosted bring-your-own-compute (see [docs/architecture.md](docs/architecture.md) for the full list)
 
 ## Agent Guides
 

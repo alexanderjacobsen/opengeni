@@ -2,6 +2,8 @@
 
 This repository is a clean TypeScript/Bun stack. The public API is session-based.
 
+> **Start here for orientation: [`docs/architecture.md`](docs/architecture.md).** It is the canonical whole-system map — what OpenGeni is, the load-bearing invariants, the full repo layout, per-component deep-dives, and a *"if you're changing X, read Y first"* decision table. Read it before navigating an unfamiliar area, and **keep it current**: if your change adds/removes/renames an app, package, or sandbox backend; alters an architectural invariant, the data-flow, or the session/turn lifecycle; or changes which file is canonical for a change area — update `docs/architecture.md` in the *same* change. A stale map is a bug. (This file, AGENTS.md, owns *how to run and operate* the stack; architecture.md owns *how the system is shaped*.)
+
 When the user says **"start the dev server"**, **"spin it up"**, or **"run the full stack"**, they mean the steps under **Full local stack**.
 
 ## Full Local Stack
@@ -44,7 +46,7 @@ Manual equivalent:
    - `OPENGENI_TEMPORAL_HOST`
    - `OPENGENI_STARTUP_DEPENDENCY_RETRY_*` when dependencies need longer startup windows
    - OpenAI or Azure OpenAI credentials
-   - `OPENGENI_SANDBOX_BACKEND=docker` or `modal`
+   - `OPENGENI_SANDBOX_BACKEND` (see Sandbox Notes for the full backend list; `docker` is the default for local dev)
    - sandbox preparation profiles / env allowlist when needed
 
 5. Start long-running processes in separate terminals:
@@ -69,6 +71,8 @@ MinIO is the local S3-compatible object storage default for Docker Compose and o
 
 ## Architecture Notes
 
+For a map of every app, package, and how the parts fit together, start at [`docs/architecture.md`](docs/architecture.md) and follow its links to the focused topic docs.
+
 - Public clients talk only to the API.
 - Browser streaming uses `GET /v1/workspaces/:workspaceId/sessions/:id/events/stream` with SSE.
 - Core NATS is the realtime bus between producers and API instances.
@@ -90,11 +94,22 @@ The agent turn activity is `runAgentTurn`, also registered under the legacy alia
 
 ## Keeping these notes current
 
-If a change alters architecture, terminology, the run lifecycle, the memory model, or a "do not" guardrail above, update this file and the relevant `docs/*.md` in the same change. An out-of-date AGENTS.md or doc is a bug, not a nicety.
+If a change alters architecture, terminology, the run lifecycle, the memory model, or a "do not" guardrail above, update this file, [`docs/architecture.md`](docs/architecture.md), and the relevant `docs/*.md` in the same change. In particular, structural changes (an app/package/sandbox backend added, removed, or renamed; a moved responsibility; a changed invariant, data-flow, or canonical source) belong in `docs/architecture.md` — see its "Keeping this current" section. An out-of-date AGENTS.md or doc is a bug, not a nicety.
 
 ## Sandbox Notes
 
+Sandbox execution is pluggable. `OPENGENI_SANDBOX_BACKEND` selects one of the backends defined by the `SandboxBackend` enum in `packages/contracts/src/index.ts` (the canonical list): `docker`, `modal`, `local`, `none`, `daytona`, `runloop`, `e2b`, `blaxel`, `cloudflare`, `vercel`, and `selfhosted`. `docker` is the default and the usual local-dev choice; `modal` and the other cloud backends are provisioned, swappable boxes. When you change the set of backends, update the enum first and treat it as the source of truth — this file and the README follow it.
+
 The Docker sandbox image includes Terraform, Checkov, Azure CLI, GitHub CLI, git, jq, curl, and base shell utilities. Bundled Terraform/checkov skills live under `packages/runtime/src/bundled_hashicorp_terraform_skills` and are mounted into the sandbox under `.agents/`.
+
+### Bring-your-own-compute (`selfhosted`)
+
+`selfhosted` is a first-class, swappable backend for self-hosted external machines (the user's own always-on box), not a provisioned sandbox. Key invariants — do not break them:
+
+- **Never cold-create or kill a user's machine.** An offline self-hosted agent is *not* a `NotFound`; the lease never provisions a rival box, and the reaper drains a self-hosted box to cold but never provider-stops it. The capability descriptor is `persistable: false` (no disk snapshot) and the box is never idle-reaped.
+- **Control surface is NATS, not a provider API.** Exec/fs/git run over a `ControlRpc` request/reply seam addressed by `agent.<ws>.<id>.rpc`, encoded via `@opengeni/agent-proto` (the protobuf wire IDL codegen'd to both Rust and TS so the control plane and agent never drift). `negotiateCapabilities` surfaces online/offline/reconnecting/consent_required/display_unavailable states.
+- **Gated off by default.** The whole feature is behind `OPENGENI_SANDBOX_SELFHOSTED_ENABLED` (default OFF). When off, enrollment routes 404 and the backend is inert — boot is unaffected. Related config: the `OPENGENI_SELFHOSTED_NATS_*`, `OPENGENI_SELFHOSTED_RELAY_*`, and `OPENGENI_SELFHOSTED_RELAY_TOKEN_SECRET` env vars wire the control plane, callout account, and relay tier.
+- Sandbox/enrollment/metrics tables and the session `active_sandbox_id`/`active_epoch` pointer (migration 0023) make sandboxes swappable within a session. Design dossier lives under `docs/design/sandbox-surfacing/`.
 
 Enabled capability packs can scope the runtime per workspace: a registered pack manifest may declare `skills` (delivered into the same `.agents/` skill index as the bundled skills) and a `sandboxImage` that replaces the global `OPENGENI_DOCKER_IMAGE`/`OPENGENI_MODAL_IMAGE_REF` for that workspace's sessions. At most one enabled pack per workspace may declare an image — no image composition. See `docs/packs.md`.
 

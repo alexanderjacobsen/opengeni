@@ -203,6 +203,172 @@ export function sanitizeHistoryItemsForModel<T extends HistoryItem>(items: reado
 }
 
 /**
+ * Drop the account/org-bound `reasoning.encrypted_content` blob from a single
+ * history item, preserving everything else (the visible chain-of-thought text in
+ * `summary`/`content`, and every non-reasoning field). Pure + non-mutating: when
+ * there is nothing to strip the SAME reference is returned (so the common,
+ * same-account path stays byte-identical); otherwise a shallow clone is returned.
+ *
+ * WHY. A codex-subscription turn round-trips `reasoning.encrypted_content` — an
+ * opaque blob minted by the ChatGPT/Codex backend that is bound to the account
+ * (org) that produced it. After a manual switch from codex account A to B, the
+ * carried history items still hold A-minted blobs; replaying them into a turn
+ * running on B is rejected (400). The blob is purely a chain-of-thought
+ * continuity optimization — dropping it costs at most one turn of lost CoT
+ * continuity and never any message content.
+ *
+ * USED FOR `compaction` items only on the history-items read path: a foreign
+ * `compaction` summary carries account-bound `encrypted_content` but its summary
+ * is real conversation content that must be preserved, so we strip only the blob
+ * (we do NOT drop the whole item). Foreign `reasoning` items are instead dropped
+ * WHOLESALE by the caller (id + blob), because the Responses backend validates
+ * the foreign `rs_…` id and rejects a reasoning item that has a foreign id and no
+ * encrypted_content (so blanking the blob alone is not enough — see
+ * {@link applyCodexHistoryStrip}).
+ *
+ * The SDK's Responses converter reads the blob via `providerData.encryptedContent`
+ * (camel) or `providerData.encrypted_content` (snake); persisted rows use the
+ * snake form, but we delete both casings defensively. We also clear a top-level
+ * `encrypted_content` (the `compaction`-item shape) belt-and-braces — that blob
+ * is likewise source-bound. Only `reasoning` and `compaction` items are touched;
+ * messages, tool calls, and tool outputs pass through untouched by reference.
+ */
+export function stripReasoningEncryptedContent<T extends HistoryItem>(item: T): T {
+  const type = itemType(item);
+  if (type !== "reasoning" && type !== "compaction") {
+    return item;
+  }
+  const record = item as Record<string, unknown>;
+  const providerData = record.providerData;
+  const providerHasBlob = !!providerData && typeof providerData === "object"
+    && ("encryptedContent" in (providerData as Record<string, unknown>)
+      || "encrypted_content" in (providerData as Record<string, unknown>));
+  const topLevelHasBlob = "encrypted_content" in record;
+  if (!providerHasBlob && !topLevelHasBlob) {
+    // Nothing encrypted to strip — return the same reference (byte-identical).
+    return item;
+  }
+  const clone: Record<string, unknown> = { ...record };
+  if (providerHasBlob) {
+    const providerClone = { ...(providerData as Record<string, unknown>) };
+    delete providerClone.encryptedContent;
+    delete providerClone.encrypted_content;
+    clone.providerData = providerClone;
+  }
+  if (topLevelHasBlob) {
+    delete clone.encrypted_content;
+  }
+  return clone as unknown as T;
+}
+
+/**
+ * Neutralize the account/org-bound identity of EVERY `reasoning` item embedded
+ * in a serialized RunState JSON string, returning the re-serialized string. Pure:
+ * a parse failure or a no-op returns the SAME string reference (so an unchanged
+ * or non-codex run-state replays byte-for-byte).
+ *
+ * WHY (HOLE C — the run-state REPLAY paths). The approval-decision resume and the
+ * items-mode run-state fallback replay the serialized RunState blob verbatim. That
+ * blob round-trips `reasoning.encrypted_content` minted by the ChatGPT/Codex
+ * backend (bound to the freezing account/org — a foreign account 400s it) AND the
+ * foreign `rs_…` reasoning ids the Responses backend validates (rejected once the
+ * blob is gone). Unlike `session_history_items`, the blob carries NO per-item
+ * producer tag, so foreign-ness cannot be decided per item; the worker instead
+ * records the FREEZING codex account on the run-state row and calls this only when
+ * the resuming turn's codex account DIFFERS from it. When the accounts differ we
+ * conservatively neutralize every reasoning item: delete its provider id and its
+ * `encrypted_content` (both casings, in `providerData`). The visible reasoning
+ * `content`/`summary` and every message / tool-call / tool-output item are left
+ * intact (message and tool content are never account-bound).
+ *
+ * A reasoning item with no id and no encrypted_content is exactly the shape the
+ * production Azure path already sends (see `stripProviderItemIdsFilter`), so it
+ * deserializes and replays cleanly. Reasoning items live in several places in the
+ * blob — `originalInput` (when an array), each `modelResponses[].output`,
+ * `lastModelResponse.output`, and the `generatedItems` wrappers (`reasoning_item`
+ * → `rawItem`) — and we scrub all of them. `compaction` items are deliberately
+ * left untouched: their `encrypted_content` is a protocol-REQUIRED field whose
+ * removal would fail the SDK's run-state schema validation on deserialize.
+ */
+export function stripReasoningIdentityFromSerializedRunState(serialized: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(serialized);
+  } catch {
+    // Not JSON (e.g. a cleared-state sentinel handled elsewhere): forward as-is.
+    return serialized;
+  }
+  if (!parsed || typeof parsed !== "object") {
+    return serialized;
+  }
+  let changed = false;
+  const scrubReasoning = (candidate: unknown): void => {
+    if (!candidate || typeof candidate !== "object") {
+      return;
+    }
+    const record = candidate as Record<string, unknown>;
+    if (record.type !== "reasoning") {
+      return;
+    }
+    if ("id" in record) {
+      delete record.id;
+      changed = true;
+    }
+    const providerData = record.providerData;
+    if (providerData && typeof providerData === "object") {
+      const provider = providerData as Record<string, unknown>;
+      if ("encryptedContent" in provider) {
+        delete provider.encryptedContent;
+        changed = true;
+      }
+      if ("encrypted_content" in provider) {
+        delete provider.encrypted_content;
+        changed = true;
+      }
+    }
+    if ("encrypted_content" in record) {
+      delete record.encrypted_content;
+      changed = true;
+    }
+  };
+  const scrubItemArray = (arr: unknown): void => {
+    if (Array.isArray(arr)) {
+      for (const item of arr) {
+        scrubReasoning(item);
+      }
+    }
+  };
+  const root = parsed as Record<string, unknown>;
+  // 1. originalInput is either a string (no items) or an array of protocol items.
+  scrubItemArray(root.originalInput);
+  // 2. generatedItems are SDK run-item wrappers; a `reasoning_item` carries the
+  //    protocol reasoning shape under `rawItem`.
+  if (Array.isArray(root.generatedItems)) {
+    for (const wrapper of root.generatedItems) {
+      if (wrapper && typeof wrapper === "object" && "rawItem" in (wrapper as Record<string, unknown>)) {
+        scrubReasoning((wrapper as Record<string, unknown>).rawItem);
+      }
+    }
+  }
+  // 3. modelResponses[].output and lastModelResponse.output hold protocol items.
+  const scrubResponseOutput = (response: unknown): void => {
+    if (response && typeof response === "object") {
+      scrubItemArray((response as Record<string, unknown>).output);
+    }
+  };
+  if (Array.isArray(root.modelResponses)) {
+    for (const response of root.modelResponses) {
+      scrubResponseOutput(response);
+    }
+  }
+  scrubResponseOutput(root.lastModelResponse);
+  if (!changed) {
+    return serialized;
+  }
+  return JSON.stringify(parsed);
+}
+
+/**
  * Normalize `computer_call` items so each carries EXACTLY ONE of the two
  * mutually-exclusive action fields the provider accepts.
  *

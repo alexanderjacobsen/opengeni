@@ -12,6 +12,10 @@ import {
   getSessionTurn,
   isCodexBilledTurn,
   workspaceCodexSubscriptionActive,
+  getCodexRotationSettings,
+  listCodexAccountStatuses,
+  getSessionCodexState,
+  recordSessionActiveCodexCredential,
   requireSession,
   recordUsageEvent,
   appendSessionHistoryItems,
@@ -64,7 +68,7 @@ import { withCodexAppsTool, withFirstPartyTools } from "./goals";
 import { resolveWorkspaceAgentInstructions, resolveWorkspacePackRuntime, settingsWithPackSandboxImage } from "./packs";
 import { notifyParentOfChildTerminal } from "./parent-wake";
 import { createSecretRedactor, identityRedactor } from "./redaction";
-import { turnInput } from "./run-input";
+import { applyCodexHistoryStrip, turnInput, type TurnCodexAccount } from "./run-input";
 import {
   createRuntimeBatcher,
   currentActivityContext,
@@ -89,6 +93,28 @@ import { randomUUID } from "node:crypto";
 // throttling is minute-granular; anything shorter mostly burns continuation
 // budget against the same window.
 export const PROVIDER_BACKPRESSURE_DELAY_MS = 60_000;
+
+/**
+ * Resolve which Codex account a turn runs on (multi-account P1): session-pin >
+ * workspace-active. No rotation in P1. The selected id must still be in the
+ * connected set — a disconnected pin was FK-nulled, so a stale id can't appear,
+ * but we guard anyway. Returns null when there is no usable account (the turn
+ * then fails with the existing relogin error path).
+ */
+export function selectCodexCredentialForTurn(args: {
+  sessionPinnedCredentialId: string | null;
+  activeCredentialId: string | null;
+  connectedIds: Set<string>;
+}): string | null {
+  const { sessionPinnedCredentialId: pin, activeCredentialId: active, connectedIds } = args;
+  if (pin && connectedIds.has(pin)) {
+    return pin;
+  }
+  if (active && connectedIds.has(active)) {
+    return active;
+  }
+  return null;
+}
 
 // Resume notice fed to the model when a turn re-enters after a graceful
 // worker shutdown (deploy/rollout restart) checkpointed it mid-flight. The
@@ -198,6 +224,47 @@ export function historyRowsToAppend(
     item: item as Record<string, unknown>,
   }));
   return { rows, nextWatermark: sanitized.length, nextPosition: nextPosition + rows.length };
+}
+
+/**
+ * Seed the turn-end reconcile watermark (`persistedHistoryCount`) from EXACTLY the
+ * view `state.history` was seeded from, so the model-input length and the watermark
+ * can NEVER disagree. The watermark is the slice index the reconcile cuts the
+ * (re-sanitized) `state.history` at to find this turn's genuinely-new items, so it
+ * must equal the length of `state.history`'s already-persisted leading prefix.
+ *
+ * The cross-account reasoning strip drops foreign reasoning items, so the prefix
+ * length is PATH-DEPENDENT, captured by `modelHistoryFromItems`:
+ *
+ *  - items read path (`modelHistoryFromItems === true`) — `state.history` was seeded
+ *    from the cross-account-STRIPPED active items (foreign reasoning DROPPED), so it
+ *    starts K shorter than the raw active-row count. Seed from the SAME strip
+ *    (HOLE D); seeding from the un-stripped count would slice K genuinely-new items
+ *    off the reconcile and silently lose them (incl. the user's switch-turn message).
+ *
+ *  - run-state BLOB path (`modelHistoryFromItems === false`: approval resume, the
+ *    items-mode run-state fallback, run_state mode) — `state.history` was seeded
+ *    from the blob, where foreign reasoning is NEUTRALIZED-IN-PLACE (the item is
+ *    KEPT, only its id/encrypted_content go — see resumeRunStateForCodexAccount), so
+ *    the blob's history length still COUNTS those items. Applying the strip here
+ *    under-counts by K and the reconcile re-appends K already-persisted items at
+ *    fresh positions — HOLE E. So the blob path must NOT strip: count the raw
+ *    sanitized active length, which mirrors the blob's completed prefix.
+ *
+ * On a same-account / non-codex turn the strip is a no-op, so both branches reduce
+ * to the same raw sanitized count (byte-identical to the pre-strip behaviour).
+ * Pure; exported for unit testing the D/E seed invariant.
+ */
+export function reconcileSeedCount(
+  activeSeedRows: ReadonlyArray<{ item: Record<string, unknown>; producerCodexCredentialId: string | null }>,
+  modelHistoryFromItems: boolean,
+  current: TurnCodexAccount,
+): number {
+  return sanitizeHistoryItemsForModel(
+    modelHistoryFromItems
+      ? applyCodexHistoryStrip(activeSeedRows, current)
+      : activeSeedRows.map((row) => row.item),
+  ).length;
 }
 
 /**
@@ -339,6 +406,11 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
               workspaceId: input.workspaceId,
               sessionId: input.sessionId,
               turnId,
+              // Tag each row with the codex account that produced it (null on the
+              // non-codex path). Resolved at line ~504 before any reconcile pass
+              // runs, so this is the turn's effective account. The read path uses
+              // it to strip cross-account reasoning.encrypted_content next turn.
+              producerCodexCredentialId: effectiveCodexCredentialId,
               items: rows,
             });
           }
@@ -362,6 +434,9 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
     // created (and used for turn.started) before the environment is available.
     let redact: (payload: unknown) => unknown = identityRedactor;
     let environmentId = "";
+    // The Codex account this turn runs on (pin > workspace active), resolved once
+    // a codex-billed turn is confirmed and threaded into the token resolver below.
+    let effectiveCodexCredentialId: string | null = null;
     // Hoisted for the preemption path: an approval-decision rerun must
     // re-enter through the approval resume path (its frozen mid-flight state
     // only exists in the RunState blob), never through a swapped trigger.
@@ -460,6 +535,35 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       ], true);
       turnStartedPublished = true;
 
+      // Multi-account (P1): resolve the effective Codex account for this turn
+      // (session-pin > workspace active) and stamp it on the session so the
+      // in-session "Running on:" indicator reflects reality. Emit a switch event
+      // when it changed from the prior run's account so the pill flips live.
+      // Gated on the codex-billed predicate — non-codex turns never touch this.
+      if (isCodexTurn) {
+        const [rotation, accounts, sessionCodex] = await Promise.all([
+          getCodexRotationSettings(db, input.workspaceId),
+          listCodexAccountStatuses(db, input.workspaceId),
+          getSessionCodexState(db, input.workspaceId, input.sessionId),
+        ]);
+        const connectedIds = new Set(accounts.map((account) => account.id));
+        effectiveCodexCredentialId = selectCodexCredentialForTurn({
+          sessionPinnedCredentialId: sessionCodex?.pinnedCredentialId ?? null,
+          activeCredentialId: rotation?.activeCredentialId ?? null,
+          connectedIds,
+        });
+        if (effectiveCodexCredentialId) {
+          const priorAccountId = sessionCodex?.lastCredentialId ?? null;
+          await recordSessionActiveCodexCredential(db, input.workspaceId, input.sessionId, effectiveCodexCredentialId);
+          if (priorAccountId !== effectiveCodexCredentialId) {
+            await publish([{
+              type: "codex.account.switched",
+              payload: { fromAccountId: priorAccountId, toAccountId: effectiveCodexCredentialId, reason: "manual" },
+            }]);
+          }
+        }
+      }
+
       // Pack-scoped runtime: enabled packs may declare the sandbox image this
       // workspace's sessions run in and skills for the sandbox skill index.
       // Resolved after turn.started so a composition conflict (two enabled
@@ -491,14 +595,20 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       // keeps gating consistent with the router. Cost accounting covers registry
       // models via configuredModelPricing.
       const resolvedModel = runtime.resolveTurnModel(capabilitySettings, turn.model);
-      // A codex-subscription turn resolves its per-workspace bearer at model-call
-      // time: codexSubscriptionFetch (on the provider's OpenAI client) reads this
-      // AsyncLocalStorage context. Build it once and wrap BOTH the compaction
-      // summarizer (a separate model call on the same codex client) and the main
-      // run; otherwise the summarizer would hit the codex backend unauthenticated.
+      // A codex-subscription turn resolves the bearer for THIS turn's effective
+      // codex account (effectiveCodexCredentialId; pin > workspace-active) at
+      // model-call time — multi-account P1 means a workspace can hold N accounts,
+      // so the bearer is per-account, not per-workspace. codexSubscriptionFetch
+      // (on the provider's OpenAI client) reads this AsyncLocalStorage context.
+      // Build it once and wrap BOTH the compaction summarizer (a separate model
+      // call on the same codex client) and the main run; otherwise the summarizer
+      // would hit the codex backend unauthenticated.
       const codexContext: CodexRequestContext | null = resolvedModel?.provider.kind === "codex-subscription"
         ? ((): CodexRequestContext => {
-            const resolver = buildCodexTokenResolver(db, runSettings, input.workspaceId);
+            // The empty-string fallback yields no row → null credential → the
+            // existing CodexReloginRequired path (a codex turn with no usable
+            // account fails closed, exactly as before multi-account).
+            const resolver = buildCodexTokenResolver(db, runSettings, input.workspaceId, effectiveCodexCredentialId ?? "");
             return {
               clientVersion: CODEX_CLIENT_VERSION,
               getToken: resolver.getToken,
@@ -878,7 +988,22 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
           console.error("context compaction failed (turn proceeds un-compacted)", compactError);
         }
       }
-      const runInput = await turnInput(db, runtime, agent, trigger, runSettings);
+      // Cross-account reasoning strip: pass THIS turn's codex account so every
+      // history read path (items + run-state replay) drops reasoning produced by
+      // a DIFFERENT codex account. effectiveCodexCredentialId is the resolved
+      // codex credential on a codex turn (pin > workspace-active) and null on a
+      // non-codex turn OR a codex turn with no usable account — exactly the
+      // "current account" the single strip rule compares against (null is the
+      // built-in/Azure account, so a non-codex turn still drops codex-produced
+      // reasoning, and a no-codex-history session is a byte-for-byte no-op).
+      const { input: runInput, modelHistoryFromItems } = await turnInput(
+        db,
+        runtime,
+        agent,
+        trigger,
+        runSettings,
+        { currentCodexCredentialId: effectiveCodexCredentialId },
+      );
       // Slice index = the length of the model-facing (active) history this turn
       // is seeded from; new items beyond it (the trigger message + this turn's
       // generated items) are the ones to persist. After a compaction this is the
@@ -901,9 +1026,15 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       // orphan-free, so it is a stable prefix of the re-sanitized history and the
       // slice begins exactly at the first genuinely-new item.
       const activeSeedRows = await getActiveSessionHistoryItems(db, input.workspaceId, input.sessionId);
-      persistedHistoryCount = sanitizeHistoryItemsForModel(
-        activeSeedRows.map((row) => row.item),
-      ).length;
+      // Seed the reconcile watermark from EXACTLY the view the model's
+      // `state.history` was seeded from (items strip on the items path = HOLE D; NO
+      // strip on the run-state blob path, where foreign reasoning is neutralized but
+      // KEPT = HOLE E), so the model-input length and the watermark never disagree.
+      persistedHistoryCount = reconcileSeedCount(
+        activeSeedRows,
+        modelHistoryFromItems,
+        { currentCodexCredentialId: effectiveCodexCredentialId },
+      );
       historyCountAtTurnStart = persistedHistoryCount;
       nextHistoryPosition = await nextSessionHistoryPosition(db, input.workspaceId, input.sessionId);
       let responseUsageCount = 0;
@@ -1033,6 +1164,9 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
           turnId,
           serializedRunState: stream.state.toString(),
           pendingApprovals: approvals,
+          // Record the account freezing this state so a resume on a DIFFERENT
+          // codex account strips its account-bound reasoning before replay (HOLE C).
+          frozenCodexCredentialId: effectiveCodexCredentialId,
         });
         await publish([
           { type: "session.requiresAction", payload: { approvals } },
@@ -1056,6 +1190,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
           turnId,
           serializedRunState: stream.state.toString(),
           pendingApprovals: [],
+          frozenCodexCredentialId: effectiveCodexCredentialId,
         });
       }
       await publish([
@@ -1140,6 +1275,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
                 turnId: preemptTurnId,
                 serializedRunState: stream.state.toString(),
                 pendingApprovals: runtime.serializeApprovals(stream.interruptions ?? []),
+                frozenCodexCredentialId: effectiveCodexCredentialId,
               });
               resumeWithNotice = true;
             } catch {
@@ -1210,6 +1346,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             turnId,
             serializedRunState: maxTurns.serializedRunState,
             pendingApprovals: [],
+            frozenCodexCredentialId: effectiveCodexCredentialId,
           });
         }
         await publish([
@@ -1255,6 +1392,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             turnId,
             serializedRunState,
             pendingApprovals: [],
+            frozenCodexCredentialId: effectiveCodexCredentialId,
           });
         }
         const failurePayload = codexUsageLimitFailurePayload(usageLimit, error instanceof Error ? error.message : String(error));
@@ -1291,6 +1429,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             turnId,
             serializedRunState: error.serializedRunState,
             pendingApprovals: [],
+            frozenCodexCredentialId: effectiveCodexCredentialId,
           });
         }
         await publish([
@@ -1340,6 +1479,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             turnId,
             serializedRunState,
             pendingApprovals: [],
+            frozenCodexCredentialId: effectiveCodexCredentialId,
           });
         }
         await publish([

@@ -221,8 +221,12 @@ export type { DesktopViewerProps } from "./components/desktop-viewer";
 export { WorkspaceDock } from "./components/workspace-dock";
 export type { WorkspaceDockProps, WorkspaceTab } from "./components/workspace-dock";
 
-/** @deprecated Import connected-machine UI from "@opengeni/react/machines" instead. Re-exported from the root for backwards compatibility; will move in a future major. */
+// Connected-machine UI moved to the "@opengeni/react/machines" subpath; re-exported
+// here for back-compat (#144).
 export * from "./machines";
+// Multi-account Codex (P1): accounts list + active-switch hook.
+export { useCodexAccounts, isCodexAccountEvent } from "./hooks/use-codex-accounts";
+export type { CodexAccountsClientLike, UseCodexAccountsOptions, UseCodexAccountsResult } from "./hooks/use-codex-accounts";
 
 // Sandbox helpers
 export { gitFileDiffToPatch } from "./lib/git-patch";

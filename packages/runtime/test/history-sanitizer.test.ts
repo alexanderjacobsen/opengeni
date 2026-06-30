@@ -5,6 +5,8 @@ import {
   rewriteComputerCallsToActionsOnly,
   rewriteEmptyComputerCallOutputImageUrls,
   sanitizeHistoryItemsForModel,
+  stripReasoningEncryptedContent,
+  stripReasoningIdentityFromSerializedRunState,
 } from "../src/history-sanitizer";
 
 // The exact 1×1 transparent PNG placeholder used by the SDK (agents-core
@@ -513,5 +515,136 @@ describe("computerCallNormalizingFetch — empty image_url backstop (action-time
     // computer_call_output → placeholder
     const out = sent.input[1].output;
     expect(out.image_url).toBe(PLACEHOLDER);
+  });
+});
+
+describe("stripReasoningEncryptedContent", () => {
+  test("drops providerData.encrypted_content (snake) but preserves reasoning text", () => {
+    const item = {
+      type: "reasoning",
+      id: "rs_1",
+      summary: [{ type: "summary_text", text: "I considered the options" }],
+      content: [{ type: "input_text", text: "visible chain of thought" }],
+      providerData: { encrypted_content: "gAAAA-account-A-blob", other: "keep" },
+    } as any;
+    const out = stripReasoningEncryptedContent(item) as any;
+    // The opaque blob is gone…
+    expect("encrypted_content" in out.providerData).toBe(false);
+    // …but the visible reasoning text and every other field survive.
+    expect(out.providerData.other).toBe("keep");
+    expect(out.summary).toEqual(item.summary);
+    expect(out.content).toEqual(item.content);
+    expect(out.id).toBe("rs_1");
+    // Non-mutating: the input keeps its blob.
+    expect(item.providerData.encrypted_content).toBe("gAAAA-account-A-blob");
+  });
+
+  test("drops providerData.encryptedContent (camel) too", () => {
+    const item = {
+      type: "reasoning",
+      providerData: { encryptedContent: "blob", encrypted_content: "blob2" },
+    } as any;
+    const out = stripReasoningEncryptedContent(item) as any;
+    expect("encryptedContent" in out.providerData).toBe(false);
+    expect("encrypted_content" in out.providerData).toBe(false);
+  });
+
+  test("clears a top-level encrypted_content (compaction item shape)", () => {
+    const item = { type: "compaction", encrypted_content: "blob", summary: "kept" } as any;
+    const out = stripReasoningEncryptedContent(item) as any;
+    expect("encrypted_content" in out).toBe(false);
+    expect(out.summary).toBe("kept");
+  });
+
+  test("returns the SAME reference when there is nothing encrypted to strip", () => {
+    const reasoningNoBlob = { type: "reasoning", content: [{ type: "input_text", text: "t" }] } as any;
+    expect(stripReasoningEncryptedContent(reasoningNoBlob)).toBe(reasoningNoBlob);
+  });
+
+  test("leaves non-reasoning items untouched (by reference)", () => {
+    const message = {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "hello" }],
+      // A message would never carry this, but prove we never touch it.
+      providerData: { encrypted_content: "should-not-be-removed" },
+    } as any;
+    const out = stripReasoningEncryptedContent(message);
+    expect(out).toBe(message);
+    expect((out as any).providerData.encrypted_content).toBe("should-not-be-removed");
+  });
+});
+
+describe("stripReasoningIdentityFromSerializedRunState", () => {
+  // The run-state REPLAY paths (approval resume + items-mode run-state fallback)
+  // replay a serialized RunState blob that has no per-item producer tag. When the
+  // resuming codex account differs from the freezing one, this neutralizes EVERY
+  // reasoning item's account-bound identity (encrypted_content + provider id)
+  // wherever it lives in the blob, while preserving message / tool / compaction
+  // content. Both HOLE A vectors (foreign blob 400, foreign rs_ id rejection) are
+  // closed because neither the blob nor the id survives.
+
+  const fullBlob = () => JSON.stringify({
+    $schemaVersion: "1.12",
+    originalInput: [
+      { type: "reasoning", id: "rs_orig", content: [{ type: "input_text", text: "t" }], providerData: { encrypted_content: "enc-orig", keep: "yes" } },
+      { type: "message", role: "user", content: "the question" },
+    ],
+    modelResponses: [
+      { output: [
+        { type: "reasoning", id: "rs_resp", content: [], providerData: { encryptedContent: "enc-resp-camel" } },
+        { type: "function_call", callId: "call_1", name: "t", arguments: "{}" },
+      ] },
+    ],
+    lastModelResponse: { output: [{ type: "reasoning", id: "rs_last", content: [], providerData: { encrypted_content: "enc-last" } }] },
+    generatedItems: [
+      { type: "reasoning_item", rawItem: { type: "reasoning", id: "rs_gen", content: [], providerData: { encrypted_content: "enc-gen" } } },
+      { type: "message_output_item", rawItem: { type: "message", role: "assistant", content: [{ type: "output_text", text: "the answer" }] } },
+    ],
+  });
+
+  test("strips encrypted_content (snake+camel) and the rs_ id from reasoning in every location", () => {
+    const out = stripReasoningIdentityFromSerializedRunState(fullBlob());
+    const parsed = JSON.parse(out);
+    // No encrypted blob survives anywhere…
+    for (const enc of ["enc-orig", "enc-resp-camel", "enc-last", "enc-gen"]) {
+      expect(out).not.toContain(enc);
+    }
+    // …no foreign rs_ id survives anywhere…
+    for (const id of ["rs_orig", "rs_resp", "rs_last", "rs_gen"]) {
+      expect(out).not.toContain(id);
+    }
+    // …a non-blob providerData sibling on a reasoning item is preserved…
+    expect(parsed.originalInput[0].providerData.keep).toBe("yes");
+    // …and all message / tool content survives.
+    expect(out).toContain("the question");
+    expect(out).toContain("the answer");
+    expect(out).toContain("call_1");
+  });
+
+  test("returns the SAME string reference when there is no reasoning to strip (no-op)", () => {
+    const blob = JSON.stringify({
+      $schemaVersion: "1.12",
+      originalInput: [{ type: "message", role: "user", content: "hi" }],
+      modelResponses: [],
+      generatedItems: [{ type: "message_output_item", rawItem: { type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] } }],
+    });
+    expect(stripReasoningIdentityFromSerializedRunState(blob)).toBe(blob);
+  });
+
+  test("leaves compaction items untouched (their encrypted_content is a required field)", () => {
+    const blob = JSON.stringify({
+      $schemaVersion: "1.12",
+      originalInput: [{ type: "compaction", encrypted_content: "comp-blob", summary: "kept" }],
+      modelResponses: [],
+      generatedItems: [],
+    });
+    // No reasoning anywhere → byte-identical (same reference); compaction intact.
+    expect(stripReasoningIdentityFromSerializedRunState(blob)).toBe(blob);
+  });
+
+  test("forwards a non-JSON string unchanged (same reference)", () => {
+    const sentinel = "not-json-cleared-state-sentinel";
+    expect(stripReasoningIdentityFromSerializedRunState(sentinel)).toBe(sentinel);
   });
 });

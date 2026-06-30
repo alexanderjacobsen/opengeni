@@ -1,5 +1,9 @@
 import { environmentsEncryptionKeyBytes, parseModelProvidersJson, type RegistryProvider, type Settings } from "@opengeni/config";
 import {
+  CODEX_APPS_MCP_SERVER_ID,
+  CODEX_APPS_MCP_SERVER_NAME,
+  CODEX_APPS_MCP_URL,
+  CODEX_APPS_STARTUP_TIMEOUT_MS,
   CODEX_FALLBACK_MODEL_SLUGS,
   CODEX_MODEL_ID_PREFIX,
   CODEX_PROVIDER_BASE_URL,
@@ -33,7 +37,50 @@ export async function settingsWithCodexCredential(db: Database, workspaceId: str
   if (!status || status.status !== "active") {
     return settings; // not connected / needs_relogin / error -> leave settings unchanged
   }
-  return withCodexProvider(settings);
+  const withProvider = withCodexProvider(settings);
+  // Additive: append the synthetic codex_apps connectors MCP server for ANY
+  // active credential. Connector access is gated SERVER-SIDE per ChatGPT account
+  // (via chatgpt-account-id), NOT by token scopes — confirmed live: a `pro` token
+  // whose only scopes are openid/profile/email/offline_access still lists all 217
+  // connector tools at .../ps/mcp. So we inject unconditionally and let
+  // runtime-discovery decide: an account with no connectors yields an empty
+  // tools/list, and a connect failure best-effort-drops the server without
+  // failing the turn. The bearer is injected dynamically at connect time
+  // (runtime/codexAppsMcpRequestInit).
+  return withCodexAppsMcpServer(withProvider);
+}
+
+/**
+ * Pure: append the synthetic codex_apps MCP server, idempotently. Connector
+ * access is gated SERVER-SIDE per ChatGPT account (chatgpt-account-id), not by
+ * token scopes, so we inject for any active credential and let runtime-discovery
+ * resolve the actual tool set (empty list / dropped server when unavailable).
+ * No secrets here — the refreshing bearer is injected at connect time from
+ * codexRequestStorage (runtime/codexAppsMcpRequestInit). The connectors backend
+ * tolerates serial and parallel tool invocation, so no per-server serialization
+ * is enforced (the SDK exposes no per-server parallel-tool-calls flag in
+ * @openai/agents 0.11.6).
+ */
+export function withCodexAppsMcpServer(settings: Settings): Settings {
+  if (settings.mcpServers.some((server) => server.id === CODEX_APPS_MCP_SERVER_ID)) {
+    return settings; // already injected
+  }
+  return {
+    ...settings,
+    mcpServers: [
+      ...settings.mcpServers,
+      {
+        id: CODEX_APPS_MCP_SERVER_ID,
+        name: CODEX_APPS_MCP_SERVER_NAME,
+        url: CODEX_APPS_MCP_URL,
+        timeoutMs: CODEX_APPS_STARTUP_TIMEOUT_MS,
+        // Connector availability is per-credential and must re-discover each
+        // run; never poison a process-global tools-list cache.
+        cacheToolsList: false,
+        // deliberately NO `headers` — the refreshing bearer is dynamic
+      },
+    ],
+  };
 }
 
 /** Pure: append the synthetic codex-subscription provider, idempotently. */

@@ -75,7 +75,7 @@ import {
 } from "@openai/agents/sandbox";
 import { ModalCloudBucketMountStrategy } from "@openai/agents-extensions/sandbox/modal";
 import OpenAI from "openai";
-import { codexSubscriptionFetch } from "@opengeni/codex";
+import { CODEX_APPS_MCP_SERVER_ID, CODEX_MODEL_ID_PREFIX, CODEX_ORIGINATOR, codexRequestStorage, codexSubscriptionFetch } from "@opengeni/codex";
 import { cpSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join, posix as posixPath, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -416,12 +416,45 @@ export class MultiProviderModelProvider implements ModelProvider {
       if (resolved) {
         return resolved.model;
       }
+      // A `codex/<slug>` id only resolves when the per-workspace worker overlay
+      // (settingsWithCodexCredential) has injected the synthetic codex-subscription
+      // provider — which it does ONLY for a workspace with an *active* connected
+      // Codex subscription. If it did not resolve, the subscription is not
+      // connected for this workspace, so the codex provider is absent. Falling
+      // through to the built-in OpenAIProvider below would ship `codex/<slug>` to
+      // the global default (Azure) client as a deployment name and surface a
+      // misleading "DeploymentNotFound" 404. Throw a clear, user-actionable error
+      // instead; it propagates through the worker's agentRunFailurePayload as the
+      // turn.failed message the session UI shows. Mirrors the codex-prefix
+      // awareness of assertConfiguredModel at apps/api/src/domain/sessions.ts.
+      if (modelName.startsWith(CODEX_MODEL_ID_PREFIX)) {
+        throw new CodexSubscriptionUnavailableError(modelName);
+      }
     }
-    // A model in no provider's allow-list falls back to the SDK's default
-    // OpenAIProvider, which uses the global default client/key configureOpenAI
-    // set up (the built-in OpenAI/Azure provider).
+    // A non-codex model in no provider's allow-list falls back to the SDK's
+    // default OpenAIProvider, which uses the global default client/key
+    // configureOpenAI set up (the built-in OpenAI/Azure provider).
     this.fallback ??= new OpenAIProvider();
     return this.fallback.getModel(modelName);
+  }
+}
+
+/**
+ * A `codex/<slug>` turn reached the model router but the workspace has no active
+ * Codex subscription connected (the worker overlay never injected the synthetic
+ * provider, so resolveTurnModel returned nothing). Thrown instead of silently
+ * routing the id to the built-in Azure/OpenAI client — that produced an opaque
+ * "DeploymentNotFound" 404. The message is user-actionable (connect/reconnect)
+ * and carries no status/code, so agentRunFailurePayload surfaces it verbatim as
+ * a non-retryable turn.failed the session UI shows.
+ */
+export class CodexSubscriptionUnavailableError extends Error {
+  constructor(modelName: string) {
+    super(
+      `Codex subscription model "${modelName}" is unavailable: no active Codex subscription is connected for this workspace. `
+      + `Connect (or reconnect) your ChatGPT/Codex subscription in Settings, then retry.`,
+    );
+    this.name = "CodexSubscriptionUnavailableError";
   }
 }
 
@@ -854,7 +887,7 @@ export async function prepareAgentTools(settings: Settings, tools: ToolRef[], op
       throw new Error(`Unknown MCP server id: ${tool.id}`);
     }
     const url = firstPartyMcpServerUrlForRun(settings, config, options.workspaceId) ?? config.url;
-    return new PrefixedMcpServer(new MCPServerStreamableHttp({
+    const server = new PrefixedMcpServer(new MCPServerStreamableHttp({
       url,
       name: config.name ?? config.id,
       cacheToolsList: config.cacheToolsList,
@@ -864,20 +897,42 @@ export async function prepareAgentTools(settings: Settings, tools: ToolRef[], op
         clientSessionTimeoutSeconds: Math.ceil(config.timeoutMs / 1000),
       } : {}),
     }), config.id, config.allowedTools);
+    // codex_apps connector availability is RUNTIME-DISCOVERED: the device-code
+    // login may lack the connector scopes, and the backend can reject the bearer
+    // at the initialize/tools-list handshake. Connect it best-effort so a 401/403
+    // (or a missing/failed token) drops the server rather than failing the turn.
+    return { server, bestEffort: isCodexAppsMcpServer(config) };
   }));
-  const connected = await connectMcpServers(servers, {
+  const requiredServers = servers.filter((entry) => !entry.bestEffort).map((entry) => entry.server);
+  const bestEffortServers = servers.filter((entry) => entry.bestEffort).map((entry) => entry.server);
+  const connectedRequired = await connectMcpServers(requiredServers, {
     connectInParallel: true,
     strict: true,
   });
+  const connectedBestEffort = bestEffortServers.length
+    ? await connectMcpServers(bestEffortServers, {
+        connectInParallel: true,
+        strict: false,
+      })
+    : null;
   return {
-    mcpServers: connected.active,
+    mcpServers: [...connectedRequired.active, ...(connectedBestEffort?.active ?? [])],
     close: async () => {
-      await connected.close();
+      await connectedRequired.close();
+      if (connectedBestEffort) {
+        await connectedBestEffort.close();
+      }
     },
   };
 }
 
 async function mcpServerRequestInit(settings: Settings, config: Settings["mcpServers"][number], options: PrepareToolsOptions): Promise<{ requestInit: { headers: Record<string, string> } } | {}> {
+  // codex_apps is checked FIRST so the static-headers path can never apply to
+  // it: its refreshing ChatGPT/Codex bearer is resolved per-connect from the
+  // codex ALS, never from a baked `config.headers` value.
+  if (isCodexAppsMcpServer(config)) {
+    return await codexAppsMcpRequestInit(settings);
+  }
   if (isFirstPartyMcpServer(settings, config)) {
     return await firstPartyMcpRequestInit(settings, config, options);
   }
@@ -919,6 +974,44 @@ async function firstPartyMcpRequestInit(settings: Settings, config: Settings["mc
   };
 }
 
+/**
+ * Builds the connect-time auth headers for the codex_apps connectors MCP. The
+ * bearer is resolved from codexRequestStorage — the SAME refreshing token source
+ * the model fetch uses (proactive refresh + single-flight + db persist) — so the
+ * token is valid at connect. A missing store (non-codex turn, or prepareTools
+ * ran outside the ALS) or a token failure (needs_relogin) returns {} so the
+ * best-effort connect drops the server rather than crashing the turn.
+ */
+async function codexAppsMcpRequestInit(settings: Settings): Promise<{ requestInit: { headers: Record<string, string> } } | {}> {
+  const ctx = codexRequestStorage.getStore();
+  if (!ctx) {
+    return {};
+  }
+  let token;
+  try {
+    token = await ctx.getToken();
+  } catch {
+    return {};
+  }
+  const headers: Record<string, string> = {
+    authorization: `Bearer ${token.accessToken}`,
+    // The ChatGPT backend sits behind Cloudflare, which 403s requests bearing a
+    // default runtime User-Agent (confirmed live: an HTML bot-block page, NOT an
+    // auth failure). Send the codex client identity — the same originator/version/
+    // User-Agent the model fetch uses — so the MCP connect handshake passes the edge.
+    originator: CODEX_ORIGINATOR,
+    "user-agent": `${CODEX_ORIGINATOR}/${ctx.clientVersion}`,
+    version: ctx.clientVersion,
+  };
+  if (token.chatgptAccountId) {
+    headers["chatgpt-account-id"] = token.chatgptAccountId;
+  }
+  if (settings.codexProductSku) {
+    headers["X-OpenAI-Product-Sku"] = settings.codexProductSku;
+  }
+  return { requestInit: { headers } };
+}
+
 // The first-party MCP permission set signed into a worker's delegated token
 // when the session does not specify its own. POWERFUL BY DEFAULT: it carries
 // every permission that unlocks a first-party tool — session orchestration
@@ -943,6 +1036,14 @@ const firstPartyMcpPermissions: Permission[] = [
   "environments:manage",
   "github:use",
 ];
+
+// codex_apps is third-party-by-trust (the external ChatGPT connectors backend)
+// but needs DYNAMIC auth, so it is its own category — deliberately NOT folded
+// into the first-party allowlist, which would wrongly sign an OpenGeni delegated
+// token to chatgpt.com.
+function isCodexAppsMcpServer(config: Settings["mcpServers"][number]): boolean {
+  return config.id === CODEX_APPS_MCP_SERVER_ID;
+}
 
 function isFirstPartyMcpServer(settings: Settings, config: Settings["mcpServers"][number]): boolean {
   if (!["opengeni", "files", "docs"].includes(config.id)) {

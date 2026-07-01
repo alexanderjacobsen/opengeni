@@ -9,7 +9,7 @@ import {
   requireFile,
   type Database,
 } from "@opengeni/db";
-import { stripReasoningEncryptedContent, stripReasoningIdentityFromSerializedRunState, type OpenGeniRuntime } from "@opengeni/runtime";
+import { stripReasoningEncryptedContent, stripReasoningIdentityFromSerializedRunState, neutralizeToolSearchItemsInSerializedRunState, type OpenGeniRuntime } from "@opengeni/runtime";
 
 /**
  * The codex account THIS turn runs on, threaded into every history read path so a
@@ -66,6 +66,18 @@ export function applyCodexHistoryStrip(
       // Foreign reasoning: drop the WHOLE item (id + blob) — see rule above.
       continue;
     }
+    if (type === "tool_search_call" || type === "tool_search_output") {
+      // Foreign tool_search items (progressive connector disclosure): drop WHOLE,
+      // like reasoning. The `tsc_…` id is minted by the producing account's
+      // backend, and the output's disclosure set reflects THAT account's
+      // connectors — replaying either into a different account risks a 400 /
+      // wrong-connector disclosure. Dropping both sides keeps the pair invariant
+      // (the history sanitizer would drop a stranded half anyway); the model
+      // simply re-searches on the new account, re-disclosing from the NEW
+      // account's own connector pool. Never any content loss — search items
+      // carry tool metadata, not conversation content.
+      continue;
+    }
     if (type === "compaction") {
       out.push(stripReasoningEncryptedContent(row.item));
       continue;
@@ -94,7 +106,13 @@ export function resumeRunStateForCodexAccount(
   if (state.frozenCodexCredentialId === current.currentCodexCredentialId) {
     return state.serializedRunState;
   }
-  return stripReasoningIdentityFromSerializedRunState(state.serializedRunState);
+  // Cross-account: neutralize reasoning identity in place AND flip frozen
+  // tool_search pairs to execution:"server" in place (count-preserving — HOLE E
+  // forbids removing blob items). The server flip makes the SDK skip its
+  // client-executor rehydration (which would THROW when the resuming account's
+  // connector pool differs from the freezing account's); the flipped shape is
+  // live-verified wire-safe. The model can still re-search on this account.
+  return neutralizeToolSearchItemsInSerializedRunState(stripReasoningIdentityFromSerializedRunState(state.serializedRunState));
 }
 
 /**

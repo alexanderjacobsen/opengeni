@@ -41,6 +41,13 @@ const RESULT_TYPE_BY_CALL_TYPE: Record<string, string> = {
   computer_call: "computer_call_result",
   shell_call: "shell_call_output",
   apply_patch_call: "apply_patch_call_output",
+  // Progressive connector disclosure (codex tool_search): a replayed
+  // `tool_search_call` must be settled by its `tool_search_output` exactly like a
+  // function call — an unpaired one 400s the store:false replay. The SDK pairs
+  // these OUTSIDE its own TOOL_CALL_RESULT_TYPE_BY_CALL_TYPE (sessionPersistence's
+  // hasToolSearchCallId), so we mirror the semantics here; the correlation id can
+  // additionally ride providerData (see callIdOf).
+  tool_search_call: "tool_search_output",
 };
 
 const RESULT_TYPES = new Set(Object.values(RESULT_TYPE_BY_CALL_TYPE));
@@ -63,12 +70,25 @@ function callIdOf(item: unknown): string | undefined {
   if (!item || typeof item !== "object") {
     return undefined;
   }
-  const record = item as { callId?: unknown; call_id?: unknown };
-  if (typeof record.callId === "string") {
+  const record = item as { callId?: unknown; call_id?: unknown; providerData?: unknown };
+  if (typeof record.callId === "string" && record.callId.length > 0) {
     return record.callId;
   }
-  if (typeof record.call_id === "string") {
+  if (typeof record.call_id === "string" && record.call_id.length > 0) {
     return record.call_id;
+  }
+  // tool_search items may carry their correlation id ONLY in providerData
+  // (mirrors the SDK's getToolSearchProviderCallId: providerData.call_id ??
+  // providerData.callId ?? call_id ?? callId). Harmless for other item kinds —
+  // their ids never live there.
+  const provider = record.providerData as { call_id?: unknown; callId?: unknown } | null | undefined;
+  if (provider && typeof provider === "object") {
+    if (typeof provider.call_id === "string" && provider.call_id.length > 0) {
+      return provider.call_id;
+    }
+    if (typeof provider.callId === "string" && provider.callId.length > 0) {
+      return provider.callId;
+    }
   }
   return undefined;
 }
@@ -362,6 +382,89 @@ export function stripReasoningIdentityFromSerializedRunState(serialized: string)
     }
   }
   scrubResponseOutput(root.lastModelResponse);
+  if (!changed) {
+    return serialized;
+  }
+  return JSON.stringify(parsed);
+}
+
+/**
+ * Neutralize tool_search items IN PLACE in a serialized RunState blob for a
+ * cross-account codex resume — the run-state sibling of
+ * `applyCodexHistoryStrip`'s tool_search rule, but COUNT-PRESERVING (HOLE E: the
+ * blob path's reconcile watermark counts the blob's history length, so items
+ * must never be removed — only mutated, exactly like the reasoning
+ * neutralization above).
+ *
+ * The hazard: on deserialize, the SDK re-runs the registered CLIENT tool_search
+ * execute callback per frozen pair (`rehydrateToolSearchRuntimeTools`) and
+ * THROWS a UserError when the re-run's runtime-tool keys mismatch the serialized
+ * expectation — which is exactly what happens when the RESUMING account's
+ * connector pool differs from the FREEZING account's. The SDK skips that
+ * rehydration entirely for `execution === 'server'` calls, so flipping the
+ * frozen pairs' `execution` to `"server"` in place defuses the throw without
+ * touching counts, ids, pairing, or content. The flipped shape is wire-safe:
+ * LIVE-VERIFIED against /codex/responses — a replayed server-execution pair is
+ * accepted (200) and its disclosure still holds. The account-bound `tsc_…` id is
+ * separately stripped by the codex transport normalizer (all input item ids).
+ *
+ * Walks the same blob locations as {@link stripReasoningIdentityFromSerializedRunState}:
+ * `originalInput` (array form), `generatedItems` (SDK run-item wrappers — the
+ * raw shape under `rawItem`), every `modelResponses[].output`, and
+ * `lastModelResponse.output`. Returns the input string unchanged when nothing
+ * matched.
+ */
+export function neutralizeToolSearchItemsInSerializedRunState(serialized: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(serialized);
+  } catch {
+    return serialized;
+  }
+  if (!parsed || typeof parsed !== "object") {
+    return serialized;
+  }
+  let changed = false;
+  const neutralize = (candidate: unknown): void => {
+    if (!candidate || typeof candidate !== "object") {
+      return;
+    }
+    const record = candidate as Record<string, unknown>;
+    if (record.type !== "tool_search_call" && record.type !== "tool_search_output") {
+      return;
+    }
+    if (record.execution !== "server") {
+      record.execution = "server";
+      changed = true;
+    }
+  };
+  const neutralizeArray = (arr: unknown): void => {
+    if (Array.isArray(arr)) {
+      for (const item of arr) {
+        neutralize(item);
+      }
+    }
+  };
+  const root = parsed as Record<string, unknown>;
+  neutralizeArray(root.originalInput);
+  if (Array.isArray(root.generatedItems)) {
+    for (const wrapper of root.generatedItems) {
+      if (wrapper && typeof wrapper === "object" && "rawItem" in (wrapper as Record<string, unknown>)) {
+        neutralize((wrapper as Record<string, unknown>).rawItem);
+      }
+    }
+  }
+  const neutralizeResponseOutput = (response: unknown): void => {
+    if (response && typeof response === "object") {
+      neutralizeArray((response as Record<string, unknown>).output);
+    }
+  };
+  if (Array.isArray(root.modelResponses)) {
+    for (const response of root.modelResponses) {
+      neutralizeResponseOutput(response);
+    }
+  }
+  neutralizeResponseOutput(root.lastModelResponse);
   if (!changed) {
     return serialized;
   }

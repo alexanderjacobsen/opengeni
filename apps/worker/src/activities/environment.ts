@@ -23,39 +23,54 @@ export async function sandboxEnvironmentForRun(
   resources: ResourceRef[],
   workspaceEnvironment: Record<string, string> = {},
   options: { skipGitHubToken?: boolean } = {},
-): Promise<Record<string, string>> {
+): Promise<{ environment: Record<string, string>; gitToken?: string }> {
   // Precedence: deployment allowlist < git identity < workspace environment
   // < backend-aware HOME (the STABLE base, shared with the API-direct attach
   // paths via stableSandboxEnvironmentForRun) < platform run-scoped GitHub auth
   // (applied below, always last). Reserved name validation at write time prevents
   // workspace values from colliding with the platform-managed entries.
+  //
+  // TOKEN-BROKER (B1): the run-scoped GitHub App installation token is NO LONGER
+  // layered into the box/agent MANIFEST env (no GH_TOKEN/GITHUB_TOKEN/GIT_CONFIG_*
+  // extraheader). It is minted ONCE per turn and returned as `gitToken`; the caller
+  // threads it OFF-MANIFEST as a clone-seed exec env (OPENGENI_GIT_TOKEN_SEED) so the
+  // clone hook writes it to a stable FILE ($OPENGENI_GIT_TOKEN_FILE), and git auth
+  // flows through GIT_ASKPASS -> that file. The manifest carries only the stable
+  // pointers (GIT_ASKPASS, GIT_TERMINAL_PROMPT, identity, and — via the shared base —
+  // OPENGENI_GIT_TOKEN_FILE), so the token VALUE never rides the manifest and the
+  // SDK's per-turn provided-session env delta stays empty even though the token
+  // rotates. The agent can refresh the token mid-turn via the `github_token` MCP tool.
   const environment = stableSandboxEnvironmentForRun(settings, workspaceEnvironment);
   const selection = githubRepositorySelection(resources);
   // NO-TOKEN SKIP (Stage D, change B): when the turn's EFFECTIVE compute backend is
   // a connected machine (selfhosted), the platform GitHub App installation token is
   // INERT — exec routes over NATS to the user's machine, which uses ITS OWN git
   // credentials, and the box that the token would auth is never created. So skip the
-  // (network) token mint entirely and return the STABLE base env. Env-parity holds:
-  // the SAME base object still feeds buildManifest + the SelfhostedSession manifest,
-  // so the SDK's per-turn provided-session env delta stays empty
+  // (network) token mint entirely and return the STABLE base env (no gitToken). Env-
+  // parity holds: the SAME base object still feeds buildManifest + the SelfhostedSession
+  // manifest, so the SDK's per-turn provided-session env delta stays empty
   // (validateNoEnvironmentDelta). The API-direct viewer attach path already drops the
   // token under this exact contract — proof a box runs fine without it.
   if (!selection || options.skipGitHubToken) {
-    return environment;
+    return { environment };
   }
-  // Run-scoped sandbox preparation for GitHub App repository resources.
+  // Run-scoped sandbox preparation for GitHub App repository resources. A SINGLE mint
+  // per turn: the value is returned as `gitToken` (seeded to the box's token file by
+  // the caller's clone hook) — NOT layered into the manifest env.
   const token = await createGitHubAppInstallationToken(settings, {
     installationId: selection.installationId,
     repositoryIds: selection.repositoryIds,
   });
   const identity = githubAppBotIdentity(settings);
-  const authHeader = Buffer.from(`x-access-token:${token}`, "utf8").toString("base64");
-  environment.GH_TOKEN = token;
-  environment.GITHUB_TOKEN = token;
-  environment.GIT_ASKPASS = "/usr/local/bin/opengeni-git-askpass";
-  environment.GIT_CONFIG_COUNT = "1";
-  environment.GIT_CONFIG_KEY_0 = "http.https://github.com/.extraheader";
-  environment.GIT_CONFIG_VALUE_0 = `AUTHORIZATION: basic ${authHeader}`;
+  // TOKEN-BROKER (B2): the askpass helper is PROVISIONED AT SETUP (runtime) into a
+  // per-box, user-writable path in the SAME dir as the token file, instead of a
+  // baked image script at /usr/local/bin/opengeni-git-askpass. The clone-hook seed
+  // block writes both the token file AND this askpass script before the fetch, so
+  // git auth becomes correct on ANY box image (including pre-existing warm boxes on
+  // their next turn's clone hook) — no product image needs to carry the askpass.
+  // HOME is already resolved in the STABLE base above; keep the /workspace fallback
+  // in lockstep with stableSandboxEnvironmentForRun's OPENGENI_GIT_TOKEN_FILE.
+  environment.GIT_ASKPASS = `${environment.HOME ?? "/workspace"}/.opengeni/askpass`;
   environment.GIT_TERMINAL_PROMPT = "0";
   if (identity) {
     environment.GIT_AUTHOR_NAME = environment.GIT_AUTHOR_NAME || identity.name;
@@ -63,7 +78,7 @@ export async function sandboxEnvironmentForRun(
     environment.GIT_COMMITTER_NAME = environment.GIT_COMMITTER_NAME || identity.name;
     environment.GIT_COMMITTER_EMAIL = environment.GIT_COMMITTER_EMAIL || identity.email;
   }
-  return environment;
+  return { environment, gitToken: token };
 }
 
 function githubRepositorySelection(resources: ResourceRef[]): { installationId: number; repositoryIds: number[] } | null {

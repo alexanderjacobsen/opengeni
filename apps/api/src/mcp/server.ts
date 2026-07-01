@@ -35,6 +35,7 @@ import {
 } from "@opengeni/db";
 import { appendAndPublishEvents } from "@opengeni/events";
 import {
+  createGitHubAppInstallationToken,
   createSignedState,
   GitHubAppConfigurationError,
   githubAppMissingSettings,
@@ -134,6 +135,12 @@ export function buildOpenGeniMcpServer(deps: ApiRouteDeps, grant: AccessGrant, o
   registerEnvironmentTools(server, deps, grant, can, json);
   if (can("github:use")) {
     registerGitHubConnectTool(server, deps, grant, options, json);
+    // TOKEN-BROKER (B1): the agent-refreshable git token. Session-scoped (keys off the
+    // worker-signed sessionId claim so it mints for THIS session's repos), gated on
+    // the same github:use capability as github_connect_link.
+    if (sessionId !== null) {
+      registerGitHubTokenTool(server, deps, grant, sessionId, json);
+    }
   }
 
   server.registerTool("files_get_download_url", {
@@ -646,17 +653,23 @@ function registerWorkspaceOrchestrationTools(
         // First-party MCP token permissions for the spawned session; every
         // permission must be held by this grant (validated in the domain).
         firstPartyMcpPermissions: z4.array(z4.string()).optional(),
-        // Shared-sandbox placement (addendum 05 §D). OMIT to share THIS box by
-        // default (a session-spawned session shares its creator's box); pass
-        // "new" for a fresh private box, or {groupId} (a sibling session's
-        // `sandboxGroupId` from a prior session_create response) to fan two
-        // workers into one box. A shared box means one filesystem/repo/desktop,
-        // N independent conversations. The group is workspace-scoped.
+        // Shared-sandbox placement (addendum 05 §D). OMIT (default) to SHARE the
+        // creator's box — one filesystem/repo/desktop, N independent conversations;
+        // this is the SAFE DEFAULT and env vars are per-exec, NOT a reason to split.
+        // Pass "new" for a fresh isolated box (a different repo set or a genuinely
+        // separate filesystem), or {groupId} (a sibling session's `sandboxGroupId`
+        // from a prior session_create response) to join that specific sibling's box.
+        // A shared box requires the SAME image; a conflicting image is rejected (B3).
+        // The description below is what the AGENT sees (this comment is invisible to
+        // it); keep the two in sync. Grouping stays env-blind (correct) — the only
+        // shared-state hard-fail is the image conflict at the lease layer.
         sandbox: z4.union([
           z4.literal("shared"),
           z4.literal("new"),
           z4.object({ groupId: z4.string().uuid() }),
-        ]).optional(),
+        ]).describe(
+          "Sandbox placement. OMIT (default) to SHARE the creator's box — one filesystem/repo/desktop, N independent conversations; this is the safe default and env vars are per-exec, not a reason to split. Pass 'new' for a fresh isolated box (different repo set or a genuinely separate filesystem). Pass {groupId} to join a specific sibling's box. A shared box requires the same image; a conflicting image is rejected.",
+        ).optional(),
         // The parent (manager) session is auto-inferred from the caller's
         // worker-signed sessionId claim, so a spawned worker's completion wakes
         // its manager automatically. There is deliberately no caller-supplied
@@ -837,6 +850,55 @@ function registerGitHubConnectTool(
       installUrl: `${base}/v1/workspaces/${grant.workspaceId}/github/connect?state=${encodeURIComponent(state)}`,
       expiresInSeconds: stateMaxAgeSeconds,
       missing: [],
+    });
+  });
+}
+
+// TOKEN-BROKER (B1): mint a FRESH short-lived GitHub App installation token for the
+// session's repository resources. The agent calls this to refresh git auth before
+// the current token expires. The MCP server CANNOT write the box, so the tool RETURNS
+// the token as JSON; the agent writes it to the token file (via exec) to refresh
+// GIT_ASKPASS. Same github:use capability gate as github_connect_link.
+function registerGitHubTokenTool(
+  server: McpServer,
+  deps: ApiRouteDeps,
+  grant: AccessGrant,
+  sessionId: string,
+  json: JsonResult,
+): void {
+  server.registerTool("github_token", {
+    description: "Mint a fresh short-lived GitHub token for this session's repositories. Write it to $OPENGENI_GIT_TOKEN_FILE (default $HOME/.opengeni/git-token) to refresh git auth before the current token expires.",
+    inputSchema: {},
+  }, async () => {
+    const session = await requireSession(deps.db, grant.workspaceId, sessionId);
+    // Resolve the run-scoped installation + repository ids from THIS session's
+    // repository resources (same shape sandboxEnvironmentForRun mints against). Only
+    // private GitHub-App repos carry the installation/repository ids.
+    const selected = (session.resources ?? []).flatMap((resource) => {
+      if (resource.kind !== "repository") {
+        return [];
+      }
+      const installationId = resource.githubInstallationId;
+      const repositoryId = resource.githubRepositoryId;
+      return typeof installationId === "number" && installationId > 0
+        && typeof repositoryId === "number" && repositoryId > 0
+        ? [{ installationId, repositoryId }]
+        : [];
+    });
+    if (selected.length === 0) {
+      throw new Error("this session has no GitHub App repository resources to mint a token for");
+    }
+    const installationId = selected[0]!.installationId;
+    if (selected.some((item) => item.installationId !== installationId)) {
+      throw new Error("GitHub App repository resources must belong to one installation");
+    }
+    const token = await createGitHubAppInstallationToken(deps.settings, {
+      installationId,
+      repositoryIds: selected.map((item) => item.repositoryId),
+    });
+    return json({
+      token,
+      tokenFile: "$OPENGENI_GIT_TOKEN_FILE (default $HOME/.opengeni/git-token)",
     });
   });
 }

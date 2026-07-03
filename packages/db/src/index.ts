@@ -9,6 +9,10 @@ import type {
   CapabilityKind,
   CapabilityPack,
   CapabilitySource,
+  ConnectionKind,
+  ConnectionMetadata,
+  ConnectionStatus,
+  McpServerConnectionRef,
   FileAsset,
   FileStatus,
   FileUploadStatus,
@@ -58,7 +62,7 @@ import { isCodexBilledModel } from "@opengeni/codex";
 // Re-exported so consumers get the whole codex-billed detection surface (the pure
 // prefix test + the credential-aware predicates below) from a single import.
 export { isCodexBilledModel } from "@opengeni/codex";
-import { and, asc, desc, eq, gt, gte, inArray, lt, ne, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, ne, or, sql, type SQL } from "drizzle-orm";
 import type { PgDatabase } from "drizzle-orm/pg-core";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
@@ -347,6 +351,8 @@ export const allWorkspacePermissions: Permission[] = [
   "github:manage",
   "github:use",
   "api_keys:manage",
+  "connections:read",
+  "connections:write",
   "environments:manage",
   "environments:use",
   "mcp_servers:attach",
@@ -1159,6 +1165,52 @@ export type CreateSocialPostInput = {
   raw?: Record<string, unknown>;
 };
 
+export type CreateConnectionInput = {
+  accountId: string;
+  workspaceId: string;
+  subjectId?: string | null;
+  providerDomain: string;
+  kind: ConnectionKind;
+  status?: ConnectionStatus;
+  credentialEncrypted: string;
+  grantedScopes?: string[];
+  expiresAt?: Date | null;
+  metadata?: Record<string, unknown>;
+  createdBySubjectId?: string | null;
+  updatedBySubjectId?: string | null;
+};
+
+export type UpdateConnectionInput = {
+  workspaceId: string;
+  connectionId: string;
+  visibleToSubjectId?: string | null;
+  subjectId?: string | null;
+  providerDomain?: string;
+  kind?: ConnectionKind;
+  status?: ConnectionStatus;
+  credentialEncrypted?: string;
+  grantedScopes?: string[];
+  expiresAt?: Date | null;
+  metadata?: Record<string, unknown>;
+  updatedBySubjectId?: string | null;
+};
+
+export type ConnectionCredentialForBroker = {
+  id: string;
+  accountId: string;
+  workspaceId: string;
+  subjectId: string | null;
+  providerDomain: string;
+  kind: ConnectionKind;
+  status: ConnectionStatus;
+  credential: Record<string, unknown>;
+  grantedScopes: string[];
+  expiresAt: Date | null;
+  lastRefreshAt: Date | null;
+  version: number;
+  metadata: Record<string, unknown>;
+};
+
 export type CreateCapabilityCatalogItemInput = {
   accountId: string;
   workspaceId: string;
@@ -1200,6 +1252,7 @@ export type EnabledMcpCapabilityServer = {
    * capability API surface.
    */
   headersEncrypted?: Record<string, string>;
+  connectionRef?: McpServerConnectionRef;
 };
 
 export type CreateSessionMcpServerInput = {
@@ -1640,9 +1693,11 @@ export async function listEnabledMcpCapabilityServers(db: Database, workspaceId:
       return [];
     }
     const headersEncrypted = encryptedHeadersConfig(installation.config.headersEncrypted);
-    if (item.authModel && !headersEncrypted) {
-      // Credential-gated MCPs are runnable only when credential headers were
-      // stored at enable time.
+    const connectionRef = connectionRefConfig(installation.config.connectionRef);
+    if (item.authModel && !headersEncrypted && !connectionRef) {
+      // Credential-gated MCPs are runnable only when either legacy static
+      // credential headers or the connections broker ref were stored at enable
+      // time.
       return [];
     }
     const metadata = item.metadata;
@@ -1659,6 +1714,7 @@ export async function listEnabledMcpCapabilityServers(db: Database, workspaceId:
       ...(timeoutMs ? { timeoutMs } : {}),
       ...(cacheToolsList !== undefined ? { cacheToolsList } : {}),
       ...(headersEncrypted ? { headersEncrypted } : {}),
+      ...(connectionRef ? { connectionRef } : {}),
     }];
   });
 }
@@ -1713,6 +1769,255 @@ export function mcpServerIdForCapability(capabilityId: string, metadata: Record<
     .replace(/^-+|-+$/g, "")
     .slice(0, 44) || "mcp";
   return `cap-${body}-${shortHash(capabilityId)}`;
+}
+
+const connectionMetadataColumns = {
+  id: schema.connections.id,
+  accountId: schema.connections.accountId,
+  workspaceId: schema.connections.workspaceId,
+  subjectId: schema.connections.subjectId,
+  providerDomain: schema.connections.providerDomain,
+  kind: schema.connections.kind,
+  status: schema.connections.status,
+  grantedScopes: schema.connections.grantedScopes,
+  expiresAt: schema.connections.expiresAt,
+  lastRefreshAt: schema.connections.lastRefreshAt,
+  lastUsedAt: schema.connections.lastUsedAt,
+  lastError: schema.connections.lastError,
+  version: schema.connections.version,
+  metadata: schema.connections.metadata,
+  createdBySubjectId: schema.connections.createdBySubjectId,
+  updatedBySubjectId: schema.connections.updatedBySubjectId,
+  createdAt: schema.connections.createdAt,
+  updatedAt: schema.connections.updatedAt,
+};
+
+function connectionSubjectVisibility(subjectId?: string | null): SQL {
+  return subjectId
+    ? or(isNull(schema.connections.subjectId), eq(schema.connections.subjectId, subjectId))!
+    : isNull(schema.connections.subjectId);
+}
+
+export async function createConnection(db: Database, input: CreateConnectionInput): Promise<ConnectionMetadata> {
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId }, async (scopedDb) => {
+    const [row] = await scopedDb.insert(schema.connections).values({
+      accountId: input.accountId,
+      workspaceId: input.workspaceId,
+      subjectId: input.subjectId ?? null,
+      providerDomain: input.providerDomain,
+      kind: input.kind,
+      status: input.status ?? "active",
+      credentialEncrypted: input.credentialEncrypted,
+      grantedScopes: input.grantedScopes ?? [],
+      expiresAt: input.expiresAt ?? null,
+      metadata: input.metadata ?? {},
+      createdBySubjectId: input.createdBySubjectId ?? null,
+      updatedBySubjectId: input.updatedBySubjectId ?? input.createdBySubjectId ?? null,
+    }).returning(connectionMetadataColumns);
+    if (!row) {
+      throw new Error("Failed to create connection");
+    }
+    return mapConnectionMetadata(row);
+  });
+}
+
+export async function listConnectionsMetadata(db: Database, workspaceId: string, subjectId?: string | null): Promise<ConnectionMetadata[]> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const rows = await scopedDb.select(connectionMetadataColumns).from(schema.connections)
+      .where(and(eq(schema.connections.workspaceId, workspaceId), connectionSubjectVisibility(subjectId)))
+      .orderBy(desc(schema.connections.createdAt));
+    return rows.map(mapConnectionMetadata);
+  });
+}
+
+export async function getConnectionMetadata(db: Database, workspaceId: string, connectionId: string, subjectId?: string | null): Promise<ConnectionMetadata | null> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [row] = await scopedDb.select(connectionMetadataColumns).from(schema.connections)
+      .where(and(
+        eq(schema.connections.workspaceId, workspaceId),
+        eq(schema.connections.id, connectionId),
+        connectionSubjectVisibility(subjectId),
+      ))
+      .limit(1);
+    return row ? mapConnectionMetadata(row) : null;
+  });
+}
+
+export async function updateConnection(db: Database, input: UpdateConnectionInput): Promise<ConnectionMetadata | null> {
+  return await withWorkspaceRls(db, input.workspaceId, async (scopedDb) => {
+    const set = {
+      updatedAt: new Date(),
+      ...(input.providerDomain !== undefined ? { providerDomain: input.providerDomain } : {}),
+      ...(input.subjectId !== undefined ? { subjectId: input.subjectId } : {}),
+      ...(input.kind !== undefined ? { kind: input.kind } : {}),
+      ...(input.status !== undefined ? { status: input.status } : {}),
+      ...(input.credentialEncrypted !== undefined
+        ? {
+          credentialEncrypted: input.credentialEncrypted,
+          version: sql`${schema.connections.version} + 1`,
+          lastError: null,
+        }
+        : {}),
+      ...(input.grantedScopes !== undefined ? { grantedScopes: input.grantedScopes } : {}),
+      ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
+      ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
+      ...(input.updatedBySubjectId !== undefined ? { updatedBySubjectId: input.updatedBySubjectId } : {}),
+    };
+    const [row] = await scopedDb.update(schema.connections).set(set)
+      .where(and(
+        eq(schema.connections.workspaceId, input.workspaceId),
+        eq(schema.connections.id, input.connectionId),
+        connectionSubjectVisibility(input.visibleToSubjectId),
+      ))
+      .returning(connectionMetadataColumns);
+    return row ? mapConnectionMetadata(row) : null;
+  });
+}
+
+export async function revokeConnection(db: Database, workspaceId: string, connectionId: string, updatedBySubjectId?: string | null): Promise<ConnectionMetadata | null> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [row] = await scopedDb.update(schema.connections).set({
+      status: "revoked",
+      // The version bump invalidates any in-flight refresh's (id, version) CAS,
+      // so a racing refresh cannot commit and flip the row back to active.
+      version: sql`${schema.connections.version} + 1`,
+      updatedBySubjectId: updatedBySubjectId ?? null,
+      updatedAt: new Date(),
+    })
+      .where(and(
+        eq(schema.connections.workspaceId, workspaceId),
+        eq(schema.connections.id, connectionId),
+        // Same visibility rule as get/update: shared rows plus the caller's own
+        // subject rows. Cross-subject revocation (admin janitorial) arrives with
+        // the subject-connections UX in I5, deliberately not before.
+        connectionSubjectVisibility(updatedBySubjectId),
+      ))
+      .returning(connectionMetadataColumns);
+    return row ? mapConnectionMetadata(row) : null;
+  });
+}
+
+export async function loadConnectionCredentialForBroker(db: Database, settings: Settings, input: {
+  workspaceId: string;
+  connectionId?: string;
+  providerDomain: string;
+  kind?: ConnectionKind;
+  subjectId?: string | null;
+  allowSubjectOwned?: boolean;
+}): Promise<ConnectionCredentialForBroker | null> {
+  const key = environmentsEncryptionKeyBytes(settings);
+  if (!key) {
+    throw new Error("connection credential present but OPENGENI_ENVIRONMENTS_ENCRYPTION_KEY is not configured");
+  }
+  const subjectPredicate = input.allowSubjectOwned
+    ? connectionSubjectVisibility(input.subjectId)
+    : isNull(schema.connections.subjectId);
+  const conditions: SQL[] = [
+    eq(schema.connections.workspaceId, input.workspaceId),
+    subjectPredicate,
+  ];
+  if (input.connectionId) {
+    conditions.push(eq(schema.connections.id, input.connectionId));
+  } else {
+    conditions.push(eq(schema.connections.providerDomain, input.providerDomain));
+    if (input.kind) {
+      conditions.push(eq(schema.connections.kind, input.kind));
+    }
+  }
+  return await withWorkspaceRls(db, input.workspaceId, async (scopedDb) => {
+    // Prefer active rows: a revoke bumps updatedAt, so recency alone would let a
+    // freshly revoked connection shadow an active replacement for the provider.
+    const [row] = await scopedDb.select().from(schema.connections)
+      .where(and(...conditions))
+      .orderBy(desc(sql`(${schema.connections.status} = 'active')`), desc(schema.connections.updatedAt))
+      .limit(1);
+    if (!row) {
+      return null;
+    }
+    let credential: unknown;
+    try {
+      credential = JSON.parse(decryptEnvironmentValue(key, row.credentialEncrypted));
+    } catch (error) {
+      throw new Error(`connection credential could not be decrypted for ${row.id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!credential || typeof credential !== "object" || Array.isArray(credential)) {
+      throw new Error(`connection credential bundle for ${row.id} is not a JSON object`);
+    }
+    return {
+      id: row.id,
+      accountId: row.accountId,
+      workspaceId: row.workspaceId,
+      subjectId: row.subjectId,
+      providerDomain: row.providerDomain,
+      kind: row.kind as ConnectionKind,
+      status: row.status as ConnectionStatus,
+      credential: credential as Record<string, unknown>,
+      grantedScopes: row.grantedScopes,
+      expiresAt: row.expiresAt,
+      lastRefreshAt: row.lastRefreshAt,
+      version: row.version,
+      metadata: row.metadata,
+    };
+  });
+}
+
+export async function recordConnectionTokenRefresh(db: Database, input: {
+  id: string;
+  version: number;
+  workspaceId: string;
+  credentialEncrypted: string;
+  expiresAt: Date | null;
+  grantedScopes?: string[];
+  lastRefreshAt: Date;
+}): Promise<boolean> {
+  return await withWorkspaceRls(db, input.workspaceId, async (scopedDb) => {
+    const set = {
+      credentialEncrypted: input.credentialEncrypted,
+      expiresAt: input.expiresAt,
+      lastRefreshAt: input.lastRefreshAt,
+      status: "active",
+      lastError: null,
+      version: sql`${schema.connections.version} + 1`,
+      updatedAt: new Date(),
+      ...(input.grantedScopes !== undefined ? { grantedScopes: input.grantedScopes } : {}),
+    };
+    const updated = await scopedDb.update(schema.connections).set(set)
+      .where(and(
+        eq(schema.connections.id, input.id),
+        eq(schema.connections.workspaceId, input.workspaceId),
+        eq(schema.connections.version, input.version),
+        // A refresh may only ever renew a live credential; revoked/errored rows
+        // stay dead even if a status change somewhere forgot to bump version.
+        eq(schema.connections.status, "active"),
+      ))
+      .returning({ id: schema.connections.id });
+    return updated.length > 0;
+  });
+}
+
+export async function setConnectionStatus(db: Database, workspaceId: string, status: ConnectionStatus, lastError: string | null, guard: { id: string; version: number }): Promise<boolean> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const updated = await scopedDb.update(schema.connections).set({
+      status,
+      lastError,
+      version: sql`${schema.connections.version} + 1`,
+      updatedAt: new Date(),
+    }).where(and(
+      eq(schema.connections.workspaceId, workspaceId),
+      eq(schema.connections.id, guard.id),
+      eq(schema.connections.version, guard.version),
+    )).returning({ id: schema.connections.id });
+    return updated.length > 0;
+  });
+}
+
+export async function recordConnectionUsed(db: Database, workspaceId: string, connectionId: string): Promise<void> {
+  await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    await scopedDb.update(schema.connections).set({
+      lastUsedAt: new Date(),
+      updatedAt: new Date(),
+    }).where(and(eq(schema.connections.workspaceId, workspaceId), eq(schema.connections.id, connectionId)));
+  });
 }
 
 export async function createSocialConnection(db: Database, input: CreateSocialConnectionInput): Promise<SocialConnection> {
@@ -8035,6 +8340,48 @@ function redactInstallationConfig(config: Record<string, unknown>): Record<strin
   return { ...rest, headerNames: Object.keys(headersEncrypted).sort() };
 }
 
+function mapConnectionMetadata(row: {
+  id: string;
+  accountId: string;
+  workspaceId: string;
+  subjectId: string | null;
+  providerDomain: string;
+  kind: string;
+  status: string;
+  grantedScopes: string[];
+  expiresAt: Date | null;
+  lastRefreshAt: Date | null;
+  lastUsedAt: Date | null;
+  lastError: string | null;
+  version: number;
+  metadata: Record<string, unknown>;
+  createdBySubjectId: string | null;
+  updatedBySubjectId: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}): ConnectionMetadata {
+  return {
+    id: row.id,
+    accountId: row.accountId,
+    workspaceId: row.workspaceId,
+    subjectId: row.subjectId,
+    providerDomain: row.providerDomain,
+    kind: row.kind as ConnectionKind,
+    status: row.status as ConnectionStatus,
+    grantedScopes: row.grantedScopes,
+    expiresAt: row.expiresAt?.toISOString() ?? null,
+    lastRefreshAt: row.lastRefreshAt?.toISOString() ?? null,
+    lastUsedAt: row.lastUsedAt?.toISOString() ?? null,
+    lastError: row.lastError,
+    version: row.version,
+    metadata: row.metadata,
+    createdBySubjectId: row.createdBySubjectId,
+    updatedBySubjectId: row.updatedBySubjectId,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
 function mapSocialConnection(row: typeof schema.socialConnections.$inferSelect): SocialConnection {
   return {
     id: row.id,
@@ -8153,7 +8500,37 @@ function encryptedHeadersConfig(value: unknown): Record<string, string> | undefi
 
 function mcpConnectivityOk(metadata: Record<string, unknown>): boolean {
   const value = metadata.mcpConnectivity;
-  return !!value && typeof value === "object" && "status" in value && value.status === "ok";
+  return !!value && typeof value === "object" && "status" in value && (value.status === "ok" || value.status === "auth_deferred");
+}
+
+function connectionRefConfig(value: unknown): McpServerConnectionRef | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.providerDomain !== "string" || record.providerDomain.length === 0) {
+    return undefined;
+  }
+  const ref: McpServerConnectionRef = { providerDomain: record.providerDomain };
+  if (typeof record.connectionId === "string" && record.connectionId.length > 0) {
+    ref.connectionId = record.connectionId;
+  }
+  if (typeof record.kind === "string" && ["oauth2", "api_key", "app_install", "delegated"].includes(record.kind)) {
+    ref.kind = record.kind as ConnectionKind;
+  }
+  if (Array.isArray(record.scopes)) {
+    const scopes = record.scopes.filter((scope): scope is string => typeof scope === "string" && scope.length > 0);
+    if (scopes.length > 0) {
+      ref.scopes = scopes;
+    }
+  }
+  if (typeof record.resource === "string" && record.resource.length > 0) {
+    ref.resource = record.resource;
+  }
+  if (record.subjectScope === "workspace" || record.subjectScope === "subject") {
+    ref.subjectScope = record.subjectScope;
+  }
+  return ref;
 }
 
 function shortHash(value: string): string {
@@ -8171,3 +8548,4 @@ function shortHash(value: string): string {
 // recordCodexAccountUsage) is already initialized when its default-deps bag
 // evaluates under the index↔resolver module cycle.
 export * from "./codex-token-resolver";
+export * from "./connection-token-resolver";

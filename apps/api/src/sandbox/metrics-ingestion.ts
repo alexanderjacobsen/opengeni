@@ -30,7 +30,7 @@
 import {
   getEnrollment,
   ingestMachineMetricsSample,
-  setEnrollmentHasDisplay,
+  setEnrollmentDisplayState,
   touchEnrollmentLastSeen,
   type Database,
   type MachineMetricsSample,
@@ -203,33 +203,63 @@ export function helloReportsDisplay(hello: Hello): boolean {
   if (!caps) {
     return false;
   }
+  // A CAPTURE-BLOCKED display is NOT a usable display: a Mac reports a display but
+  // withholds `desktop` and sets `desktopUnavailableReason` when Screen Recording
+  // (TCC) is not granted. Treating it as "has display" is exactly how the 0.1.3
+  // incident hid — the machine claimed a desktop it could not capture, so it was
+  // offered for computer-use and the model saw a blank. Gate it out here (the single
+  // source of truth for `has_display`, consumed by both the machine state and the
+  // capability negotiation). The `display`-present fallback is preserved for every
+  // other case (e.g. a relay-less agent that reports a display but not `desktop`).
+  if (caps.desktopUnavailableReason) {
+    return false;
+  }
   return caps.desktop === true || caps.display != null;
 }
 
 /**
- * Reconcile `enrollments.has_display` to the display presence a Hello reports.
- * Resolves the enrollment (the accountId is the RLS principal + the existence
- * check + the current value). A no-change Hello short-circuits BEFORE issuing any
- * write (and the DB writer is itself change-guarded as a backstop), so a steady
- * state never churns. An unknown/cross-workspace agentId is a no-op.
+ * The human, actionable reason a display is present but UNUSABLE (macOS Screen
+ * Recording / TCC not granted), or null when capture is permitted / the machine is
+ * headless. Normalizes the proto's non-optional "" empty string to null so the DB
+ * carries a clean tri-state (a real reason vs. no reason) — the Machines dashboard
+ * shows "display: capture not granted" only when this is non-null.
+ */
+export function helloDesktopUnavailableReason(hello: Hello): string | null {
+  const reason = hello.capabilities?.desktopUnavailableReason;
+  return reason ? reason : null;
+}
+
+/**
+ * Reconcile `enrollments.has_display` (+ the capture-blocked reason) to what a Hello
+ * reports. Resolves the enrollment (the accountId is the RLS principal + the
+ * existence check + the current values). A no-change Hello short-circuits BEFORE
+ * issuing any write (and the DB writer is itself change-guarded on BOTH fields as a
+ * backstop), so a steady state never churns. An unknown/cross-workspace agentId is a
+ * no-op.
  */
 export async function refreshEnrollmentDisplay(
   db: Database,
-  input: { workspaceId: string; agentId: string; hasDisplay: boolean },
+  input: { workspaceId: string; agentId: string; hasDisplay: boolean; desktopUnavailableReason?: string | null },
 ): Promise<{ updated: boolean }> {
+  const desktopUnavailableReason = input.desktopUnavailableReason ?? null;
   const enrollment = await getEnrollment(db, input.workspaceId, input.agentId);
   if (!enrollment) {
     return { updated: false };
   }
-  if (enrollment.hasDisplay === input.hasDisplay) {
-    // Unchanged — do not even issue the UPDATE (no churn on a steady-state Hello).
+  if (
+    enrollment.hasDisplay === input.hasDisplay &&
+    (enrollment.desktopUnavailableReason ?? null) === desktopUnavailableReason
+  ) {
+    // Both fields unchanged — do not even issue the UPDATE (no churn on a
+    // steady-state Hello).
     return { updated: false };
   }
-  return await setEnrollmentHasDisplay(db, {
+  return await setEnrollmentDisplayState(db, {
     accountId: enrollment.accountId,
     workspaceId: input.workspaceId,
     enrollmentId: input.agentId,
     hasDisplay: input.hasDisplay,
+    desktopUnavailableReason,
   });
 }
 
@@ -263,6 +293,7 @@ export async function handleHelloPayload(
       workspaceId: ids.workspaceId,
       agentId: ids.agentId,
       hasDisplay: helloReportsDisplay(hello),
+      desktopUnavailableReason: helloDesktopUnavailableReason(hello),
     });
   } catch (error) {
     observability?.warn?.("Failed to refresh an enrollment's display from a Hello", {

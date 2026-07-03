@@ -53,6 +53,7 @@ const publishable = topologicallySortedPackages(publishableWorkspacePackages());
 const publishableNames = new Set(publishable.map((pkg) => pkg.name));
 const ignored = changesetIgnoreSet();
 const workspaceNames = workspacePackageByName();
+const PREPUBLISH_GUARD_SCRIPT = "bun ../../scripts/prepublish-guard";
 
 function readPkg(pkgDir: string): PackageJson {
   return JSON.parse(readFileSync(join(repoRoot, pkgDir, "package.json"), "utf8")) as PackageJson;
@@ -77,6 +78,12 @@ function assertPublishableMetadata(pkg: WorkspacePackage): void {
   if (json.publishConfig?.provenance !== true) {
     failures.push(`${pkg.name} is publishable but missing publishConfig.provenance=true.`);
   }
+  if (json.license !== "Apache-2.0") {
+    failures.push(`${pkg.name} is publishable but missing license="Apache-2.0".`);
+  }
+  if (!existsSync(join(repoRoot, pkg.dir, "LICENSE"))) {
+    failures.push(`${pkg.name} is publishable but missing a package-local LICENSE file.`);
+  }
   if (!Array.isArray(json.files) || !json.files.includes("dist") || !json.files.includes("src")) {
     failures.push(`${pkg.name} is publishable but its files list must include "dist" and "src".`);
   }
@@ -88,6 +95,11 @@ function assertPublishableMetadata(pkg: WorkspacePackage): void {
   }
   if (!json.scripts?.build) {
     failures.push(`${pkg.name} is publishable but has no build script.`);
+  }
+  if (json.scripts?.prepublishOnly !== PREPUBLISH_GUARD_SCRIPT) {
+    failures.push(
+      `${pkg.name} is publishable but missing prepublishOnly="${PREPUBLISH_GUARD_SCRIPT}".`,
+    );
   }
 }
 

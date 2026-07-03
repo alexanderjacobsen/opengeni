@@ -286,7 +286,7 @@ export function MessageTimeline({
               renderMessageText={renderMessageText}
               onOpenSession={onOpenSession}
               toolRegistry={toolRegistry}
-              foldLiveCluster={index < groups.length - 1}
+              foldLiveCluster={isAgentProgress(groups[index + 1])}
             />
           ))}
           {working ? (
@@ -368,7 +368,7 @@ function TimelineGroupView({
 }) {
   switch (group.kind) {
     case "activity":
-      return group.outcome || foldLiveCluster ? (
+      return group.outcome || (foldLiveCluster && clusterIsSettled(group)) ? (
         <TurnSummary
           items={group.items}
           outcome={group.outcome}
@@ -421,6 +421,30 @@ function timelineGroupKey(group: TimelineGroup): string {
     case "turn":
       return group.id;
   }
+}
+
+/** The agent has moved PAST a cluster only when what follows is more agent
+    progress — new activity, a settled turn, or narration. A waiting notice
+    (approval pause), a pending queued message, a goal pill, or nothing at all
+    do NOT advance the story, and folding on them would hide exactly the work
+    the reader needs in view. */
+function isAgentProgress(next: TimelineGroup | undefined): boolean {
+  if (!next) {
+    return false;
+  }
+  return next.kind === "activity" || next.kind === "turn" || (next.kind === "item" && next.item.kind === "agent-message");
+}
+
+/** No item still running or streaming — the only state safe to fold live.
+    Position alone is a broken proxy: a pending queued message (or any trailing
+    item) can sit after the ACTIVE cluster, which must never fold mid-work. */
+function clusterIsSettled(group: Extract<TimelineGroup, { kind: "activity" }>): boolean {
+  return group.items.every((item) => {
+    if (item.kind === "reasoning") {
+      return !item.streaming;
+    }
+    return item.status !== "running";
+  });
 }
 
 function flattenActivityItems(groups: TimelineGroup[]): ActivityItem[] {

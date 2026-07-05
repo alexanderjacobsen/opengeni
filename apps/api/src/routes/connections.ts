@@ -7,7 +7,6 @@ import {
   OAuthStartResponse,
   UpdateConnectionRequest,
 } from "@opengeni/contracts";
-import { Buffer } from "node:buffer";
 import { requireAccessGrant, requireEnvironmentEncryption } from "@opengeni/core";
 import {
   createConnection,
@@ -17,15 +16,23 @@ import {
   revokeConnection,
   updateConnection,
 } from "@opengeni/db";
-import { createSignedState, readSignedState } from "@opengeni/github";
 import type { ApiRouteDeps } from "@opengeni/core";
 import type { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
-
-const oauthStateTtlMs = 10 * 60 * 1000;
+import {
+  completeMcpOAuthCallback,
+  integrationBaseUrl,
+  startMcpOAuth,
+} from "../integrations/oauth-client";
 
 export function registerConnectionRoutes(app: Hono, deps: ApiRouteDeps): void {
   const { db, settings } = deps;
+
+  function assertIntegrationsEnabled(): void {
+    if (!settings.integrationsEnabled) {
+      throw new HTTPException(404, { message: "integrations are not enabled for this deployment" });
+    }
+  }
 
   app.get("/v1/workspaces/:workspaceId/connections", async (c) => {
     const workspaceId = c.req.param("workspaceId");
@@ -115,41 +122,32 @@ export function registerConnectionRoutes(app: Hono, deps: ApiRouteDeps): void {
   });
 
   app.post("/v1/workspaces/:workspaceId/connections/oauth/start", async (c) => {
+    assertIntegrationsEnabled();
     const workspaceId = c.req.param("workspaceId");
     const grant = await requireAccessGrant(c, deps, workspaceId, "connections:write");
-    const payload = OAuthStartRequest.parse(await c.req.json());
-    const key = requireEnvironmentEncryption(settings);
-    const state = createSignedState(requireIntegrationsStateSecret(settings), {
+    const parsed = OAuthStartRequest.safeParse(await c.req.json());
+    if (!parsed.success) {
+      throw new HTTPException(400, { message: parsed.error.issues[0]?.message ?? "invalid OAuth start request" });
+    }
+    const payload = parsed.data;
+    const result = await startMcpOAuth({ db, settings }, {
       accountId: grant.accountId,
       workspaceId,
       subjectId: grant.subjectId,
-      providerDomain: payload.providerDomain,
-      requestedScopes: payload.requestedScopes,
-      encryptedPkceVerifier: encryptEnvironmentValue(key, randomBase64Url(32)),
-      ...(payload.resource !== undefined ? { resource: payload.resource } : {}),
-      ...(payload.returnPath !== undefined ? { returnPath: payload.returnPath } : {}),
-      ...(payload.connectionId !== undefined ? { connectionId: payload.connectionId } : {}),
+      requestUrl: c.req.url,
+      payload,
     });
-    return c.json(OAuthStartResponse.parse({
-      state,
-      authorizationUrl: null,
-      expiresAt: new Date(Date.now() + oauthStateTtlMs).toISOString(),
-    }), 501);
+    return c.json(OAuthStartResponse.parse(result));
   });
 
   app.get("/v1/integrations/oauth/callback", async (c) => {
-    const state = c.req.query("state");
-    if (!state) {
-      throw new HTTPException(400, { message: "missing OAuth state" });
-    }
-    const payload = readSignedState(state, requireIntegrationsStateSecret(settings));
-    if (!payload) {
-      throw new HTTPException(400, { message: "invalid or expired OAuth state" });
-    }
-    if (!c.req.query("code")) {
-      throw new HTTPException(400, { message: "missing OAuth code" });
-    }
-    return c.json({ error: "OAuth callback is not implemented until integrations I2" }, 501);
+    assertIntegrationsEnabled();
+    const result = await completeMcpOAuthCallback({ db, settings }, {
+      code: c.req.query("code"),
+      state: c.req.query("state"),
+      requestUrl: c.req.url,
+    });
+    return c.redirect(result.redirectTo, 302);
   });
 
   app.get("/v1/integrations/oauth/client-metadata.json", (c) => {
@@ -178,22 +176,4 @@ function writableSubjectId(requested: string | null | undefined, grantSubjectId:
 
 function encryptCredentialBundle(key: Uint8Array, credential: Record<string, unknown>): string {
   return encryptEnvironmentValue(key, JSON.stringify(credential));
-}
-
-function requireIntegrationsStateSecret(settings: ApiRouteDeps["settings"]): string {
-  const secret = settings.integrationsStateSecret?.trim();
-  if (!secret) {
-    throw new HTTPException(503, { message: "integrations OAuth requires OPENGENI_INTEGRATIONS_STATE_SECRET" });
-  }
-  return secret;
-}
-
-function integrationBaseUrl(publicBaseUrl: string | undefined, requestUrl: string): string {
-  return (publicBaseUrl ?? new URL(requestUrl).origin).replace(/\/+$/, "");
-}
-
-function randomBase64Url(byteLength: number): string {
-  const bytes = new Uint8Array(byteLength);
-  crypto.getRandomValues(bytes);
-  return Buffer.from(bytes).toString("base64url");
 }

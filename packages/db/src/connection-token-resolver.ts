@@ -1,4 +1,7 @@
 import { environmentsEncryptionKeyBytes, type McpServerConnectionRef, type Settings } from "@opengeni/config";
+import { Buffer } from "node:buffer";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import { encryptEnvironmentValue } from "./environment-crypto";
 import {
   loadConnectionCredentialForBroker,
@@ -120,7 +123,7 @@ export function buildConnectionTokenResolver(
     if (!key) {
       throw new Error("OPENGENI_ENVIRONMENTS_ENCRYPTION_KEY is not configured");
     }
-    const refreshed = await deps.refresh(cred, ref);
+    const refreshed = await deps.refresh(cred, ref, settings);
     const refreshRecord: Parameters<typeof recordConnectionTokenRefresh>[1] = {
       id: cred.id,
       version: cred.version,
@@ -278,6 +281,7 @@ function headersForCredential(cred: ConnectionCredentialForBroker): Record<strin
 export async function refreshOAuthConnectionCredential(
   cred: ConnectionCredentialForBroker,
   ref: McpServerConnectionRef,
+  settings?: Settings,
 ): Promise<{ credential: Record<string, unknown>; expiresAt: Date | null; grantedScopes?: string[] }> {
   if (cred.kind !== "oauth2") {
     return { credential: cred.credential, expiresAt: cred.expiresAt, grantedScopes: cred.grantedScopes };
@@ -290,6 +294,9 @@ export async function refreshOAuthConnectionCredential(
   if (!refreshToken || !tokenEndpoint) {
     throw new Error("connection has no refresh token endpoint");
   }
+  if (settings) {
+    await assertOAuthEndpointAllowed(tokenEndpoint, settings);
+  }
   const body = new URLSearchParams();
   body.set("grant_type", "refresh_token");
   body.set("refresh_token", refreshToken);
@@ -300,8 +307,16 @@ export async function refreshOAuthConnectionCredential(
     stringValue((cred.credential as { client_id?: unknown }).client_id)
     ?? stringValue((cred.metadata as { clientId?: unknown }).clientId)
     ?? stringValue((cred.metadata as { client_id?: unknown }).client_id);
+  const clientSecret = stringValue((cred.credential as { client_secret?: unknown }).client_secret);
+  const authMethod = stringValue((cred.credential as { token_endpoint_auth_method?: unknown }).token_endpoint_auth_method) ?? "none";
   if (clientId) {
     body.set("client_id", clientId);
+  }
+  const headers: Record<string, string> = { "content-type": "application/x-www-form-urlencoded" };
+  if (clientSecret && authMethod === "client_secret_post") {
+    body.set("client_secret", clientSecret);
+  } else if (clientId && clientSecret && authMethod === "client_secret_basic") {
+    headers.authorization = `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`;
   }
   const resource = ref.resource ?? stringValue((cred.credential as { resource?: unknown }).resource);
   if (resource) {
@@ -312,9 +327,13 @@ export async function refreshOAuthConnectionCredential(
   }
   const response = await fetch(tokenEndpoint, {
     method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
+    headers,
     body,
+    redirect: "manual",
   });
+  if (response.status >= 300 && response.status < 400) {
+    throw new ConnectionRefreshHttpError(response.status);
+  }
   if (!response.ok) {
     throw new ConnectionRefreshHttpError(response.status);
   }
@@ -333,6 +352,7 @@ export async function refreshOAuthConnectionCredential(
     ...(expiresAt ? { expires_at: expiresAt.toISOString() } : {}),
     ...(resource ? { resource } : {}),
     ...(scopeText ? { scope: scopeText } : {}),
+    ...(clientSecret ? { client_secret: clientSecret, token_endpoint_auth_method: authMethod } : {}),
   };
   return {
     credential: nextCredential,
@@ -370,4 +390,92 @@ function stringRecord(value: unknown): Record<string, string> | null {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+async function assertOAuthEndpointAllowed(rawUrl: string, settings: Settings): Promise<void> {
+  if (settings.integrationsAllowPrivateNetworkTargets || ["local", "test"].includes(settings.environment)) {
+    return;
+  }
+  const url = new URL(rawUrl);
+  if (url.protocol !== "https:") {
+    throw new Error("OAuth token endpoint must use https outside local/test");
+  }
+  const hostname = url.hostname.toLowerCase();
+  if (hostname === "localhost" || hostname.endsWith(".localhost")) {
+    throw new Error("OAuth token endpoint may not target localhost");
+  }
+  const literal = isIP(hostname);
+  const addresses = literal
+    ? [hostname]
+    : (await lookup(hostname, { all: true })).map((entry) => entry.address);
+  if (addresses.some(isPrivateAddress)) {
+    throw new Error("OAuth token endpoint may not target a private network address");
+  }
+}
+
+export function isPrivateAddress(address: string): boolean {
+  const normalized = normalizeAddress(address);
+  const mapped = ipv4FromMappedIpv6(normalized);
+  if (mapped) {
+    return isPrivateIpv4Address(mapped);
+  }
+  if (normalized.includes(":")) {
+    if (isIP(normalized) !== 6) {
+      return true;
+    }
+    return normalized === "::1"
+      || normalized === "::"
+      || normalized.startsWith("fc")
+      || normalized.startsWith("fd")
+      || normalized.startsWith("fe8")
+      || normalized.startsWith("fe9")
+      || normalized.startsWith("fea")
+      || normalized.startsWith("feb");
+  }
+  return isPrivateIpv4Address(normalized);
+}
+
+function normalizeAddress(address: string): string {
+  const trimmed = address.trim().toLowerCase();
+  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function ipv4FromMappedIpv6(address: string): string | null {
+  if (!address.startsWith("::ffff:")) {
+    return null;
+  }
+  const embedded = address.slice("::ffff:".length);
+  if (embedded.includes(".")) {
+    return embedded;
+  }
+  const parts = embedded.split(":");
+  if (parts.length !== 2 || parts.some((part) => !/^[0-9a-f]{1,4}$/.test(part))) {
+    return null;
+  }
+  const high = Number.parseInt(parts[0]!, 16);
+  const low = Number.parseInt(parts[1]!, 16);
+  if (!Number.isInteger(high) || !Number.isInteger(low) || high < 0 || high > 0xffff || low < 0 || low > 0xffff) {
+    return null;
+  }
+  return `${(high >> 8) & 0xff}.${high & 0xff}.${(low >> 8) & 0xff}.${low & 0xff}`;
+}
+
+function isPrivateIpv4Address(address: string): boolean {
+  if (isIP(address) !== 4) {
+    return true;
+  }
+  const parts = address.split(".").map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+    return true;
+  }
+  const [a, b] = parts as [number, number, number, number];
+  return a === 0
+    || a === 10
+    || a === 127
+    || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && b === 168);
 }

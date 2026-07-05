@@ -8,14 +8,18 @@ import {
   ConnectionRefreshHttpError,
   createConnection,
   createDb,
+  consumeIntegrationOAuthStateNonce,
   encryptEnvironmentValue,
   getConnectionMetadata,
+  isPrivateAddress,
+  loadIntegrationOAuthClient,
   listConnectionsMetadata,
   loadConnectionCredentialForBroker,
   recordConnectionTokenRefresh,
   refreshOAuthConnectionCredential,
   revokeConnection,
   setConnectionStatus,
+  storeIntegrationOAuthClient,
   type ConnectionBrokerDeps,
   type ConnectionCredentialForBroker,
   type Database,
@@ -108,6 +112,17 @@ function resolverDeps(overrides: Partial<ConnectionBrokerDeps> = {}): { deps: Co
   };
   return { deps, counts };
 }
+
+describe("OAuth endpoint address classification", () => {
+  test("IPv4-mapped IPv6 addresses are classified through their embedded IPv4 address", () => {
+    expect(isPrivateAddress("::ffff:127.0.0.1")).toBe(true);
+    expect(isPrivateAddress("::ffff:10.0.0.1")).toBe(true);
+    expect(isPrivateAddress("::FFFF:192.168.1.1")).toBe(true);
+    expect(isPrivateAddress("::ffff:7f00:0001")).toBe(true);
+    expect(isPrivateAddress("::ffff:1.1.1.1")).toBe(false);
+    expect(isPrivateAddress("not an ip address")).toBe(true);
+  });
+});
 
 beforeAll(async () => {
   shared = await acquireSharedTestDatabase("connections");
@@ -346,6 +361,77 @@ describe("connections table and helpers", () => {
     expect(loaded?.id).toBe(active.id);
     expect(loaded?.status).toBe("active");
   });
+
+  test("DCR OAuth client storage returns the first issuer winner without overwriting it", async () => {
+    if (!available) return;
+    const first = await storeIntegrationOAuthClient(db, {
+      issuer: "https://as.example.com",
+      authorizationServer: "https://as.example.com",
+      clientId: "client-1",
+      clientSecretEncrypted: encryptEnvironmentValue(key, "secret-1"),
+      tokenEndpointAuthMethod: "client_secret_post",
+      metadata: { registrationEndpoint: "https://as.example.com/register-1" },
+    });
+    const second = await storeIntegrationOAuthClient(db, {
+      issuer: "https://as.example.com",
+      authorizationServer: "https://as.example.com/other",
+      clientId: "client-2",
+      clientSecretEncrypted: encryptEnvironmentValue(key, "secret-2"),
+      tokenEndpointAuthMethod: "client_secret_post",
+      metadata: { registrationEndpoint: "https://as.example.com/register-2" },
+    });
+    expect(first.clientId).toBe("client-1");
+    expect(second.clientId).toBe("client-1");
+
+    const loaded = await loadIntegrationOAuthClient(db, settings, "https://as.example.com");
+    expect(loaded).toMatchObject({
+      issuer: "https://as.example.com",
+      authorizationServer: "https://as.example.com",
+      clientId: "client-1",
+      clientSecret: "secret-1",
+      tokenEndpointAuthMethod: "client_secret_post",
+      metadata: { registrationEndpoint: "https://as.example.com/register-1" },
+    });
+  });
+
+  test("OAuth state nonce consumption is single-use and TTL-cleaned per workspace", async () => {
+    if (!available) return;
+    const ws = await freshWorkspace();
+    const now = new Date();
+    const first = await consumeIntegrationOAuthStateNonce(db, {
+      ...ws,
+      subjectId: "subject-a",
+      nonce: "nonce-1",
+      expiresAt: new Date(now.getTime() + 60_000),
+      now,
+    });
+    const replay = await consumeIntegrationOAuthStateNonce(db, {
+      ...ws,
+      subjectId: "subject-a",
+      nonce: "nonce-1",
+      expiresAt: new Date(now.getTime() + 60_000),
+      now,
+    });
+    expect(first).toBe(true);
+    expect(replay).toBe(false);
+
+    const expired = await consumeIntegrationOAuthStateNonce(db, {
+      ...ws,
+      subjectId: "subject-a",
+      nonce: "expired",
+      expiresAt: new Date(now.getTime() - 60_000),
+      now: new Date(now.getTime() - 120_000),
+    });
+    expect(expired).toBe(true);
+    const afterCleanup = await consumeIntegrationOAuthStateNonce(db, {
+      ...ws,
+      subjectId: "subject-a",
+      nonce: "expired",
+      expiresAt: new Date(now.getTime() + 60_000),
+      now,
+    });
+    expect(afterCleanup).toBe(true);
+  });
 });
 
 describe("buildConnectionTokenResolver", () => {
@@ -486,6 +572,77 @@ describe("buildConnectionTokenResolver", () => {
     });
     expect(result).toMatchObject({ status: "auth_needed", reason: "refresh_failed" });
     expect(counts.status).toBe(0);
+  });
+
+  test("refresh token POST rejects redirects without marking needs_reauth", async () => {
+    let redirectTargetHits = 0;
+    const redirectTarget = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch() {
+        redirectTargetHits += 1;
+        return Response.json({ access_token: "redirected-token", token_type: "Bearer", expires_in: 3600 });
+      },
+    });
+    let tokenHits = 0;
+    let tokenRequestBody: URLSearchParams | null = null;
+    const tokenEndpoint = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        tokenHits += 1;
+        tokenRequestBody = new URLSearchParams(await request.text());
+        return new Response("", {
+          status: 302,
+          headers: { location: `http://127.0.0.1:${redirectTarget.port}/capture` },
+        });
+      },
+    });
+    try {
+      const stale = brokerCredential({
+        id: "conn_oauth",
+        providerDomain: "oauth.example.com",
+        kind: "oauth2",
+        credential: {
+          access_token: "AC",
+          refresh_token: "RF",
+          token_type: "Bearer",
+          token_endpoint: `http://127.0.0.1:${tokenEndpoint.port}/token`,
+        },
+        expiresAt: new Date(Date.now() - 1_000),
+        version: 3,
+      });
+      let observedError: unknown;
+      const { deps, counts } = resolverDeps({
+        loadCredential: async () => stale,
+        refresh: async (cred, ref) => {
+          counts.refresh += 1;
+          try {
+            return await refreshOAuthConnectionCredential(cred, ref);
+          } catch (error) {
+            observedError = error;
+            throw error;
+          }
+        },
+      });
+      const resolver = buildConnectionTokenResolver({} as Database, settings, deps);
+      const result = await resolver({
+        workspaceId: "ws_1",
+        serverId: "srv_1",
+        connectionRef: { providerDomain: "oauth.example.com", kind: "oauth2" },
+      });
+      expect(result).toMatchObject({ status: "auth_needed", reason: "refresh_failed", connectionId: "conn_oauth" });
+      expect(observedError).toBeInstanceOf(ConnectionRefreshHttpError);
+      expect((observedError as ConnectionRefreshHttpError).httpStatus).toBe(302);
+      expect(counts.status).toBe(0);
+      expect(tokenHits).toBe(1);
+      expect(tokenRequestBody!.get("grant_type")).toBe("refresh_token");
+      expect(tokenRequestBody!.get("refresh_token")).toBe("RF");
+      expect(redirectTargetHits).toBe(0);
+    } finally {
+      tokenEndpoint.stop(true);
+      redirectTarget.stop(true);
+    }
   });
 
   test("public-client refresh sends client_id from the credential bundle", async () => {

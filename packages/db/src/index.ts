@@ -4377,6 +4377,41 @@ export async function listSessionEvents(
   });
 }
 
+export type ToolspaceCallReservation =
+  | { reserved: true; count: number }
+  | { reserved: false };
+
+/**
+ * Atomically reserve one toolspace call against a turn's per-turn budget.
+ *
+ * A single conditional UPDATE increments `toolspace_call_count` only while it is
+ * below `limit` and returns the post-increment value. Concurrent reservations
+ * for the same turn serialize on the row lock, so exactly `limit` of N
+ * simultaneous callers observe `reserved: true` — closing the read-then-append
+ * TOCTOU the event-count approach had. `reserved: false` means the turn is at or
+ * over budget (or the turn row no longer exists).
+ */
+export async function reserveToolspaceCallForTurn(
+  db: Database,
+  workspaceId: string,
+  sessionId: string,
+  turnId: string,
+  limit: number,
+): Promise<ToolspaceCallReservation> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [row] = await scopedDb.update(schema.sessionTurns)
+      .set({ toolspaceCallCount: sql`${schema.sessionTurns.toolspaceCallCount} + 1` })
+      .where(and(
+        eq(schema.sessionTurns.workspaceId, workspaceId),
+        eq(schema.sessionTurns.sessionId, sessionId),
+        eq(schema.sessionTurns.id, turnId),
+        sql`${schema.sessionTurns.toolspaceCallCount} < ${limit}`,
+      ))
+      .returning({ count: schema.sessionTurns.toolspaceCallCount });
+    return row ? { reserved: true, count: Number(row.count) } : { reserved: false };
+  });
+}
+
 function normalizeEventSequence(value: number | undefined, fallback: number): number {
   if (value === undefined || !Number.isFinite(value)) {
     return fallback;

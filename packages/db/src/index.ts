@@ -5826,6 +5826,32 @@ export async function heartbeatLeaseHolder(db: Database, input: {
     }));
 }
 
+/**
+ * HOLDER-LIVENESS touch: refresh ONLY this holder's last_heartbeat_at. The
+ * warmup phase of a turn (acquire -> waitForWarm -> establish/cold-restore ->
+ * display stack) can legitimately run for many minutes BEFORE the full turn
+ * heartbeat (heartbeatLeaseHolder) starts, and the dead-worker turn-holder
+ * reap judges liveness by this timestamp. Touching our own holder row needs no
+ * epoch fence — supersession is handled by the fenced acquire/establish paths;
+ * a reaped/released row returns false (row gone).
+ */
+export async function touchLeaseHolder(db: Database, input: {
+  accountId: string; workspaceId: string; sandboxGroupId: string;
+  kind: LeaseHolderKind; holderId: string;
+}): Promise<boolean> {
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId },
+    async (scopedDb) => {
+      const updated = await scopedDb.execute<{ id: string }>(sql`
+        update sandbox_lease_holders set last_heartbeat_at = now()
+        where lease_id = (select id from sandbox_leases
+                          where workspace_id = ${input.workspaceId} and sandbox_group_id = ${input.sandboxGroupId})
+          and kind = ${input.kind} and holder_id = ${input.holderId}
+        returning id
+      `);
+      return updated.length > 0;
+    });
+}
+
 // §4.6 — the reaper. DB-SIDE ONLY (no provider call — the provider stop() is
 // P1.3's runtime concern). Three actions in one pass: TTL-reap stale viewer
 // holders, recompute refcounts + warm->draining, reset warming-death to cold;
@@ -5844,18 +5870,42 @@ export interface ReapDrainable {
 export async function reapStaleLeaseHolders(db: Database, input: {
   workspaceId: string;
   viewerHolderTtlMs: number;   // delete viewer rows older than this
+  /** Delete TURN rows whose heartbeat is older than this (the lease TTL: >> the
+   *  10s turn heartbeat, so only a DEAD worker's holder ever crosses it). 0/absent
+   *  = legacy never-reap. */
+  turnHolderTtlMs?: number;
   idleGraceMs: number;         // drain-grace horizon (matches releaseLeaseHolder)
-}): Promise<{ reapedViewers: number; warmingReset: number; drained: ReapDrainable[] }> {
+}): Promise<{ reapedViewers: number; reapedTurns: number; warmingReset: number; drained: ReapDrainable[] }> {
   return await withWorkspaceRls(db, input.workspaceId, async (scopedDb) =>
     await scopedDb.transaction(async (txRaw) => {
       const tx = txRaw as unknown as Database;
-      // (a) Reap stale VIEWER holders (turn holders are TTL-exempt — never reaped).
+      // (a) Reap stale VIEWER holders.
       const reaped = await tx.execute<{ lease_id: string }>(sql`
         delete from sandbox_lease_holders
         where workspace_id = ${input.workspaceId} and kind = 'viewer'
           and last_heartbeat_at < now() - (${String(input.viewerHolderTtlMs)} || ' milliseconds')::interval
         returning lease_id
       `);
+      // (a2) Reap DEAD-WORKER turn holders. A live holder is touched every 10s
+      // from registration (the resumeBoxForTurn holder-liveness loop covers the
+      // warmup; the turn heartbeat covers the run — legit multi-day turns
+      // included), so the caller's horizon is generous defense-in-depth, never
+      // a bound a live path can reach. A holder staler than it belongs to a
+      // worker that died without cleanup (SIGKILL/OOM/deploy churn); left in
+      // place it pins refcount >= 1 FOREVER, so the lease never drains, the
+      // reaper never persists /workspace, and the box rides the provider
+      // hard-timeout to an UNPERSISTED death (the 2026-07-06 staging deploy
+      // churn left holders frozen for hours). The redispatched turn re-acquires
+      // under a NEW holder id, so deleting the corpse never touches a live
+      // execution.
+      const reapedTurnRows = input.turnHolderTtlMs && input.turnHolderTtlMs > 0
+        ? await tx.execute<{ lease_id: string }>(sql`
+          delete from sandbox_lease_holders
+          where workspace_id = ${input.workspaceId} and kind = 'turn'
+            and last_heartbeat_at < now() - (${String(input.turnHolderTtlMs)} || ' milliseconds')::interval
+          returning lease_id
+        `)
+        : [];
 
       // (b) Recompute refcounts for every lease in the workspace; warm leases
       // that hit 0 (AND turn_holders=0) enter draining with a fresh grace
@@ -5923,6 +5973,7 @@ export async function reapStaleLeaseHolders(db: Database, input: {
 
       return {
         reapedViewers: reaped.length,
+        reapedTurns: reapedTurnRows.length,
         warmingReset: warmingReset.length + warmingDrain.length,
         drained: drainable.map((r) => ({
           workspaceId: input.workspaceId,
@@ -5942,11 +5993,14 @@ export async function reapStaleLeaseHolders(db: Database, input: {
 // is the sanctioned cross-workspace read).
 export async function reapStaleLeaseHoldersGlobal(db: Database, input: {
   viewerHolderTtlMs: number;
+  /** Reap DEAD-WORKER turn holders staler than this (the lease TTL; see
+   *  reapStaleLeaseHolders). 0/absent = never (legacy). */
+  turnHolderTtlMs?: number;
   idleGraceMs: number;
 }): Promise<ReapDrainable[]> {
   const rows = await rawRows<{ workspace_id: string; sandbox_group_id: string; instance_id: string | null; lease_epoch: number | string }>(db, sql`
     select workspace_id, sandbox_group_id, instance_id, lease_epoch
-    from opengeni_private.reap_sandbox_leases(${input.viewerHolderTtlMs}, ${input.idleGraceMs})
+    from opengeni_private.reap_sandbox_leases(${input.viewerHolderTtlMs}, ${input.turnHolderTtlMs ?? 0}, ${input.idleGraceMs})
   `);
   return rows.map((r) => ({
     workspaceId: r.workspace_id,
@@ -6175,33 +6229,113 @@ export async function persistDrainSnapshot(db: Database, input: {
       if (input.workspaceArchive === null) {
         return { wrote: true, priorArchive: null };
       }
-      // (2) Merge the NEW archive into resume_state.sessionState.workspaceArchive.
-      // jsonb_set's create_missing does NOT create intermediate objects, so a
-      // direct set of '{sessionState,workspaceArchive}' is a silent no-op when
-      // `sessionState` is absent (a null resume_state, or a legacy flat envelope).
-      // Instead: rebuild `sessionState` as (existing sessionState OR '{}') merged
-      // (||) with `{workspaceArchive: <b64>}` — this CREATES sessionState if absent
-      // AND preserves its existing siblings (providerState/manifest/exposedPorts).
-      // The archive is bound as a jsonb string scalar (to_jsonb(text)). Re-asserting
-      // the CAS guard keeps the write atomic with the FOR UPDATE lock above.
-      await scopedDb.execute(sql`
-        update sandbox_leases set
-          resume_state = jsonb_set(
-            -- Defensive: only treat resume_state / its sessionState as an object
-            -- when it actually IS one; a null/scalar (legacy or malformed envelope)
-            -- starts from '{}' so jsonb_set never throws "cannot set path in scalar".
-            case when jsonb_typeof(resume_state) = 'object' then resume_state else '{}'::jsonb end,
-            '{sessionState}',
-            (case when jsonb_typeof(resume_state -> 'sessionState') = 'object'
-                  then resume_state -> 'sessionState' else '{}'::jsonb end)
-              || jsonb_build_object('workspaceArchive', to_jsonb(${input.workspaceArchive}::text)),
-            true
-          ),
-          updated_at = now()
-        where workspace_id = ${input.workspaceId} and sandbox_group_id = ${input.sandboxGroupId}
-          and liveness = 'draining' and refcount = 0 and lease_epoch = ${input.expectedEpoch}
-      `);
+      await foldWorkspaceArchiveOntoLease(scopedDb, {
+        workspaceId: input.workspaceId,
+        sandboxGroupId: input.sandboxGroupId,
+        expectedEpoch: input.expectedEpoch,
+        workspaceArchive: input.workspaceArchive,
+        livenessGuard: "draining",
+      });
       return { wrote: true, priorArchive };
+    });
+}
+
+/**
+ * The ONE archive-fold write, shared by the drain seam (persistDrainSnapshot)
+ * and the mid-session seam (persistWarmSnapshot) — the two differ only in
+ * their CAS guard (draining@refcount0 vs warm) and their read-side semantics.
+ *
+ * Merges the NEW archive (+ its workspaceArchiveAt timestamp, the throttle
+ * baseline for mid-session snapshots) into resume_state.sessionState.
+ * jsonb_set's create_missing does NOT create intermediate objects, so a direct
+ * set of '{sessionState,workspaceArchive}' is a silent no-op when
+ * `sessionState` is absent (a null resume_state, or a legacy flat envelope).
+ * Instead: rebuild `sessionState` as (existing sessionState OR '{}') merged
+ * (||) with the fold — this CREATES sessionState if absent AND preserves its
+ * existing siblings (providerState/manifest/exposedPorts). The archive is
+ * bound as a jsonb string scalar (to_jsonb(text)). Re-asserting the caller's
+ * CAS guard keeps the write atomic with its FOR UPDATE lock.
+ */
+async function foldWorkspaceArchiveOntoLease(scopedDb: Database, input: {
+  workspaceId: string; sandboxGroupId: string; expectedEpoch: number;
+  workspaceArchive: string;
+  livenessGuard: "draining" | "warm";
+}): Promise<void> {
+  const livenessGuard = input.livenessGuard === "draining"
+    ? sql`liveness = 'draining' and refcount = 0`
+    : sql`liveness = 'warm'`;
+  await scopedDb.execute(sql`
+    update sandbox_leases set
+      resume_state = jsonb_set(
+        -- Defensive: only treat resume_state / its sessionState as an object
+        -- when it actually IS one; a null/scalar (legacy or malformed envelope)
+        -- starts from '{}' so jsonb_set never throws "cannot set path in scalar".
+        case when jsonb_typeof(resume_state) = 'object' then resume_state else '{}'::jsonb end,
+        '{sessionState}',
+        (case when jsonb_typeof(resume_state -> 'sessionState') = 'object'
+              then resume_state -> 'sessionState' else '{}'::jsonb end)
+          || jsonb_build_object(
+            'workspaceArchive', to_jsonb(${input.workspaceArchive}::text),
+            'workspaceArchiveAt', to_jsonb(now()::timestamptz::text)
+          ),
+        true
+      ),
+      updated_at = now()
+    where workspace_id = ${input.workspaceId} and sandbox_group_id = ${input.sandboxGroupId}
+      and ${livenessGuard} and lease_epoch = ${input.expectedEpoch}
+  `);
+}
+
+/**
+ * MID-SESSION /workspace snapshot fold (sandbox-file-persistence). The WARM
+ * sibling of persistDrainSnapshot: a turn that HOLDS the live box folds a fresh
+ * snapshot onto its own lease without draining anything. Guarded by
+ * `liveness='warm' AND lease_epoch=expected` — a drain/re-create that raced in
+ * (different liveness or newer epoch) writes ZERO rows → wrote:false, and the
+ * caller simply skips (the snapshot belonged to a box the lease no longer
+ * tracks). `workspaceArchiveAt` rides the same sessionState merge so the
+ * throttle re-check here is ATOMIC with the write — two concurrent holders
+ * cannot double-snapshot inside one interval.
+ */
+export async function persistWarmSnapshot(db: Database, input: {
+  accountId: string; workspaceId: string; sandboxGroupId: string;
+  expectedEpoch: number;
+  /** base64 of the provider snapshot-ref / tar archive from persistWorkspace(). */
+  workspaceArchive: string;
+  /** Snapshots newer than this many ms are kept (throttle); 0 = always write. */
+  minIntervalMs: number;
+}): Promise<{ wrote: boolean; throttled: boolean; priorArchive: string | null }> {
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId },
+    async (scopedDb) => {
+      const guard = await scopedDb.execute<{ prior_archive: string | null; prior_archive_at: string | null }>(sql`
+        select
+          resume_state #>> '{sessionState,workspaceArchive}' as prior_archive,
+          resume_state #>> '{sessionState,workspaceArchiveAt}' as prior_archive_at
+        from sandbox_leases
+        where workspace_id = ${input.workspaceId} and sandbox_group_id = ${input.sandboxGroupId}
+          and liveness = 'warm' and lease_epoch = ${input.expectedEpoch}
+        for update
+      `);
+      if (guard.length === 0) {
+        return { wrote: false, throttled: false, priorArchive: null };
+      }
+      const priorArchive = guard[0]!.prior_archive ?? null;
+      const priorAtMs = guard[0]!.prior_archive_at ? Date.parse(guard[0]!.prior_archive_at) : Number.NaN;
+      if (
+        input.minIntervalMs > 0
+        && Number.isFinite(priorAtMs)
+        && Date.now() - priorAtMs < input.minIntervalMs
+      ) {
+        return { wrote: false, throttled: true, priorArchive: null };
+      }
+      await foldWorkspaceArchiveOntoLease(scopedDb, {
+        workspaceId: input.workspaceId,
+        sandboxGroupId: input.sandboxGroupId,
+        expectedEpoch: input.expectedEpoch,
+        workspaceArchive: input.workspaceArchive,
+        livenessGuard: "warm",
+      });
+      return { wrote: true, throttled: false, priorArchive };
     });
 }
 

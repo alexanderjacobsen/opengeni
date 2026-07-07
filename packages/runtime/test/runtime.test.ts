@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { OPENAI_RESPONSES_RAW_MODEL_EVENT_SOURCE, RunContext, RunRawModelStreamEvent, getAllMcpTools, invalidateServerToolsCache } from "@openai/agents";
 import { AGENT_INSTRUCTIONS_CORE_PLACEHOLDER, DEFAULT_AGENT_INSTRUCTIONS, getSettings } from "@opengeni/config";
 import { CLEARED_RUN_STATE_BLOB } from "@opengeni/contracts";
-import { applyMissingManifestEntries, azureCliLoginCommand, azureOpenAIDefaultQuery, buildOpenGeniAgent, buildManifest, composeAgentInstructions, coreInstructions, appendToolspaceInstructions, TOOLSPACE_PROGRAMMATIC_DIRECTIVE, GENESIS_TITLE_DIRECTIVE, lazySkillSourceWithPackSkills, deserializeSandboxSessionStateEnvelope, ensureReadableStreamFrom, materializeSandboxFileDownloads, repositoryCloneCommand, repositoryUsesSandboxClone, mcpToolErrorOutput, modelResponseUsageFromSdkEvent, normalizeSdkEvent, normalizeToolOutputForEvent, prepareRunInput, stripProviderItemIdsFilter, callModelInputFilterForSettings, prefixedMcpToolName, prepareAgentTools, runAzureCliLoginHook, runRepositoryCloneHook, runToolspaceTokenSeedHook, sandboxCommandExitCode, sandboxFileDownloadsForAgent, sandboxRunAs, toolspaceTokenSeedCommand, withSandboxFileDownloads, withSandboxLifecycleHooks, SCREENSHOT_OMITTED_PLACEHOLDER, type ResolveConnectionCredentialInput, type ResolveConnectionCredentialResult } from "../src/index";
+import { applyMissingManifestEntries, pinProvidedSessionManifestEnvironment, azureCliLoginCommand, azureOpenAIDefaultQuery, buildOpenGeniAgent, buildManifest, composeAgentInstructions, coreInstructions, appendToolspaceInstructions, TOOLSPACE_PROGRAMMATIC_DIRECTIVE, GENESIS_TITLE_DIRECTIVE, lazySkillSourceWithPackSkills, deserializeSandboxSessionStateEnvelope, ensureReadableStreamFrom, materializeSandboxFileDownloads, repositoryCloneCommand, repositoryUsesSandboxClone, mcpToolErrorOutput, modelResponseUsageFromSdkEvent, normalizeSdkEvent, normalizeToolOutputForEvent, prepareRunInput, stripProviderItemIdsFilter, callModelInputFilterForSettings, prefixedMcpToolName, prepareAgentTools, runAzureCliLoginHook, runRepositoryCloneHook, runToolspaceTokenSeedHook, sandboxCommandExitCode, sandboxFileDownloadsForAgent, sandboxRunAs, toolspaceTokenSeedCommand, withSandboxFileDownloads, withSandboxLifecycleHooks, SCREENSHOT_OMITTED_PLACEHOLDER, type ResolveConnectionCredentialInput, type ResolveConnectionCredentialResult } from "../src/index";
 import { Manifest } from "@openai/agents/sandbox";
 import { startTestMcpServer, testSettings } from "@opengeni/testing";
 import type { MCPServer } from "@openai/agents";
@@ -1400,7 +1400,12 @@ describe("runtime event normalization", () => {
     expect(Object.keys(applied[0]!.entries)).toEqual(["repos/acme/two"]);
   });
 
-  test("refreshes manifest environment on resumed sandbox sessions", async () => {
+  test("refreshes manifest environment on OWNED resumed sessions and reports drift as key names", async () => {
+    // OWNED-resume refresh is a FEATURE (a workspace-env edit reaching a
+    // long-lived owned local/docker box) — owned applyManifest merges env with
+    // no guard. The drift EVENT is the durable trace; the provided-session
+    // guard fix lives in pinProvidedSessionManifestEnvironment (tested below),
+    // NOT here.
     const current = new Manifest({
       root: "/workspace",
       entries: {
@@ -1413,21 +1418,90 @@ describe("runtime event normalization", () => {
       entries: {
         "repos/acme/one": { type: "git_repo", host: "github.com", repo: "acme/one", ref: "main" },
       },
-      environment: { GH_TOKEN: "new-token" },
+      environment: { GH_TOKEN: "new-token", NEW_KEY: "added" },
     });
     const applied: Manifest[] = [];
+    const events: { type: string; payload: unknown }[] = [];
     const session = {
       state: { manifest: current },
       applyManifest: async (manifest: Manifest) => {
         applied.push(manifest);
       },
     };
-    await applyMissingManifestEntries(session as any, target);
+    await applyMissingManifestEntries(session as any, target, {
+      onRuntimeEvent: (event) => {
+        events.push(event);
+      },
+    });
+    // Env refresh applied (owned semantics preserved).
     expect(applied).toHaveLength(1);
     expect(Object.keys(applied[0]!.entries)).toEqual([]);
     expect(JSON.parse(JSON.stringify((session.state.manifest as Manifest).environment))).toMatchObject({
       GH_TOKEN: { value: "new-token" },
     });
+    // Drift rides a durable event as key names only — values are secrets.
+    expect(events).toEqual([{
+      type: "sandbox.env.drift",
+      payload: { added: ["NEW_KEY"], removed: [], changed: ["GH_TOKEN"] },
+    }]);
+    expect(JSON.stringify(events)).not.toContain("token");
+  });
+
+  test("pins provided-session agent manifests to the live box environment", async () => {
+    const agent = {
+      defaultManifest: new Manifest({
+        root: "/workspace",
+        entries: {
+          "repos/acme/one": { type: "git_repo", host: "github.com", repo: "acme/one", ref: "main" },
+        },
+        environment: { HOME: "/workspace", NEW_KEY: "fresh" },
+      }),
+    };
+    const session = {
+      state: {
+        manifest: new Manifest({
+          root: "/workspace",
+          entries: {},
+          environment: { HOME: "/workspace" },
+        }),
+      },
+    };
+    const events: { type: string; payload: unknown }[] = [];
+    await pinProvidedSessionManifestEnvironment(agent as any, session as any, {
+      onRuntimeEvent: (event) => {
+        events.push(event);
+      },
+    });
+    // The agent's manifest now declares the box's OWN env (byte-identical ->
+    // the SDK's validateNoEnvironmentDelta sees no delta), entries preserved.
+    expect(JSON.parse(JSON.stringify(agent.defaultManifest.environment))).toMatchObject({
+      HOME: { value: "/workspace" },
+    });
+    expect(JSON.parse(JSON.stringify(agent.defaultManifest.environment))).not.toHaveProperty("NEW_KEY");
+    expect(Object.keys(agent.defaultManifest.entries)).toEqual(["repos/acme/one"]);
+    expect(events).toEqual([{
+      type: "sandbox.env.drift",
+      payload: { added: ["NEW_KEY"], removed: [], changed: [] },
+    }]);
+  });
+
+  test("provided-session env pin is a no-op without drift", async () => {
+    const manifest = new Manifest({
+      root: "/workspace",
+      entries: {},
+      environment: { HOME: "/workspace" },
+    });
+    const agent = { defaultManifest: manifest };
+    const events: { type: string; payload: unknown }[] = [];
+    await pinProvidedSessionManifestEnvironment(agent as any, {
+      state: { manifest: new Manifest({ root: "/workspace", entries: {}, environment: { HOME: "/workspace" } }) },
+    } as any, {
+      onRuntimeEvent: (event) => {
+        events.push(event);
+      },
+    });
+    expect(agent.defaultManifest).toBe(manifest);
+    expect(events).toEqual([]);
   });
 
   test("normalizes serialized manifest state before applying missing entries", async () => {

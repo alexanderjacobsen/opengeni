@@ -27,9 +27,11 @@ import {
   commitWarmingToWarm,
   failWarmingToCold,
   getSandboxSessionEnvelope,
+  persistWarmSnapshot,
   readLease,
   recordWarmingSandboxCreated,
   releaseLeaseHolder,
+  touchLeaseHolder,
   SandboxLeaseSupersededError,
   type Database,
   type LeaseHolderKind,
@@ -39,6 +41,7 @@ import {
   ensureDisplayStack as ensureDisplayStackOnBox,
   desktopCapableBackend,
   serializeEstablishedSandboxEnvelope,
+  deletePriorPersistedSnapshot,
   DisplayStackError,
   DisplayStackUnsupportedError,
   buildStreamUrl,
@@ -218,6 +221,84 @@ function preserveWorkspaceArchiveOnInterimResumeState(
 }
 
 /**
+ * MID-SESSION /workspace snapshot (sandbox-file-persistence). The reaper's
+ * drain-persist only protects boxes the reaper itself kills; anything else —
+ * Modal's hard creation-time timeout catching a session busy past it, provider
+ * OOM/infra death — loses everything since the last clean drain (staging
+ * session e644e8a8, 2026-07-06: mid-turn box termination cost an unpushed
+ * branch + 2 commits). While a turn HOLDS the live box, this folds a fresh
+ * snapshot onto the lease through persistWarmSnapshot (the warm sibling of the
+ * drain seam: epoch-fenced CAS + atomic throttle re-check) and GCs the
+ * superseded snapshot image, bounding worst-case loss of ANY unclean box death
+ * to sandboxSnapshotIntervalMs.
+ *
+ * Never throws and never blocks turn progress semantics: every failure path
+ * returns false (the snapshot is protection, not a turn dependency). No-ops
+ * when the interval is 0, the backend has no persistWorkspace (selfhosted =
+ * the user's machine IS the persistence), or a snapshot newer than the
+ * interval already rides the lease.
+ */
+export async function maybePersistWarmWorkspaceSnapshot(
+  services: SandboxResumeServices,
+  ids: { accountId: string; workspaceId: string; sandboxGroupId: string },
+  session: unknown,
+  leaseEpoch: number,
+): Promise<boolean> {
+  const { db, settings } = services;
+  const intervalMs = settings.sandboxSnapshotIntervalMs;
+  if (intervalMs <= 0) {
+    return false;
+  }
+  const persistable = session as {
+    persistWorkspace?: () => Promise<Uint8Array | undefined>;
+  };
+  if (typeof persistable.persistWorkspace !== "function") {
+    return false;
+  }
+  try {
+    // Cheap throttle pre-check before the (potentially slow) capture;
+    // persistWarmSnapshot re-checks atomically under the row lock, so this is
+    // purely a cost optimization, not the correctness guard.
+    const lease = await readLease(db, ids.workspaceId, ids.sandboxGroupId);
+    if (!lease || lease.leaseEpoch !== leaseEpoch || lease.liveness !== "warm") {
+      return false;
+    }
+    const sessionState = lease.resumeState && typeof lease.resumeState === "object"
+      ? (lease.resumeState as { sessionState?: Record<string, unknown> }).sessionState
+      : undefined;
+    const priorAtRaw = sessionState && typeof sessionState === "object" ? sessionState.workspaceArchiveAt : undefined;
+    const priorAtMs = typeof priorAtRaw === "string" ? Date.parse(priorAtRaw) : Number.NaN;
+    if (Number.isFinite(priorAtMs) && Date.now() - priorAtMs < intervalMs) {
+      return false;
+    }
+    const bytes = await persistable.persistWorkspace();
+    if (!bytes || bytes.length === 0) {
+      return false;
+    }
+    const { wrote, priorArchive } = await persistWarmSnapshot(db, {
+      accountId: ids.accountId,
+      workspaceId: ids.workspaceId,
+      sandboxGroupId: ids.sandboxGroupId,
+      expectedEpoch: leaseEpoch,
+      workspaceArchive: Buffer.from(bytes).toString("base64"),
+      minIntervalMs: intervalMs,
+    });
+    if (!wrote) {
+      return false;
+    }
+    // Keep-latest-per-lease GC, same as the drain seam: best-effort delete of
+    // the superseded snapshot image while the session's client is live.
+    await deletePriorPersistedSnapshot(persistable, priorArchive);
+    return true;
+  } catch (error) {
+    // Protection, not a dependency: a failed snapshot must never fail (or slow
+    // down retrying) the turn. The next heartbeat/turn-end tick retries.
+    console.error("mid-session workspace snapshot failed (turn unaffected)", error);
+    return false;
+  }
+}
+
+/**
  * Resume the one box for a single turn (or any worker-side resume op). Returns
  * the live non-owned session + the fence epoch + a release fn. The CALLER owns
  * the lifecycle: inject non-owned, run, then `await release()` and drop the
@@ -238,11 +319,15 @@ export async function resumeBoxForTurn(
   // The release closure is created eagerly so the caller can always release in
   // finally, even if establish/commit throws after the holder was registered.
   let released = false;
+  let holderLivenessTimer: ReturnType<typeof setInterval> | undefined;
   const release = async (): Promise<void> => {
     if (released) {
       return;
     }
     released = true;
+    if (holderLivenessTimer) {
+      clearInterval(holderLivenessTimer);
+    }
     await releaseLeaseHolder(db, {
       accountId: ids.accountId,
       workspaceId: ids.workspaceId,
@@ -269,6 +354,29 @@ export async function resumeBoxForTurn(
     ...(ids.image ? { image: ids.image } : {}),
     leaseTtlMs,
   });
+
+  // HOLDER-LIVENESS loop: touch OUR holder row every 10s from the moment it is
+  // registered until release. The dead-worker turn-holder reap judges liveness
+  // by last_heartbeat_at, and the full turn heartbeat (heartbeatLeaseHolder in
+  // agent-turn) only starts AFTER this function returns — while waitForWarm,
+  // establish/cold-restore, and the display stack can legitimately run for
+  // many minutes in here, COMPOUNDING past any fixed reap horizon. With this
+  // loop no live holder is ever silent for more than one tick, so the reap
+  // horizon is pure defense-in-depth, not a tuned guess about path lengths.
+  // Epoch-free by design (touch only refreshes our own row's timestamp);
+  // best-effort (a transient DB error must never fail the resume).
+  holderLivenessTimer = setInterval(() => {
+    void touchLeaseHolder(db, {
+      accountId: ids.accountId,
+      workspaceId: ids.workspaceId,
+      sandboxGroupId: ids.sandboxGroupId,
+      kind,
+      holderId,
+    }).catch(() => undefined);
+  }, 10_000);
+  if ("unref" in holderLivenessTimer && typeof holderLivenessTimer.unref === "function") {
+    holderLivenessTimer.unref();
+  }
 
   // FENCED: a newer epoch exists (a later turn re-established the box). Back off;
   // NEVER create(). Release our (just-registered) holder so we don't pin a stale

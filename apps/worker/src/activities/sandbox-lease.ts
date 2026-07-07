@@ -33,6 +33,7 @@
 import {
   accrueWarmSeconds,
   confirmDrainCold,
+  appendSessionEvents,
   countQueuedTurns,
   countSandboxLeasesByLiveness,
   forceDrainOverLimitViewerOnlyBoxes,
@@ -40,6 +41,7 @@ import {
   listCreditBalancesByAccount,
   listLiveModalSandboxLeaseAttributions,
   listMeterableWarmLeases,
+  listSessionIdsInGroup,
   persistDrainSnapshot,
   readLease,
   reapStaleLeaseHoldersGlobal,
@@ -193,6 +195,16 @@ export function createSandboxLeaseActivities(
     // (1) The DB-only cross-workspace sweep. Returns the drainable rows.
     const drainable: ReapDrainable[] = await reapStaleLeaseHoldersGlobal(db, {
       viewerHolderTtlMs: settings.sandboxViewerHolderTtlMs,
+      // Dead-worker turn holders: a live holder is touched every 10s from the
+      // moment it is registered (resumeBoxForTurn's holder-liveness loop covers
+      // the whole warmup — waitForWarm/establish/display-stack — and the turn
+      // heartbeat covers the run), so NO live path is ever silent for more than
+      // one tick. The horizon is deliberately generous defense-in-depth (not a
+      // tuned guess about path lengths): a killed worker's frozen holder —
+      // which would otherwise pin refcount >= 1 FOREVER, so the lease never
+      // drains and the box dies at the provider hard-timeout UNPERSISTED —
+      // clears within ~12 minutes.
+      turnHolderTtlMs: settings.sandboxWarmingTimeoutMs + settings.sandboxLeaseTtlMs,
       idleGraceMs: settings.sandboxIdleGraceMs,
     });
 
@@ -467,14 +479,23 @@ async function terminateDrainableBox(
   // Same guard as confirmDrainCold (draining AND refcount=0 AND lease_epoch=
   // expected): a re-arm or newer epoch that snuck in writes ZERO rows → wrote:false
   // → the seam leaves the box RUNNING and we skip the cold-commit below.
-  const persistArchive: PersistArchiveFn = async (archiveBase64: string | null) =>
-    await persistDrainSnapshot(db, {
+  // `persisted` tracks whether a real archive landed on the lease this drain —
+  // the durable sandbox.box.terminated event below carries it, so a "terminated
+  // with NOTHING persisted" (box already dead at drain) is visible in the DB.
+  let persisted = false;
+  const persistArchive: PersistArchiveFn = async (archiveBase64: string | null) => {
+    const result = await persistDrainSnapshot(db, {
       accountId,
       workspaceId: row.workspaceId,
       sandboxGroupId: row.sandboxGroupId,
       expectedEpoch: row.leaseEpoch,
       workspaceArchive: archiveBase64,
     });
+    if (result.wrote && archiveBase64 !== null) {
+      persisted = true;
+    }
+    return result;
+  };
 
   // Resume-by-id -> persistWorkspace -> persist-onto-lease -> GC prior snapshot ->
   // provider terminate. A box that is already gone (NotFound) is success (the goal
@@ -497,6 +518,26 @@ async function terminateDrainableBox(
     sandboxGroupId: row.sandboxGroupId,
     expectedEpoch: row.leaseEpoch,
   });
+  if (wentCold) {
+    // Durable termination record (sandbox-file-persistence observability): who
+    // ended this box and whether its /workspace was captured first, appended to
+    // every session sharing the group's box. Best-effort: attribution must
+    // never affect the drain outcome.
+    try {
+      const sessionIds = await listSessionIdsInGroup(db, row.workspaceId, row.sandboxGroupId);
+      for (const sessionId of sessionIds) {
+        await appendSessionEvents(db, row.workspaceId, sessionId, [{
+          type: "sandbox.box.terminated",
+          payload: { actor: "reaper", persisted, instanceId: lease.instanceId },
+        }]);
+      }
+    } catch (eventError) {
+      observability.warn("sandbox reaper: box-terminated event write failed (drain outcome unaffected)", {
+        sandboxGroupId: row.sandboxGroupId,
+        error: eventError instanceof Error ? eventError.message : String(eventError),
+      });
+    }
+  }
   return wentCold;
 }
 

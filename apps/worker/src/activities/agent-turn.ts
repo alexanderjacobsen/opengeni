@@ -94,7 +94,7 @@ import type {
   RunAgentTurnInput,
   RunAgentTurnResult,
 } from "./types";
-import { resumeBoxForTurn, acquireSelfhostedLeaseForTurn, type ResumedTurnSandbox } from "../sandbox-resume";
+import { resumeBoxForTurn, acquireSelfhostedLeaseForTurn, maybePersistWarmWorkspaceSnapshot, type ResumedTurnSandbox } from "../sandbox-resume";
 import { wrapTurnBoxWithRouting, establishSelfhostedTurnSession, routingEnabled } from "../sandbox-routing";
 import { recordCreditMicros, runtimeMetricsHooksForObservability, turnLifecycleMetricsFor, type TurnOutcome } from "../observability-metrics";
 import { beginRecording, discardRecording, finalizeRecording, type ActiveRecording } from "./recording";
@@ -565,6 +565,14 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
     // runs it refreshes expires_at epoch-fenced so a legit multi-day turn is
     // never TTL-reaped. Cleared in finally. Only set when the flag resolved a box.
     let leaseHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
+    // MID-SESSION snapshot single-flight guard: the heartbeat tick fires every
+    // 10s but a Modal filesystem snapshot can take longer — never overlap two
+    // captures on one box. The in-flight capture's promise is held so the
+    // turn-end persist can await it (its capture predates the turn's final
+    // writes; landing after the fresher turn-end capture started would make
+    // the atomic DB throttle discard the fresher one). Interval throttling
+    // itself lives in maybePersistWarmWorkspaceSnapshot / persistWarmSnapshot.
+    let snapshotInFlight: Promise<void> | null = null;
     // P4.3 on-turn recording: when the desktop tier + recording are enabled and
     // the box is desktop-capable, the turn films the SAME :0 the agent's
     // computer-use drives, finalized to storage in this activity's `finally`
@@ -1177,6 +1185,27 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             sandboxHolderId,
           );
           setupBoxSession = resolvedSandbox.established.session;
+          // Durable box-lifecycle events (sandbox-file-persistence observability):
+          // record every box transition in session_events so the NEXT box loss is
+          // attributable from the DB alone — worker logs rotate within hours, which
+          // left both 2026-07-06 incidents without a durable trace. Best-effort.
+          {
+            const established = resolvedSandbox.established;
+            if (publish && established.origin && established.origin !== "resumed") {
+              const lifecycleEvents: Array<{ type: "sandbox.box.lost" | "sandbox.box.created"; payload: unknown }> = [];
+              if (established.lostInstanceId) {
+                lifecycleEvents.push({ type: "sandbox.box.lost", payload: { sandboxId: established.lostInstanceId } });
+              }
+              lifecycleEvents.push({
+                type: "sandbox.box.created",
+                payload: {
+                  sandboxId: established.instanceId,
+                  hydrated: established.origin === "restored" ? "archive" : "none",
+                },
+              });
+              await publish(lifecycleEvents).catch(() => undefined);
+            }
+          }
           // M7 hot-swap: when the selfhosted feature is on, wrap the established
           // group box in the STABLE routing proxy before it is injected NON-OWNED
           // into the run. The SDK binds to this ONE object once and calls its
@@ -1244,6 +1273,33 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
           })
             .then((result) => recordCreditMicros(observability, "usage", result.costMicros))
             .catch(() => undefined);
+          // MID-SESSION snapshot (sandbox-file-persistence): while the turn holds
+          // the box, fold a fresh /workspace snapshot onto the lease every
+          // sandboxSnapshotIntervalMs, so a box death the reaper never sees
+          // (Modal hard timeout mid-busy, OOM, infra) costs at most one interval
+          // of work — a legit multi-day turn is otherwise completely unprotected
+          // (the reaper only drain-persists IDLE leases). Uses the UN-proxied box
+          // session (setupBoxSession): the routing veneer could swap mid-op and a
+          // selfhosted target has no persistWorkspace anyway. Best-effort +
+          // single-flight; throttling lives in the helper.
+          const snapshotSession = setupBoxSession;
+          if (snapshotSession && !snapshotInFlight) {
+            snapshotInFlight = maybePersistWarmWorkspaceSnapshot(
+              { db, settings },
+              { accountId: input.accountId, workspaceId: input.workspaceId, sandboxGroupId: heartbeatGroupId },
+              snapshotSession,
+              heartbeatEpoch,
+            )
+              .then(async (persisted) => {
+                if (persisted && publish) {
+                  await publish([{ type: "sandbox.box.snapshot", payload: { trigger: "heartbeat" } }]);
+                }
+              })
+              .catch(() => undefined)
+              .finally(() => {
+                snapshotInFlight = null;
+              });
+          }
         }, 10_000);
         if ("unref" in leaseHeartbeatTimer && typeof leaseHeartbeatTimer.unref === "function") {
           leaseHeartbeatTimer.unref();
@@ -2384,6 +2440,32 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
         }
       }
       if (resolvedSandbox) {
+        // TURN-END mid-session snapshot (sandbox-file-persistence): fold the
+        // turn's finished /workspace onto the lease before releasing the holder,
+        // so the work this turn just produced survives any unclean box death in
+        // the idle window ahead. Throttled by the same interval as the heartbeat
+        // tick (a short turn right after a snapshot skips — bounded-loss contract
+        // is the interval, not per-turn). Best-effort and time-capped by the
+        // helper's own failure discipline; never delays release on failure.
+        if (setupBoxSession && sandboxGroupId) {
+          // Single-flight vs the heartbeat capture: the timer is already cleared
+          // above, but a capture it launched may still be in flight — and that
+          // capture predates the turn's final writes. Await it (it never
+          // rejects; its own failure discipline caps its runtime), THEN
+          // attempt; the atomic throttle decides in capture order.
+          if (snapshotInFlight) {
+            await snapshotInFlight;
+          }
+          const persisted = await maybePersistWarmWorkspaceSnapshot(
+            { db, settings },
+            { accountId: input.accountId, workspaceId: input.workspaceId, sandboxGroupId },
+            setupBoxSession,
+            resolvedSandbox.leaseEpoch,
+          );
+          if (persisted && publish) {
+            await publish([{ type: "sandbox.box.snapshot", payload: { trigger: "turn-end" } }]).catch(() => undefined);
+          }
+        }
         await resolvedSandbox.release().catch((releaseError) => {
           console.error("sandbox lease release failed (turn outcome unaffected)", releaseError);
         });

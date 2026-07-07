@@ -7,6 +7,7 @@ import {
   type CatalogIntegrationRow,
   type LogoStorage,
 } from "./import-integrations-catalog";
+import { probeCatalogSnapshot, probeMcpEndpoint } from "./integrations-catalog-probe";
 
 const fixtureUrl = new URL("./fixtures/integrations-catalog-sample.json", import.meta.url);
 
@@ -16,7 +17,7 @@ describe("integrations.sh catalog import normalization", () => {
     const normalized = normalizeCatalogSnapshot(snapshot);
 
     expect(normalized.generatedAt).toBe("2026-07-03T23:41:44.132Z");
-    expect(normalized.rows).toHaveLength(11);
+    expect(normalized.rows).toHaveLength(8);
     expect(normalized.quarantined).toHaveLength(1);
     expect(normalized.quarantined[0]?.row.domain).toBe("activepieces.com");
     expect(normalized.quarantined[0]?.reason).toContain("manual confirmation");
@@ -30,8 +31,10 @@ describe("integrations.sh catalog import normalization", () => {
     expect(acko?.authKind).toBe("none");
 
     const bump = normalized.rows.filter((row) => row.domain === "bump.sh");
-    expect(bump).toHaveLength(3);
-    expect(new Set(bump.map((row) => row.mcpUrl)).size).toBe(3);
+    expect(bump).toHaveLength(1);
+    expect(bump[0]?.mcpUrl).toBe("https://developers.bump.sh/doc/portal/mcp");
+    expect(normalized.skipped.filter((skip) => skip.domain === "bump.sh" && skip.reason === "duplicate_domain_name"))
+      .toHaveLength(2);
   });
 
   test("applies importability filters and dedupes by domain plus MCP URL", () => {
@@ -59,6 +62,64 @@ describe("integrations.sh catalog import normalization", () => {
       "templated_url",
       "transport_not_streamable_http",
     ].sort());
+  });
+
+  test("strips raw control characters from all string fields", () => {
+    const normalized = normalizeCatalogSnapshot({
+      generatedAt: "2026-07-03T00:00:00.000Z",
+      importRows: [
+        row({
+          domain: "control.example\u0000",
+          name: "Control\u0007 Example",
+          mcpUrl: "https://control.example/mcp\u0001",
+          scopesHint: ["read\u0002write", "keeps\ttab\nnewline"],
+          credentialFacts: [{ setup: "bad\u001Fvalue" }],
+        }),
+      ],
+    });
+
+    expect(normalized.cleaning.controlCharacterFields).toBe(6);
+    expect(normalized.rows[0]).toMatchObject({
+      domain: "control.example",
+      name: "Control Example",
+      mcpUrl: "https://control.example/mcp",
+      scopesHint: ["readwrite", "keeps\ttab\nnewline"],
+      credentialFacts: [{ setup: "badvalue" }],
+    });
+  });
+
+  test("dedupes junk clusters by normalized domain plus name and keeps the best row", () => {
+    const normalized = normalizeCatalogSnapshot({
+      generatedAt: "2026-07-03T00:00:00.000Z",
+      importRows: [
+        row({
+          domain: "games.example",
+          name: "ABC Word Search",
+          mcpUrl: "https://games.example/discovered/mcp",
+          provenance: "discovered",
+          logoSourceUrl: null,
+        }),
+        row({
+          domain: "GAMES.EXAMPLE",
+          name: "abc   word search",
+          mcpUrl: "https://games.example/detected/mcp",
+          provenance: "detected",
+          logoSourceUrl: "https://integrations.sh/logo/games.example",
+        }),
+        row({
+          domain: "games.example",
+          name: "ABC Word Search",
+          mcpUrl: "https://games.example/other/mcp",
+          provenance: "discovered",
+          logoSourceUrl: "https://integrations.sh/logo/games.example",
+        }),
+      ],
+    });
+
+    expect(normalized.rows).toHaveLength(1);
+    expect(normalized.rows[0]?.mcpUrl).toBe("https://games.example/detected/mcp");
+    expect(normalized.cleaning.duplicateDomainNameRows).toBe(2);
+    expect(normalized.skipped.filter((skip) => skip.reason === "duplicate_domain_name")).toHaveLength(2);
   });
 
   test("derives rows from raw API plus per-domain surface docs", () => {
@@ -181,6 +242,90 @@ describe("integrations.sh logo storage", () => {
     });
     expect(failedFetch.ok).toBe(false);
     expect(!failedFetch.ok && failedFetch.reason).toBe("fetch_failed:network down");
+  });
+});
+
+describe("integrations.sh MCP endpoint probe", () => {
+  test("classifies a 200 JSON-RPC initialize response as real MCP", async () => {
+    const outcome = await probeMcpEndpoint("https://mcp.example/mcp", {
+      fetchImpl: async () => new Response(JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        result: { protocolVersion: "2025-03-26", capabilities: {}, serverInfo: { name: "Example", version: "1" } },
+      }), { status: 200, headers: { "content-type": "application/json" } }),
+    });
+
+    expect(outcome).toMatchObject({ status: "real", reason: "mcp_json_rpc", httpStatus: 200 });
+  });
+
+  test("classifies auth-gated MCP endpoints with WWW-Authenticate as real", async () => {
+    const outcome = await probeMcpEndpoint("https://linear.example/mcp", {
+      fetchImpl: async () => new Response("Unauthorized", {
+        status: 401,
+        headers: { "www-authenticate": "Bearer resource_metadata=\"https://linear.example/.well-known/oauth-protected-resource\"" },
+      }),
+    });
+
+    expect(outcome).toMatchObject({ status: "real", reason: "auth_challenge", httpStatus: 401 });
+  });
+
+  test("classifies 404s, HTML, generic JSON, and DNS failures as junk", async () => {
+    await expect(probeMcpEndpoint("https://missing.example/mcp", {
+      fetchImpl: async () => new Response("not found", { status: 404 }),
+    })).resolves.toMatchObject({ status: "junk", reason: "http_not_found" });
+
+    await expect(probeMcpEndpoint("https://html.example/mcp", {
+      fetchImpl: async () => new Response("<!doctype html><title>No MCP</title>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      }),
+    })).resolves.toMatchObject({ status: "junk", reason: "html_response" });
+
+    await expect(probeMcpEndpoint("https://api.example/mcp", {
+      fetchImpl: async () => new Response(JSON.stringify({ kind: "gmail#profile", emailAddress: "me@example.com" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    })).resolves.toMatchObject({ status: "junk", reason: "non_mcp_json" });
+
+    await expect(probeMcpEndpoint("https://dns.example/mcp", {
+      fetchImpl: async () => { throw new Error("getaddrinfo ENOTFOUND dns.example"); },
+    })).resolves.toMatchObject({ status: "junk", reason: "connection_error" });
+  });
+
+  test("filters junk rows while keeping unverified rows with probe metadata", async () => {
+    const normalized = normalizeCatalogSnapshot({
+      generatedAt: "2026-07-03T00:00:00.000Z",
+      importRows: [
+        row({ domain: "real.example", mcpUrl: "https://real.example/mcp" }),
+        row({ domain: "gmail.googleapis.com", mcpUrl: "https://gmail.googleapis.com/mcp" }),
+        row({ domain: "maybe.example", mcpUrl: "https://maybe.example/mcp" }),
+      ],
+    });
+    const probed = await probeCatalogSnapshot(normalized, {
+      concurrency: 2,
+      fetchImpl: async (input) => {
+        const url = String(input);
+        if (url.includes("real.example")) {
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { capabilities: {} } }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (url.includes("googleapis.com")) {
+          return new Response("not found", { status: 404 });
+        }
+        return new Response("busy", { status: 503 });
+      },
+    });
+
+    expect(probed.rows.map((candidate) => candidate.domain)).toEqual(["maybe.example", "real.example"]);
+    expect(probed.probe).toMatchObject({ kept: 2, dropped: 1, real: 1, unverified: 1, googleapisDropped: 1 });
+    expect(probed.rows.find((candidate) => candidate.domain === "maybe.example")?.probe)
+      .toMatchObject({ status: "unverified", reason: "http_status", httpStatus: 503 });
+    expect(probed.skipped.find((skip) => skip.domain === "gmail.googleapis.com")).toMatchObject({
+      reason: "probe_http_not_found",
+    });
   });
 });
 

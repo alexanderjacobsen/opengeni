@@ -1078,6 +1078,7 @@ function fabricateWorkspace(name: string): Workspace {
     externalSource: null,
     externalId: null,
     agentInstructions: null,
+    settings: {},
     createdAt: now,
     updatedAt: now,
   };

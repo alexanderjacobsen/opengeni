@@ -9720,7 +9720,16 @@ export async function finishTurn(db: Database, workspaceId: string, turnId: stri
  * without a fresh claim, so the row still carries the approval-wait status
  * while the rerun activity executes.
  */
-export async function requeuePreemptedTurn(db: Database, workspaceId: string, turnId: string, triggerEventId: string): Promise<void> {
+export async function requeuePreemptedTurn(
+  db: Database,
+  workspaceId: string,
+  turnId: string,
+  triggerEventId: string,
+  // Prior statuses the reset is allowed to match. Defaults to the live-turn
+  // set; the worker-death redispatch also passes "cancelled" so it can reset a
+  // turn the dying attempt stamped `cancelled` in its CancelledFailure cleanup.
+  fromStatuses: string[] = ["running", "requires_action"],
+): Promise<void> {
   await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
     const [row] = await scopedDb.update(schema.sessionTurns).set({
       status: "queued",
@@ -9728,7 +9737,7 @@ export async function requeuePreemptedTurn(db: Database, workspaceId: string, tu
       startedAt: null,
       finishedAt: null,
       updatedAt: new Date(),
-    }).where(and(eq(schema.sessionTurns.workspaceId, workspaceId), eq(schema.sessionTurns.id, turnId), inArray(schema.sessionTurns.status, ["running", "requires_action"]))).returning({ id: schema.sessionTurns.id });
+    }).where(and(eq(schema.sessionTurns.workspaceId, workspaceId), eq(schema.sessionTurns.id, turnId), inArray(schema.sessionTurns.status, fromStatuses))).returning({ id: schema.sessionTurns.id });
     if (!row) {
       throw new Error(`Preemptible session turn not found: ${turnId}`);
     }
@@ -9761,6 +9770,37 @@ export async function incrementTurnWorkerDeathRedispatches(db: Database, workspa
       throw new Error(`Session turn not found: ${turnId}`);
     }
     return Number(count);
+  });
+}
+
+/**
+ * Settle a turn `cancelled` from a DYING attempt (the generic CancelledFailure
+ * cleanup of a worker that lost its heartbeat), fenced so a zombie can never
+ * clobber a turn that worker-death recovery has already moved on. It only
+ * writes when BOTH hold:
+ *   • the turn is still live (running / requires_action) — not a turn recovery
+ *     already reset to `queued`; and
+ *   • the redispatch counter is unchanged since this dispatch started —
+ *     requeueTurnAfterWorkerDeath bumps it BEFORE re-queuing, so a mismatch
+ *     means a successor dispatch owns the turn now (do not touch it).
+ * Returns true when it actually settled (caller emits turn.cancelled only then).
+ */
+export async function cancelTurnFromDyingDispatch(
+  db: Database,
+  workspaceId: string,
+  turnId: string,
+  expectedRedispatches: number,
+): Promise<boolean> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const rows = await scopedDb.execute(sql`
+      update session_turns
+      set status = 'cancelled', finished_at = now(), updated_at = now()
+      where workspace_id = ${workspaceId} and id = ${turnId}
+        and status in ('running', 'requires_action')
+        and coalesce((metadata->>'workerDeathRedispatches')::int, 0) = ${expectedRedispatches}
+      returning id
+    `);
+    return rows.length > 0;
   });
 }
 

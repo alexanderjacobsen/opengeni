@@ -38,6 +38,7 @@ import {
   TerminalSessionBanner,
   UserMessageBody,
 } from "@/components/session/banners";
+import { ComposerAgentsPill } from "@/components/session/composer-agents-pill";
 import { GoalSurface } from "@/components/session/goal-surface";
 import { SessionInspector } from "@/components/session/inspector";
 import { QueueRail } from "@/components/session/queue-rail";
@@ -53,6 +54,7 @@ import { useCodexModels } from "@/lib/use-codex-models";
 import { normalizeProviderDomain } from "@/lib/capabilities";
 import { isTerminalSessionStatus, projectSessionTimeline, summarizeSessionFailure } from "@/lib/events";
 import { buildTools } from "@/lib/session-tools";
+import type { LineageNode } from "@opengeni/sdk";
 import type { ConnectionMetadata, Session, SessionEvent } from "@/types";
 
 export function SessionRoute({ workspaceId, sessionId }: { workspaceId: string; sessionId: string }) {
@@ -262,6 +264,15 @@ export function SessionRoute({ workspaceId, sessionId }: { workspaceId: string; 
     (mcpServerId: string) => capabilityNames.get(mcpServerId) ?? null,
     [capabilityNames],
   );
+  // One lineage read for the whole session view: it gates the dock's "Agents"
+  // tab AND feeds the composer-anchored agents pill, so both stay a single
+  // source of truth. Events refresh it instantly on spawn/worker-completion, and
+  // a 30s poll (matching the old header chip) is the fallback so the pill's
+  // "running" count doesn't go stale on CHILD-side status changes that emit no
+  // event on this parent's feed. Must sit above the loading/error early-returns
+  // — it's a hook, so it has to run unconditionally on every render.
+  const lineage = useSessionLineage(sessionId, { events, pollIntervalMs: 30_000 });
+  const agentNodes = lineage.lineage?.children ?? [];
 
   if (loading || !session) {
     if (loadError) {
@@ -292,6 +303,7 @@ export function SessionRoute({ workspaceId, sessionId }: { workspaceId: string; 
       failure={failure}
       creditExhausted={creditExhausted}
       goal={goal}
+      agentNodes={agentNodes}
       hasOlder={hasOlder}
       loadingOlder={loadingOlder}
       onLoadOlder={loadOlder}
@@ -317,6 +329,8 @@ export function SessionRoute({ workspaceId, sessionId }: { workspaceId: string; 
         queue={queue}
         goal={goal}
         connectionState={connectionState}
+        agentNodes={agentNodes}
+        agentsLoading={lineage.loading}
         primary={chatPane}
         dockCollapsed={!context.inspectorOpen}
         onDockCollapsedChange={(collapsed) => context.setInspectorOpen(!collapsed)}
@@ -347,6 +361,9 @@ function SessionDock(props: {
   queue: ReturnType<typeof useTurnQueue>;
   goal: ReturnType<typeof useGoal>;
   connectionState: ReturnType<typeof useSessionEvents>["connectionState"];
+  /** Spawned-worker lineage — read once by SessionRoute, shared here + the pill. */
+  agentNodes: LineageNode[];
+  agentsLoading: boolean;
   primary: React.ReactNode;
   dockCollapsed: boolean;
   onDockCollapsedChange: (collapsed: boolean) => void;
@@ -373,13 +390,13 @@ function SessionDock(props: {
     content: <SessionInspector session={props.session} events={props.events} connectionState={props.connectionState} />,
   };
 
-  // The decoupled home for spawned workers (#318): one live lineage read (shared-
-  // feed via the dock's own event stream, no extra poll) gates the "Agents" tab
-  // and feeds its panel. The tab is present only once the session has children,
-  // so a goal-less session still surfaces its agents here. Injected right after
-  // Run (before the package's sandbox tabs) to preserve #318's dock order.
-  const lineage = useSessionLineage(props.sessionId, { events: props.events });
-  const childNodes = lineage.lineage?.children ?? [];
+  // The decoupled home for spawned workers (#318): SessionRoute owns the single
+  // lineage read and passes the children in (props.agentNodes), so the "Agents"
+  // tab AND the composer-anchored pill stay one source of truth. The tab is
+  // present only once the session has children, so a goal-less session still
+  // surfaces its agents here. Injected right after Run (before the package's
+  // sandbox tabs) to preserve #318's dock order.
+  const childNodes = props.agentNodes;
   const agentsTab: WorkspaceTab | null =
     childNodes.length > 0
       ? {
@@ -394,7 +411,7 @@ function SessionDock(props: {
             <AgentsPanel
               workspaceId={props.workspaceId}
               nodes={childNodes}
-              loading={lineage.loading && childNodes.length === 0}
+              loading={props.agentsLoading && childNodes.length === 0}
             />
           ),
         }
@@ -426,6 +443,8 @@ function SessionChatPane(props: {
   /** The last turn ended budget_exhausted — the workspace is out of credits. */
   creditExhausted: boolean;
   goal: ReturnType<typeof useGoal>;
+  /** Spawned-worker lineage children — feeds the composer-anchored agents pill. */
+  agentNodes: LineageNode[];
   hasOlder: boolean;
   loadingOlder: boolean;
   onLoadOlder: () => Promise<boolean>;
@@ -611,10 +630,15 @@ function SessionChatPane(props: {
         </div>
       ) : null}
 
-      {/* The floating goal pill hovers just above the composer (hidden when the
-          session has no goal). */}
+      {/* Front-and-center floating pills above the composer: the agents pill
+          (spawned workers, with a live running indicator) stacks over the goal
+          pill. Each hides when it has nothing to show, so they degrade to
+          whichever one is present — or neither. */}
       {!terminal ? (
-        <GoalSurface session={props.session} goal={props.goal} />
+        <>
+          <ComposerAgentsPill workspaceId={props.session.workspaceId} nodes={props.agentNodes} />
+          <GoalSurface session={props.session} goal={props.goal} />
+        </>
       ) : null}
 
       <div className="shrink-0 px-4 pb-4 pt-1 sm:px-6">

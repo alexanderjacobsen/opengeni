@@ -150,7 +150,7 @@ export class MockOpenGeniClient implements SessionClientLike {
     const children = sessionId === MANAGER_SESSION_ID
       ? [{ session: this.fabricateSession(WORKER_SESSION_ID, "running", "Worker session"), children: [] }]
       : [];
-    return { ancestors: [], children };
+    return { ancestors: [], children, truncated: false };
   }
 
   async updateSession(_workspaceId: string, sessionId: string, request: UpdateSessionRequest): Promise<Session> {
@@ -311,6 +311,14 @@ export class MockOpenGeniClient implements SessionClientLike {
     this.goals.set(sessionId, goal);
     this.bus(sessionId).append(request.status === "paused" ? "goal.paused" : "goal.resumed", { goalId: goal.id });
     return { ...goal };
+  }
+
+  async deleteGoal(_workspaceId: string, sessionId: string): Promise<void> {
+    const goal = this.goals.get(sessionId);
+    this.goals.delete(sessionId);
+    if (goal) {
+      this.bus(sessionId).append("goal.cleared", { goalId: goal.id });
+    }
   }
 
   async clearSessionContext(_workspaceId: string, sessionId: string): Promise<void> {

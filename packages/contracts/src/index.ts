@@ -2582,6 +2582,7 @@ export const LineageNode: z.ZodType<LineageNode> = z.lazy(() => z.object({
 export const SessionLineageResponse = z.object({
   ancestors: z.array(Session),
   children: z.array(LineageNode),
+  truncated: z.boolean().default(false),
 });
 export type SessionLineageResponse = z.infer<typeof SessionLineageResponse>;
 
@@ -2619,6 +2620,7 @@ export const SessionEventType = z.enum([
   "goal.completed",
   "goal.paused",
   "goal.resumed",
+  "goal.cleared",
   "goal.continuation",
   "memory.saved",
   "memory.corrected",

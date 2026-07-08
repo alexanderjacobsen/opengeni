@@ -254,12 +254,17 @@ export function buildTimeline(events: SessionEvent[]): TimelineItem[] {
       case "sandbox.operation.failed": {
         const name = typeof payload.name === "string" ? payload.name : "sandbox";
         const status = event.type.endsWith(".failed") ? "failed" : event.type.endsWith(".completed") ? "complete" : "running";
-        // Routine repository-clone operations are per-turn platform plumbing (an
-        // idempotent clone check + off-manifest token re-seed runs before EVERY
-        // turn on a repo-attached session) — rendering them reads as the agent
-        // redoing work each turn. Only failures surface, and they surface loudly:
-        // the failed event below creates its own item even without a started row.
-        if (name === "repository-clone" && status !== "failed") {
+        // Routine per-turn platform plumbing that runs before EVERY turn to
+        // guarantee box contents survive a re-warm — NOT the agent redoing work:
+        //   - repository-clone: idempotent clone check + off-manifest token re-seed;
+        //   - file-resource-download: idempotent `if [ ! -f ] then curl` (skips
+        //     when the attached file is already on the box — see
+        //     sandboxFileDownloadCommand), so an uploaded image is not re-fetched;
+        //     the operation still emits every turn even when it does nothing.
+        // Rendering either every turn reads as churn. Only FAILURES surface, and
+        // they surface loudly — the failed event below creates its own item even
+        // without a started row.
+        if ((name === "repository-clone" || name === "file-resource-download") && status !== "failed") {
           break;
         }
         const existing = findOpenSandbox(items, name);
@@ -436,6 +441,7 @@ export function buildTimeline(events: SessionEvent[]): TimelineItem[] {
       case "goal.completed":
       case "goal.paused":
       case "goal.resumed":
+      case "goal.cleared":
       case "goal.continuation": {
         items.push({
           kind: "goal",
@@ -865,7 +871,13 @@ function workerCompletionPayload(value: unknown): {
   pausedReason: string | null;
 } | null {
   const payload = asRecord(value);
-  if (typeof payload.childSessionId !== "string" || typeof payload.status !== "string") {
+  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (
+    typeof payload.childSessionId !== "string"
+    || !uuidPattern.test(payload.childSessionId)
+    || typeof payload.status !== "string"
+    || payload.status.trim() === ""
+  ) {
     return null;
   }
   const goal = asRecord(payload.goal);

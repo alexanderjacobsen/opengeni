@@ -394,6 +394,7 @@ export type LineageNode = {
 export type SessionLineageResponse = {
   ancestors: SessionSummary[];
   children: LineageNode[];
+  truncated: boolean;
 };
 
 export type SessionTurnStatus =
@@ -462,6 +463,7 @@ export const SESSION_EVENT_TYPES = [
   "goal.completed",
   "goal.paused",
   "goal.resumed",
+  "goal.cleared",
   "goal.continuation",
   "memory.saved",
   "memory.corrected",

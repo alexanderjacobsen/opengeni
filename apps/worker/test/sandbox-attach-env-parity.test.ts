@@ -65,6 +65,9 @@ describe("attach-vs-turn manifest-environment parity (no repo attached)", () => 
     // TOKEN-BROKER (B1): the STABLE token FILE PATH rides the shared base, so it is
     // present + IDENTICAL on both manifests (the token VALUE never does).
     expect(attachEnv.OPENGENI_GIT_TOKEN_FILE).toBe("/workspace/.opengeni/git-token");
+    expect(attachEnv.OPENGENI_GIT_CREDENTIALS_DIR).toBe("/workspace/.opengeni/git-credentials");
+    expect(attachEnv.OPENGENI_GIT_CLI_WRAPPER_DIR).toBe("/workspace/.opengeni/bin");
+    expect(attachEnv.PATH?.split(":")[0]).toBe("/workspace/.opengeni/bin");
     expect(turnEnv.OPENGENI_GIT_TOKEN_FILE).toBe("/workspace/.opengeni/git-token");
   });
 
@@ -88,6 +91,19 @@ describe("attach-vs-turn manifest-environment parity (no repo attached)", () => 
     expect(attachEnv.HOME).toBe("/workspace");
   });
 
+  test("selfhosted stable env does not gain managed-sandbox git helper pointers", async () => {
+    const settings = testSettings({ sandboxBackend: "selfhosted" });
+    const { environment: turnEnv } = await sandboxEnvironmentForRun(settings, [], {});
+    const attachEnv = stableSandboxEnvironmentForRun(settings, {});
+
+    expect(turnEnv).toEqual({ HOME: "/" });
+    expect(attachEnv).toEqual(turnEnv);
+    expect(turnEnv.OPENGENI_GIT_CREDENTIALS_DIR).toBeUndefined();
+    expect(turnEnv.OPENGENI_GIT_TOKEN_FILE).toBeUndefined();
+    expect(turnEnv.OPENGENI_GIT_CLI_WRAPPER_DIR).toBeUndefined();
+    expect(turnEnv.PATH).toBeUndefined();
+  });
+
   test("FAILURE-SENSITIVITY: the OLD attach env (base allowlist only) DOES delta", async () => {
     // This reproduces the original bug: an attach-warmed box created with only the
     // base env (the pre-fix establishSandboxSessionFromEnvelope default) is missing
@@ -104,11 +120,12 @@ describe("attach-vs-turn manifest-environment parity (no repo attached)", () => 
   });
 });
 
-// TOKEN-BROKER (B1): a repo-attached turn no longer layers the rotating GitHub token
-// (or the extraheader) onto the manifest env — the token is returned as `gitToken`
-// (seeded off-manifest to the box token file). The manifest carries ONLY the stable
-// pointers (GIT_ASKPASS, GIT_TERMINAL_PROMPT, identity, and — from the shared base —
-// OPENGENI_GIT_TOKEN_FILE), so it stays attach-reproducible and the SDK sees no delta.
+// TOKEN-BROKER (B1): a repo-attached turn no longer layers rotating git provider
+// tokens (or extraheaders) onto the manifest env. Tokens are returned separately
+// (`gitToken` is the GitHub alias) and seeded off-manifest to box token files. The
+// manifest carries ONLY stable pointers (GIT_ASKPASS, GIT_TERMINAL_PROMPT,
+// identity, OPENGENI_GIT_CREDENTIALS_DIR, and OPENGENI_GIT_TOKEN_FILE), so it
+// stays attach-reproducible and the SDK sees no delta.
 describe("repo-attached turn: token VALUE is OFF the manifest, only the FILE PATH is on it", () => {
   // A repo-attached turn mints a REAL GitHub App token via the network; the clean
   // test env has no app configured, so we exercise the SKIP path (which returns the
@@ -128,7 +145,7 @@ describe("repo-attached turn: token VALUE is OFF the manifest, only the FILE PAT
     // exact manifest a machine-effective repo turn declares; a cloud repo turn adds
     // GIT_ASKPASS/GIT_TERMINAL_PROMPT on top but STILL no GH_TOKEN/GITHUB_TOKEN/
     // GIT_CONFIG_* (those keys were removed by the token broker).
-    const { environment: turnEnv, gitToken } = await sandboxEnvironmentForRun(
+    const { environment: turnEnv, gitToken, gitTokens } = await sandboxEnvironmentForRun(
       settings,
       [repoResource],
       {},
@@ -138,15 +155,24 @@ describe("repo-attached turn: token VALUE is OFF the manifest, only the FILE PAT
     // The rotating token keys are ABSENT from the manifest env (the broker removed them).
     expect(turnEnv.GH_TOKEN).toBeUndefined();
     expect(turnEnv.GITHUB_TOKEN).toBeUndefined();
+    expect(turnEnv.GITLAB_TOKEN).toBeUndefined();
+    expect(turnEnv.AZURE_DEVOPS_EXT_PAT).toBeUndefined();
+    expect(turnEnv.OPENGENI_GIT_TOKEN_SEED).toBeUndefined();
+    expect(turnEnv.OPENGENI_GIT_GITHUB_TOKEN_SEED).toBeUndefined();
+    expect(turnEnv.OPENGENI_GIT_GITLAB_TOKEN_SEED).toBeUndefined();
+    expect(turnEnv.OPENGENI_GIT_AZURE_DEVOPS_TOKEN_SEED).toBeUndefined();
     expect(turnEnv.GIT_CONFIG_COUNT).toBeUndefined();
     expect(turnEnv.GIT_CONFIG_KEY_0).toBeUndefined();
     expect(turnEnv.GIT_CONFIG_VALUE_0).toBeUndefined();
     // No token was minted on the skip path.
     expect(gitToken).toBeUndefined();
+    expect(gitTokens).toBeUndefined();
 
     // The STABLE token FILE PATH matches the attach base (parity-safe pointer).
     const attachEnv = stableSandboxEnvironmentForRun(settings, {});
     expect(turnEnv.OPENGENI_GIT_TOKEN_FILE).toBe("/workspace/.opengeni/git-token");
+    expect(turnEnv.OPENGENI_GIT_CREDENTIALS_DIR).toBe("/workspace/.opengeni/git-credentials");
+    expect(turnEnv.OPENGENI_GIT_CLI_WRAPPER_DIR).toBe("/workspace/.opengeni/bin");
     expect(turnEnv.OPENGENI_GIT_TOKEN_FILE).toBe(attachEnv.OPENGENI_GIT_TOKEN_FILE);
     expect(hasNoEnvironmentDelta(attachEnv, turnEnv)).toBe(true);
   });

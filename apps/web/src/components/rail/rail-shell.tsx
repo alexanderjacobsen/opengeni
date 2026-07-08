@@ -17,7 +17,7 @@ import { CollapsedSessionsButton, SessionList } from "@/components/rail/session-
 import { SwitcherBlock } from "@/components/rail/switcher-block";
 import { SessionSandboxSwitcher } from "@/components/session/sandbox-switcher";
 import { CodexAccountIndicator } from "@/components/session/codex-account-indicator";
-import { SessionAgentsChip, SpawnedByBreadcrumb } from "@/components/session/goal-surface";
+import { SessionAgentsChip, SpawnedByBreadcrumb } from "@/components/session/subagents";
 import { WorkspaceNav } from "@/components/rail/workspace-nav";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
@@ -296,7 +296,7 @@ function CanvasTopStrip({ hamburgerRef }: { hamburgerRef: RefObject<HTMLButtonEl
           <div className="flex shrink-0 items-center gap-1.5">
             {/* Sessions that spawned workers surface an "N agents" chip opening
                 the shared subagent lineage panel. */}
-            <SessionAgentsChip workspaceId={context.session.workspaceId} nodes={childNodes} loading={lineage.loading} />
+            <SessionAgentsChip workspaceId={context.session.workspaceId} nodes={childNodes} />
             <ConnectionPill state={context.connectionState} />
             <SessionStatusBadge status={context.session.status} />
             {context.keyAuthRequired ? (

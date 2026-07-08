@@ -41,13 +41,13 @@ import {
 import { GoalSurface } from "@/components/session/goal-surface";
 import { SessionInspector } from "@/components/session/inspector";
 import { QueueRail } from "@/components/session/queue-rail";
-import { useSandboxWorkspaceTabs } from "@/components/session/sandbox-workspace";
+import { SessionWorkspace } from "@/components/session/sandbox-workspace";
 import { AgentsPanel } from "@/components/session/subagents";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Notice } from "@/components/ui/notice";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { WorkspaceDock, type WorkspaceTab } from "@opengeni/react";
+import type { WorkspaceTab } from "@opengeni/react";
 import { useAppContext } from "@/context";
 import { useCodexModels } from "@/lib/use-codex-models";
 import { normalizeProviderDomain } from "@/lib/capabilities";
@@ -351,73 +351,65 @@ function SessionDock(props: {
   dockCollapsed: boolean;
   onDockCollapsedChange: (collapsed: boolean) => void;
 }) {
-  // Track the dock's active tab so the Files surface can hold the box WARM only
-  // while it's actually on screen (fast ~100ms Channel-A ops instead of a cold
-  // ~5s resume per list/write). Default to the dock's first tab ("run").
-  const [activeTab, setActiveTab] = useState<string>("run");
-  const { tabs: sandboxTabs } = useSandboxWorkspaceTabs({
-    workspaceId: props.workspaceId,
-    sessionId: props.sessionId,
-    events: props.events,
-    filesActive: !props.dockCollapsed && activeTab === "files",
-  });
+  // The workbench (Changes | Files | Terminal | Desktop + machine chip) lives in
+  // the package now; the app injects its Run + Debug tabs around it. The Files
+  // warm-hold + active-tab tracking are handled inside <SandboxWorkspace>.
+  const runTab: WorkspaceTab = {
+    id: "run",
+    label: "Run",
+    content: (
+      <ScrollArea className="h-full min-w-0">
+        <div className="min-w-0 space-y-5 p-3">
+          {/* The goal moved to the floating GoalSurface above the composer; the
+              Run tab is the turn queue only. */}
+          <QueueRail queue={props.queue} sessionStatus={props.session.status} />
+        </div>
+      </ScrollArea>
+    ),
+  };
+  const debugTab: WorkspaceTab = {
+    id: "debug",
+    label: "Debug",
+    content: <SessionInspector session={props.session} events={props.events} connectionState={props.connectionState} />,
+  };
 
-  // The decoupled home for spawned workers: one live lineage read (shared-feed
-  // via the dock's own event stream, no extra poll) gates the "Agents" tab and
-  // feeds its panel. The tab is present only once the session has children, so a
-  // goal-less session still surfaces its agents here.
+  // The decoupled home for spawned workers (#318): one live lineage read (shared-
+  // feed via the dock's own event stream, no extra poll) gates the "Agents" tab
+  // and feeds its panel. The tab is present only once the session has children,
+  // so a goal-less session still surfaces its agents here. Injected right after
+  // Run (before the package's sandbox tabs) to preserve #318's dock order.
   const lineage = useSessionLineage(props.sessionId, { events: props.events });
   const childNodes = lineage.lineage?.children ?? [];
-
-  const tabs: WorkspaceTab[] = [
-    {
-      id: "run",
-      label: "Run",
-      content: (
-        <ScrollArea className="h-full min-w-0">
-          <div className="min-w-0 space-y-5 p-3">
-            {/* The goal moved to the floating GoalSurface above the composer; the
-                Run tab is the turn queue only. */}
-            <QueueRail queue={props.queue} sessionStatus={props.session.status} />
-          </div>
-        </ScrollArea>
-      ),
-    },
-    ...(childNodes.length > 0
-      ? [
-          {
-            id: "agents",
-            label: "Agents",
-            badge: (
-              <span className="rounded-sm bg-og-accent-soft px-1 text-2xs text-og-fg-muted">
-                {childNodes.length}
-              </span>
-            ),
-            content: (
-              <AgentsPanel
-                workspaceId={props.workspaceId}
-                nodes={childNodes}
-                loading={lineage.loading && childNodes.length === 0}
-              />
-            ),
-          } satisfies WorkspaceTab,
-        ]
-      : []),
-    ...sandboxTabs,
-    {
-      id: "debug",
-      label: "Debug",
-      content: <SessionInspector session={props.session} events={props.events} connectionState={props.connectionState} />,
-    },
-  ];
+  const agentsTab: WorkspaceTab | null =
+    childNodes.length > 0
+      ? {
+          id: "agents",
+          label: "Agents",
+          badge: (
+            <span className="rounded-sm bg-og-accent-soft px-1 text-2xs text-og-fg-muted">
+              {childNodes.length}
+            </span>
+          ),
+          content: (
+            <AgentsPanel
+              workspaceId={props.workspaceId}
+              nodes={childNodes}
+              loading={lineage.loading && childNodes.length === 0}
+            />
+          ),
+        }
+      : null;
+  const leadingTabs: WorkspaceTab[] = agentsTab ? [runTab, agentsTab] : [runTab];
 
   return (
-    <WorkspaceDock
+    <SessionWorkspace
+      workspaceId={props.workspaceId}
+      sessionId={props.sessionId}
+      events={props.events}
       primary={props.primary}
-      tabs={tabs}
-      autoSaveId="og.session.dock"
-      activeTab={activeTab}
-      onActiveTabChange={setActiveTab}
+      leadingTabs={leadingTabs}
+      trailingTabs={[debugTab]}
+      initialTab="run"
       collapsed={props.dockCollapsed}
       onCollapsedChange={props.onDockCollapsedChange}
     />

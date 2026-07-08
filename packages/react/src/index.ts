@@ -37,8 +37,19 @@ export { useWorkspaceSessions } from "./hooks/use-workspace-sessions";
 export type { UseWorkspaceSessionsOptions, UseWorkspaceSessionsResult } from "./hooks/use-workspace-sessions";
 export { useSessionLineage, isLineageRefreshEvent } from "./hooks/use-session-lineage";
 export type { UseSessionLineageOptions, UseSessionLineageResult } from "./hooks/use-session-lineage";
-export { useEnvironments } from "./hooks/use-environments";
-export type { UseEnvironmentsOptions, UseEnvironmentsResult } from "./hooks/use-environments";
+export { useVariableSets, useEnvironments } from "./hooks/use-environments";
+export type { UseVariableSetsOptions, UseVariableSetsResult, UseEnvironmentsOptions, UseEnvironmentsResult } from "./hooks/use-environments";
+export { useRigs, useRig, useRigVersions, useRigChanges } from "./hooks/use-rigs";
+export type {
+  UseRigsOptions,
+  UseRigsResult,
+  UseRigOptions,
+  UseRigResult,
+  UseRigVersionsOptions,
+  UseRigVersionsResult,
+  UseRigChangesOptions,
+  UseRigChangesResult,
+} from "./hooks/use-rigs";
 export { usePacks } from "./hooks/use-packs";
 export type { UsePacksOptions, UsePacksResult } from "./hooks/use-packs";
 export { useWorkspaces } from "./hooks/use-workspaces";

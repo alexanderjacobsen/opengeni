@@ -251,18 +251,19 @@ describe("api key permission options", () => {
       "Sessions",
       "Files & documents",
       "Scheduled tasks",
-      "Environments",
+      "Variable sets",
       "Connections",
       "Machines",
       "GitHub",
       "Goals",
+      "Rigs",
       "Admin & account",
     ]);
   });
 
   test("offers the scopes the old hardcoded list omitted", () => {
     const offered = buildApiKeyPermissionGroups().flatMap((group) => group.permissions);
-    const previouslyMissing: Permission[] = ["environments:manage", "environments:use", "goals:manage", "workspace:admin", "github:manage", "workspace:create", "billing:read", "billing:manage", "members:manage", "account:read", "account:admin"];
+    const previouslyMissing: Permission[] = ["variable-sets:manage", "variable-sets:use", "goals:manage", "workspace:admin", "github:manage", "workspace:create", "billing:read", "billing:manage", "members:manage", "account:read", "account:admin"];
     for (const permission of previouslyMissing) {
       expect(offered).toContain(permission);
     }
@@ -275,7 +276,7 @@ describe("api key permission options", () => {
   test("non-admin grants can only delegate their own permissions", () => {
     const delegable = delegableApiKeyPermissions(["sessions:read", "files:read", "api_keys:manage"]);
     expect([...delegable].sort()).toEqual(["api_keys:manage", "files:read", "sessions:read"]);
-    expect(delegable.has("environments:manage")).toBe(false);
+    expect(delegable.has("variable-sets:manage")).toBe(false);
   });
 
   test("empty grants can delegate nothing", () => {
@@ -300,7 +301,7 @@ describe("session MCP permission groups", () => {
     for (const accountScope of ["account:read", "account:admin", "members:manage", "billing:read", "billing:manage", "workspace:create", "toolspace:call"]) {
       expect(offered).not.toContain(accountScope);
     }
-    for (const workspaceScope of ["sessions:create", "goals:manage", "environments:use", "workspace:admin"]) {
+    for (const workspaceScope of ["sessions:create", "goals:manage", "variable-sets:use", "workspace:admin"]) {
       expect(offered).toContain(workspaceScope);
     }
   });
@@ -315,11 +316,11 @@ describe("session create draft", () => {
     });
   });
 
-  test("maps sandbox backend, environment, goal, and MCP scope into the payload", () => {
+  test("maps sandbox backend, variableSet, goal, and MCP scope into the payload", () => {
     const draft = {
       ...emptySessionDraft(),
       compute: { kind: "sandbox" as const, backend: "docker" as const },
-      environmentId: "env-1",
+      variableSetId: "env-1",
       goalText: "  Keep CI green  ",
       goalSuccessCriteria: "All checks pass for 7 days",
       goalMaxAutoContinuations: "12",
@@ -329,7 +330,7 @@ describe("session create draft", () => {
     expect(submissionFromSessionDraft(draft)).toEqual({
       extras: {
         sandboxBackend: "docker",
-        environmentId: "env-1",
+        variableSetId: "env-1",
         goal: {
           text: "Keep CI green",
           successCriteria: "All checks pass for 7 days",
@@ -356,8 +357,8 @@ describe("session create draft", () => {
   test("a connected machine sends targetSandboxId + workingDir, omits repos and env injection", () => {
     const draft = {
       ...emptySessionDraft(),
-      // Even with an environment set, a machine never injects it (D2).
-      environmentId: "env-1",
+      // Even with a variable set set, a machine never injects it (D2).
+      variableSetId: "env-1",
       compute: {
         kind: "machine" as const,
         sandboxId: "sbx-machine-1",
@@ -976,6 +977,9 @@ function session(patch: Partial<Session> = {}): Session {
     activeSandboxId: null,
     activeEpoch: 0,
     parentSessionId: null,
+    rigId: null,
+    rigVersionId: null,
+    variableSetId: null,
     environmentId: null,
     firstPartyMcpPermissions: null,
     mcpServers: [],
@@ -1013,6 +1017,8 @@ function scheduledTask(schedule: ScheduledTaskScheduleSpec, patch: Partial<Sched
     overlapPolicy: "allow_concurrent",
     agentConfig: scheduledTaskAgentConfig(),
     reusableSessionId: null,
+    rigId: null,
+    variableSetId: null,
     environmentId: null,
     metadata: {},
     createdAt: "2026-05-12T00:00:00.000Z",

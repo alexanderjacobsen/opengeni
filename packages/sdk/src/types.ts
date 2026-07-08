@@ -374,7 +374,13 @@ export type Session = {
   sandboxGroupId: string;
   activeSandboxId: string | null;
   activeEpoch: number;
+  variableSetId: string | null;
+  /** @deprecated use variableSetId */
   environmentId: string | null;
+  // The rig + frozen rig version this session rides (M3). Both null for a
+  // rig-less session. Frozen at create; a later rig promote never moves them.
+  rigId: string | null;
+  rigVersionId: string | null;
   firstPartyMcpPermissions: string[] | null;
   mcpServers: SessionMcpServerMetadata[];
   parentSessionId: string | null;
@@ -459,6 +465,10 @@ export const SESSION_EVENT_TYPES = [
   "agent.model.usage",
   "tool.auth_needed",
   "agent.updated",
+  "rig.setup.started",
+  "rig.setup.completed",
+  "rig.setup.skipped",
+  "rig.setup.failed",
   "sandbox.operation.started",
   "sandbox.operation.completed",
   "sandbox.operation.failed",
@@ -830,7 +840,11 @@ export type ScheduledTask = {
   overlapPolicy: ScheduledTaskOverlapPolicy;
   agentConfig: ScheduledTaskAgentConfig;
   reusableSessionId: string | null;
+  variableSetId: string | null;
+  /** @deprecated use variableSetId */
   environmentId: string | null;
+  // The rig each run binds to (M3); active version resolved per fire. Null ⇒ rig-less.
+  rigId: string | null;
   metadata: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
@@ -855,7 +869,12 @@ export type CreateSessionRequest = {
   // Host working directory for a connected-machine target (the agent runs here;
   // default = the machine's launch dir). Ignored for managed sandboxes.
   workingDir?: string | undefined;
+  variableSetId?: string | undefined;
+  /** @deprecated use variableSetId */
   environmentId?: string | undefined;
+  // The rig to bind this session to (M3). Its active version is frozen onto the
+  // session at create. Omitted ⇒ the workspace default rig when set, else rig-less.
+  rigId?: string | undefined;
   goal?: GoalSpec | undefined;
   clientEventId?: string | undefined;
   // Workspace-scoped CREATE idempotency key: forward a STABLE value to make a
@@ -909,11 +928,15 @@ export const KNOWN_PERMISSIONS = [
   "connections:write",
   "environments:manage",
   "environments:use",
+  "variable-sets:manage",
+  "variable-sets:use",
   "mcp_servers:attach",
   "toolspace:call",
   "goals:manage",
   "enrollments:read",
   "enrollments:manage",
+  "rigs:use",
+  "rigs:manage",
 ] as const;
 
 export type KnownPermission = (typeof KNOWN_PERMISSIONS)[number];
@@ -1135,6 +1158,7 @@ export type Workspace = {
   externalId: string | null;
   agentInstructions: string | null;
   settings: Record<string, unknown>;
+  defaultRigId?: string | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -1147,6 +1171,10 @@ export type WorkspaceSettings = {
 export type UpdateWorkspaceSettingsRequest = {
   memoryEnabled?: boolean | undefined;
   [key: string]: unknown;
+};
+
+export type SetWorkspaceDefaultRigRequest = {
+  rigId: string | null;
 };
 
 export type CreateWorkspaceRequest = {
@@ -1301,7 +1329,11 @@ export type CreateScheduledTaskRequest = {
   overlapPolicy?: ScheduledTaskOverlapPolicy | undefined;
   agentConfig: ScheduledTaskAgentConfigInput;
   status?: ScheduledTaskStatus | undefined;
+  variableSetId?: string | null | undefined;
+  /** @deprecated use variableSetId */
   environmentId?: string | null | undefined;
+  // The rig each run binds to (M3); active version resolved per fire.
+  rigId?: string | null | undefined;
   metadata?: Record<string, unknown> | undefined;
 };
 
@@ -1312,7 +1344,11 @@ export type UpdateScheduledTaskRequest = {
   overlapPolicy?: ScheduledTaskOverlapPolicy | undefined;
   agentConfig?: ScheduledTaskAgentConfigInput | undefined;
   status?: ScheduledTaskStatus | undefined;
+  variableSetId?: string | null | undefined;
+  /** @deprecated use variableSetId */
   environmentId?: string | null | undefined;
+  // The rig each run binds to (M3); active version resolved per fire.
+  rigId?: string | null | undefined;
   metadata?: Record<string, unknown> | undefined;
 };
 
@@ -1336,42 +1372,170 @@ export type ScheduledTaskRun = {
   updatedAt: string;
 };
 
-// --- Environments -------------------------------------------------------------
+// --- VariableSets -------------------------------------------------------------
 
 /**
  * Variable values are write-only by design: the API never returns a value, so
  * reads expose name + version metadata only. Values are decrypted exclusively
  * inside the worker at sandbox materialization time.
  */
-export type WorkspaceEnvironmentVariableMetadata = {
+export type VariableSetVariableMetadata = {
   name: string;
   version: number;
   createdAt: string;
   updatedAt: string;
 };
 
-export type WorkspaceEnvironment = {
+export type VariableSet = {
   id: string;
   accountId: string;
   workspaceId: string;
   name: string;
   description: string | null;
-  variables: WorkspaceEnvironmentVariableMetadata[];
+  variables: VariableSetVariableMetadata[];
   createdAt: string;
   updatedAt: string;
 };
 
-export type CreateWorkspaceEnvironmentRequest = {
+/** @deprecated use VariableSetVariableMetadata */
+export type WorkspaceEnvironmentVariableMetadata = VariableSetVariableMetadata;
+
+/** @deprecated use VariableSet */
+export type WorkspaceEnvironment = VariableSet;
+
+export type CreateVariableSetRequest = {
   name: string;
   description?: string | undefined;
   /** Initial variables. Values are write-only: they never come back on reads. */
   variables?: { name: string; value: string }[] | undefined;
 };
 
-export type UpdateWorkspaceEnvironmentRequest = {
+/** @deprecated use CreateVariableSetRequest */
+export type CreateWorkspaceEnvironmentRequest = CreateVariableSetRequest;
+
+export type UpdateVariableSetRequest = {
   name?: string | undefined;
   description?: string | null | undefined;
 };
+
+/** @deprecated use UpdateVariableSetRequest */
+export type UpdateWorkspaceEnvironmentRequest = UpdateVariableSetRequest;
+
+export type SetVariableSetVariableRequest = {
+  value: string;
+};
+
+/** @deprecated use SetVariableSetVariableRequest */
+export type SetWorkspaceEnvironmentVariableRequest = SetVariableSetVariableRequest;
+
+// --- Rigs ---------------------------------------------------------------------
+// Workspace-scoped, versioned sandbox machine definitions. Versions are
+// append-only and content-immutable; exactly one is active per rig.
+
+export type RigCheck = {
+  name: string;
+  command: string;
+};
+
+export type RigVersion = {
+  id: string;
+  rigId: string;
+  version: number;
+  image: string | null;
+  setupScript: string | null;
+  checks: RigCheck[];
+  credentialHooks: string[];
+  defaultVariableSetIds: string[];
+  changelog: string | null;
+  createdBy: string | null;
+  active: boolean;
+  createdAt: string;
+};
+
+export type RigVerificationHealth = {
+  checkHealth: "passing" | "failing" | "unknown";
+  lastVerifiedAt: string | null;
+};
+
+export type Rig = {
+  id: string;
+  accountId: string;
+  workspaceId: string;
+  name: string;
+  description: string | null;
+  createdBy: string | null;
+  activeVersion: RigVersion | null;
+  activeVersionHealth?: RigVerificationHealth | null;
+  versionCount: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type RigChangeKind = "setup_append" | "definition_edit";
+
+export type RigChangeStatus = "proposed" | "verifying" | "merged" | "rejected" | "failed";
+
+export type RigCheckResult = {
+  name: string;
+  command: string;
+  exitCode: number | null;
+  output?: string | undefined;
+};
+
+export type RigChangeVerification = {
+  startedAt?: string | undefined;
+  finishedAt?: string | undefined;
+  log?: string | undefined;
+  checkResults?: RigCheckResult[] | undefined;
+  [key: string]: unknown;
+};
+
+export type RigChange = {
+  id: string;
+  rigId: string;
+  baseVersionId: string | null;
+  kind: RigChangeKind;
+  payload: Record<string, unknown>;
+  status: RigChangeStatus;
+  proposedBy: string | null;
+  verification: RigChangeVerification | null;
+  resultVersionId: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CreateRigRequest = {
+  name: string;
+  description?: string | undefined;
+  image?: string | undefined;
+  setupScript?: string | undefined;
+  checks?: RigCheck[] | undefined;
+  credentialHooks?: string[] | undefined;
+  defaultVariableSetIds?: string[] | undefined;
+};
+
+export type UpdateRigRequest = {
+  name?: string | undefined;
+  description?: string | null | undefined;
+};
+
+export type RigSetupAppendPayload = {
+  command: string;
+  note?: string | undefined;
+};
+
+export type RigDefinitionEditPayload = {
+  image?: string | null | undefined;
+  setupScript?: string | null | undefined;
+  checks?: RigCheck[] | undefined;
+  credentialHooks?: string[] | undefined;
+  defaultVariableSetIds?: string[] | undefined;
+  changelog?: string | null | undefined;
+};
+
+export type ProposeRigChangeRequest =
+  | { kind: "setup_append"; payload: RigSetupAppendPayload }
+  | { kind: "definition_edit"; payload: RigDefinitionEditPayload };
 
 // --- Files ---------------------------------------------------------------------
 
@@ -1661,7 +1825,7 @@ export type CapabilityPackSkill = {
   files: CapabilityPackSkillFile[];
 };
 
-export type CapabilityPackEnvironmentSpec = {
+export type CapabilityPackVariableSetSpec = {
   description: string;
   requiredVariables: string[];
   required: boolean;
@@ -1680,7 +1844,7 @@ export type CapabilityPack = {
   connectors: CapabilityPackConnector[];
   knowledge: CapabilityPackKnowledge[];
   scheduledTaskTemplates: CapabilityPackScheduledTaskTemplate[];
-  environment?: CapabilityPackEnvironmentSpec | undefined;
+  variableSet?: CapabilityPackVariableSetSpec | undefined;
   metadata: Record<string, unknown>;
 };
 
@@ -1725,7 +1889,7 @@ export type RegisterCapabilityPackRequest = {
     defaultOverlapPolicy?: ScheduledTaskOverlapPolicy | undefined;
     prompt?: string | undefined;
   }[] | undefined;
-  environment?: {
+  variableSet?: {
     description: string;
     requiredVariables?: string[] | undefined;
     required?: boolean | undefined;
@@ -1755,6 +1919,8 @@ export type PackInstallation = {
 };
 
 export type EnablePackRequest = {
+  variableSetId?: string | undefined;
+  /** @deprecated use variableSetId */
   environmentId?: string | undefined;
   metadata?: Record<string, unknown> | undefined;
 };
@@ -1869,10 +2035,12 @@ export type EnableCapabilityRequest = {
    */
   headers?: Record<string, string> | undefined;
   /**
-   * Initial environment attachment for kind=pack capabilities — mirrors the
+   * Initial variableSet attachment for kind=pack capabilities — mirrors the
    * dedicated POST /packs/:id/enable body. Required to enable an
-   * environment.required pack through this unified path; ignored otherwise.
-   */
+   * variableSet.required pack through this unified path; ignored otherwise.
+  */
+  variableSetId?: string | undefined;
+  /** @deprecated use variableSetId */
   environmentId?: string | undefined;
 };
 

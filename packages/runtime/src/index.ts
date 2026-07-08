@@ -833,6 +833,17 @@ export type BuildAgentOptions = {
   // per-session instructions. Omitted/blank ⇒ byte-identical instructions.
   workspaceMemory?: string;
   workspaceEnvironment?: WorkspaceEnvironmentContext;
+  // M3 rig runtime binding (all absent ⇒ a rig-less turn, byte-for-byte today).
+  //  - `rig`: renders the non-bypassable rig doctrine block in the CORE.
+  //  - `rigSetup`: the rig version's setup script, run ONCE per box (marker-
+  //    guarded) as the FIRST beforeAgentStart hook so later hooks see its tooling.
+  //  - `rigCredentialHookIds`: the rig version's credential_hooks, unioned with
+  //    the deployment preparation-profile hooks. Resolved (and VALIDATED — an
+  //    unknown name throws here, at build = per-turn resolution time) so a typo'd
+  //    hook fails the turn instead of being silently ignored.
+  rig?: RigInstructionsContext;
+  rigSetup?: RigSetupDescriptor;
+  rigCredentialHookIds?: string[];
   // TOKEN-BROKER (B1): the run-scoped GitHub App installation token alias,
   // minted ONCE per turn by the worker (sandboxEnvironmentForRun's `gitToken`).
   // Kept for back-compat; internally it maps to gitTokenSeeds.github.
@@ -904,6 +915,27 @@ export type WorkspaceEnvironmentContext = {
   variableNames?: string[];
 };
 
+/**
+ * The rig a session rides (M3): its name + the active version pinned onto the
+ * session. Surfaced verbatim in the non-bypassable CORE instructions so the
+ * agent understands its sandbox is a disposable fork of a shared, versioned
+ * machine definition and how to promote a durable change. Absent for rig-less
+ * sessions (the block never renders).
+ */
+export type RigInstructionsContext = {
+  name: string;
+  version: number;
+};
+
+export function rigInstructions(rig: RigInstructionsContext): string[] {
+  return [
+    `This session runs on rig "${rig.name}" (active version v${rig.version}) — a shared, versioned sandbox machine definition for your workspace.`,
+    "Your sandbox is an EPHEMERAL FORK of that rig: you have root and may install anything freely, but everything you change here is junk that dies with the box and never reaches the rig or other sessions.",
+    "For a DURABLE, team-wide change (tooling every future session on this rig should have), propose it with rig_propose_change, passing the EXACT command that already worked in this box — never assume an unverified change propagates.",
+    "If tooling you expect is missing, consult rig_get to see the rig's current setup and checks before reinstalling.",
+  ];
+}
+
 export function workspaceEnvironmentInstructions(environment: WorkspaceEnvironmentContext): string[] {
   const lines = [
     `A workspace environment named "${environment.name}" is attached to this session; its variables are exported in the sandbox shell environment.`,
@@ -930,10 +962,13 @@ export function workspaceEnvironmentInstructions(environment: WorkspaceEnvironme
  * drop: composeAgentInstructions() substitutes it at the persona template's
  * {{core}} marker, and appends it when the marker is absent.
  */
-export function coreInstructions(workspaceEnvironment?: WorkspaceEnvironmentContext): string[] {
+export function coreInstructions(workspaceEnvironment?: WorkspaceEnvironmentContext, rig?: RigInstructionsContext): string[] {
   return [
     "If the session has a goal, you own it: keep working until you call opengeni__goal_complete with concrete evidence or opengeni__goal_pause with a rationale; revise it with opengeni__goal_update; create one with opengeni__goal_set when given a long-running objective.",
     ...(workspaceEnvironment ? workspaceEnvironmentInstructions(workspaceEnvironment) : []),
+    // Rig doctrine (M3): data-conditional, inside the non-bypassable CORE so a
+    // white-label persona template can never drop it. Absent for rig-less sessions.
+    ...(rig ? rigInstructions(rig) : []),
   ];
 }
 
@@ -945,8 +980,8 @@ export function coreInstructions(workspaceEnvironment?: WorkspaceEnvironmentCont
  * and the append both join by " ", so the DEFAULT_AGENT_INSTRUCTIONS template
  * with an empty environment reproduces the historical preamble byte-for-byte.
  */
-export function composeAgentInstructions(template: string, workspaceEnvironment?: WorkspaceEnvironmentContext): string {
-  const core = coreInstructions(workspaceEnvironment).join(" ");
+export function composeAgentInstructions(template: string, workspaceEnvironment?: WorkspaceEnvironmentContext, rig?: RigInstructionsContext): string {
+  const core = coreInstructions(workspaceEnvironment, rig).join(" ");
   if (template.includes(AGENT_INSTRUCTIONS_CORE_PLACEHOLDER)) {
     return template.split(AGENT_INSTRUCTIONS_CORE_PLACEHOLDER).join(core);
   }
@@ -1018,6 +1053,12 @@ const agentToolspaceTokenSeed = new WeakMap<object, string>();
 // backend). Read by runStream's owned branch to keep platform box-setup hooks off
 // connected machines (a user's real computer).
 const agentActiveSandboxBackend = new WeakMap<object, Settings["sandboxBackend"]>();
+// M3: the rig-setup descriptor + resolved rig credential hooks for this agent's
+// turn (kept off the manifest like the clone hooks). Read by runStream to build
+// the rig-setup hook and to union the rig credential hooks with the deployment
+// preparation-profile hooks. Absent for a rig-less turn.
+const agentRigSetup = new WeakMap<object, RigSetupDescriptor>();
+const agentRigCredentialHooks = new WeakMap<object, SandboxLifecycleHook[]>();
 
 /**
  * The tool output emitted for an MCP tool call that FAILED with a THROWN error
@@ -1108,7 +1149,7 @@ export function buildOpenGeniAgent(settings: Settings, resources: ResourceRef[],
       appendSessionInstructions(
         appendWorkspaceMemory(
           appendToolspaceInstructions(
-            composeAgentInstructions(options.instructionsTemplate ?? settings.agentInstructionsTemplate, options.workspaceEnvironment),
+            composeAgentInstructions(options.instructionsTemplate ?? settings.agentInstructionsTemplate, options.workspaceEnvironment, options.rig),
             settings.toolspaceEnabled && Boolean(options.toolspaceTokenSeed),
           ),
           options.workspaceMemory,
@@ -1194,6 +1235,16 @@ export function buildOpenGeniAgent(settings: Settings, resources: ResourceRef[],
   }
   if (options.toolspaceTokenSeed) {
     agentToolspaceTokenSeed.set(agent, options.toolspaceTokenSeed);
+  }
+  // M3: stash the rig setup descriptor + RESOLVE the rig credential hooks now.
+  // sandboxLifecycleHooksForIds throws on an unknown hook name, so a typo'd rig
+  // credential_hook fails the turn HERE (per-turn resolution) rather than being
+  // silently dropped — the fail-visible contract the brief requires.
+  if (options.rigSetup) {
+    agentRigSetup.set(agent, options.rigSetup);
+  }
+  if (options.rigCredentialHookIds && options.rigCredentialHookIds.length > 0) {
+    agentRigCredentialHooks.set(agent, sandboxLifecycleHooksForIds(options.rigCredentialHookIds));
   }
   maybeInstallCodexToolSearch(agent, settings, options);
   applyMcpApprovalPolicy(agent, settings);
@@ -1900,8 +1951,8 @@ async function codexAppsMcpRequestInit(settings: Settings): Promise<{ requestIni
 // The first-party MCP permission set signed into a worker's delegated token
 // when the session does not specify its own. POWERFUL BY DEFAULT: it carries
 // every permission that unlocks a first-party tool — session orchestration
-// (sessions:*), workspace environments (environments:*), and GitHub
-// (github:use) — so agents are fully capable out of the box. A user DEMOTES a
+// (sessions:*), workspace variable sets (variable-sets:*), rigs:use
+// (list/get/propose/verify only), and GitHub (github:use) — so agents are fully capable out of the box. A user DEMOTES a
 // specific session by setting a narrower session.firstPartyMcpPermissions (the
 // create-session permission picker), which the worker uses instead. Account-
 // level scopes (billing/account/members/api_keys/workspace:admin) are
@@ -1917,8 +1968,9 @@ const firstPartyMcpPermissions: Permission[] = [
   "sessions:read",
   "sessions:create",
   "sessions:control",
-  "environments:use",
-  "environments:manage",
+  "variable-sets:use",
+  "variable-sets:manage",
+  "rigs:use",
   "github:use",
 ];
 
@@ -2457,8 +2509,16 @@ export async function runAgentStream(agent: Agent<any, any>, input: PreparedAgen
     // repository-clone hook seeds it to the box's token file before the clone.
     const ownedGitTokenSeeds = gitTokenSeedsForAgent(agent);
     const ownedToolspaceTokenSeed = toolspaceTokenSeedForAgent(agent);
+    const ownedRigSetup = rigSetupDescriptorForAgent(agent);
     const ownedHooks = [
-      ...sandboxLifecycleHooksForIds(sandboxLifecycleHookIds(settings)),
+      // M3: rig setup runs FIRST so any tooling it installs is present for the
+      // credential / repository-clone hooks below. The rig's credential hooks are
+      // unioned into the deployment preparation-profile hooks (deduped by id).
+      ...sandboxRigSetupHooksForAgent(agent),
+      ...unionCredentialHooks(
+        sandboxLifecycleHooksForIds(sandboxLifecycleHookIds(settings)),
+        rigCredentialHooksForAgent(agent),
+      ),
       ...sandboxToolspaceTokenHooksForAgent(agent),
       ...sandboxRepositoryCloneHooksForAgent(agent),
     ];
@@ -2468,6 +2528,7 @@ export async function runAgentStream(agent: Agent<any, any>, input: PreparedAgen
       ...(runAs ? { runAs } : {}),
       ...(ownedGitTokenSeeds ? { gitTokenSeeds: ownedGitTokenSeeds } : {}),
       ...(ownedToolspaceTokenSeed ? { toolspaceTokenSeed: ownedToolspaceTokenSeed } : {}),
+      ...(ownedRigSetup ? { rigSetup: ownedRigSetup } : {}),
     };
     // Keep the decoration as a safety net for any session the SDK does create/resume
     // through the client during this run (it is inert for the provided session).
@@ -2516,9 +2577,17 @@ export async function runAgentStream(agent: Agent<any, any>, input: PreparedAgen
   // repository-clone hook seeds it to the box's token file before the clone.
   const gitTokenSeeds = gitTokenSeedsForAgent(agent);
   const toolspaceTokenSeed = toolspaceTokenSeedForAgent(agent);
+  const legacyRigSetup = rigSetupDescriptorForAgent(agent);
   const client = resourceClient
     ? withSandboxLifecycleHooks(resourceClient, [
-      ...sandboxLifecycleHooksForIds(sandboxLifecycleHookIds(settings)),
+      // M3: same rig-setup-first ordering + credential-hook union as the owned
+      // path (this legacy create/resume decoration path is byte-for-byte today
+      // for a rig-less turn — the rig hooks are empty then).
+      ...sandboxRigSetupHooksForAgent(agent),
+      ...unionCredentialHooks(
+        sandboxLifecycleHooksForIds(sandboxLifecycleHookIds(settings)),
+        rigCredentialHooksForAgent(agent),
+      ),
       ...sandboxToolspaceTokenHooksForAgent(agent),
       ...sandboxRepositoryCloneHooksForAgent(agent),
     ], {
@@ -2527,6 +2596,7 @@ export async function runAgentStream(agent: Agent<any, any>, input: PreparedAgen
       ...(runAs ? { runAs } : {}),
       ...(gitTokenSeeds ? { gitTokenSeeds } : {}),
       ...(toolspaceTokenSeed ? { toolspaceTokenSeed } : {}),
+      ...(legacyRigSetup ? { rigSetup: legacyRigSetup } : {}),
     })
     : undefined;
   const sandboxSessionState = prepared.sandboxSessionState
@@ -2897,8 +2967,19 @@ export async function runOwnedSandboxSetup(
     ...(opts.gitTokenSeedsOverride ?? {}),
   } satisfies GitTokenSeeds;
   const ownedToolspaceTokenSeed = toolspaceTokenSeedForAgent(agent);
+  const ownedRigSetup = rigSetupDescriptorForAgent(agent);
   const ownedHooks = [
-    ...sandboxLifecycleHooksForIds(sandboxLifecycleHookIds(settings)),
+    // M3: rig setup runs FIRST so any tooling it installs is present for the
+    // credential / repository-clone hooks below; the rig's credential hooks are
+    // unioned into the deployment preparation-profile hooks (deduped by id).
+    // This is the LIVE owned-path execution (the provided session skips the
+    // client create/resume decoration), so the rig hooks MUST be here or a
+    // rig-bound turn would start without ever running the frozen setup script.
+    ...sandboxRigSetupHooksForAgent(agent),
+    ...unionCredentialHooks(
+      sandboxLifecycleHooksForIds(sandboxLifecycleHookIds(settings)),
+      rigCredentialHooksForAgent(agent),
+    ),
     ...sandboxToolspaceTokenHooksForAgent(agent),
     ...sandboxRepositoryCloneHooksForAgent(agent),
   ];
@@ -2908,6 +2989,7 @@ export async function runOwnedSandboxSetup(
     ...(runAs ? { runAs } : {}),
     ...(Object.keys(ownedGitTokenSeeds).length > 0 ? { gitTokenSeeds: ownedGitTokenSeeds } : {}),
     ...(ownedToolspaceTokenSeed ? { toolspaceTokenSeed: ownedToolspaceTokenSeed } : {}),
+    ...(ownedRigSetup ? { rigSetup: ownedRigSetup } : {}),
   };
   // OWNED-PATH HOOKS: run the beforeAgentStart hooks directly against the provided
   // box, once per turn, BEFORE the run starts (repository-clone hook seeds the B1
@@ -3640,6 +3722,22 @@ export type SandboxLifecycleHookContext = {
   // rotating values).
   gitTokenSeeds?: GitTokenSeeds;
   toolspaceTokenSeed?: string;
+  // M3: the rig setup descriptor for the rig-setup hook (the script + marker
+  // version id + the rig's own timeout). Present only on a rig-bound turn.
+  rigSetup?: RigSetupDescriptor;
+};
+
+// M3: everything the rig-setup hook needs to run the frozen rig version's setup
+// script exactly once per box. `versionId` keys the idempotence marker
+// (/var/opengeni/rig-setup-<versionId>.done); `timeoutMs` is the rig-specific
+// budget (settings.rigSetupTimeoutMs), NOT the 120s lifecycle default; `rigName`
+// is for human-readable events/errors only.
+export type RigSetupDescriptor = {
+  rigId: string;
+  versionId: string;
+  rigName: string;
+  script: string;
+  timeoutMs: number;
 };
 
 export type SandboxLifecycleHook = {
@@ -3752,6 +3850,42 @@ function sandboxToolspaceTokenHooksForAgent(agent: Agent<any, any>): SandboxLife
         run: runToolspaceTokenSeedHook,
       }]
     : [];
+}
+
+// M3: the rig-setup hook for this agent (present only on a rig-bound turn whose
+// frozen version carries a non-empty setup script). It runs FIRST among the
+// owned beforeAgentStart hooks so any tooling it installs is available to the
+// repository-clone / credential hooks that follow. The descriptor is threaded
+// through the hook context (rigSetupHookContext) so runRigSetupHook reads it.
+function sandboxRigSetupHooksForAgent(agent: Agent<any, any>): SandboxLifecycleHook[] {
+  return agentRigSetup.get(agent)
+    ? [{
+        id: "rig-setup",
+        phase: "beforeAgentStart",
+        run: runRigSetupHook,
+      }]
+    : [];
+}
+
+function rigSetupDescriptorForAgent(agent: Agent<any, any>): RigSetupDescriptor | undefined {
+  return agentRigSetup.get(agent);
+}
+
+// M3: the rig version's credential hooks (already resolved + validated at build
+// time). Unioned with the deployment preparation-profile hooks by the caller.
+function rigCredentialHooksForAgent(agent: Agent<any, any>): SandboxLifecycleHook[] {
+  return agentRigCredentialHooks.get(agent) ?? [];
+}
+
+// M3: union the deployment preparation-profile hooks with the rig version's
+// credential hooks, deduped by id (a hook named by BOTH the deployment profile
+// and the rig runs once). Deployment hooks keep their leading position.
+function unionCredentialHooks(deploymentHooks: SandboxLifecycleHook[], rigHooks: SandboxLifecycleHook[]): SandboxLifecycleHook[] {
+  if (rigHooks.length === 0) {
+    return deploymentHooks;
+  }
+  const seen = new Set(deploymentHooks.map((hook) => hook.id));
+  return [...deploymentHooks, ...rigHooks.filter((hook) => !seen.has(hook.id))];
 }
 
 function sandboxRepositoryCloneHooks(
@@ -4141,6 +4275,145 @@ export async function runToolspaceTokenSeedHook(
   } else {
     throw new Error("Sandbox session does not support command execution");
   }
+}
+
+// Bounds the setup output tail carried on a rig.setup failure event/error so a
+// runaway script can't bloat the session's event stream or the turn error.
+const RIG_SETUP_OUTPUT_TAIL_LIMIT = 4_000;
+
+// A distinctive sentinel the guard prints when the idempotence marker already
+// exists, so the runtime can tell a SKIP from an actual run without a second
+// exec round-trip.
+const RIG_SETUP_SKIPPED_SENTINEL = "__OPENGENI_RIG_SETUP_SKIPPED__";
+
+/**
+ * The rig-setup command (M3). One idempotent bash program:
+ *   1. `mkdir -p /var/opengeni` and, if the per-version marker already exists,
+ *      print the SKIP sentinel and exit 0 (a warm box re-running the hook).
+ *   2. otherwise atomically claim a per-version lock directory. A loser waits
+ *      for the winner's marker, then skips; if the winner fails and releases the
+ *      lock, the loser retries the claim.
+ *   3. the winner writes the rig's setup script to a temp file and runs it under
+ *      coreutils `timeout` (NOT `bash -e` — the script opts into `set -e`
+ *      itself if it wants), then captures the exit code and `touch`es the marker
+ *      ONLY on success (exit 0) so a failed/timed-out setup re-runs next turn.
+ * The heredoc delimiter is quoted, so the script content is executed verbatim
+ * with no host-side expansion.
+ */
+export function rigSetupScriptCommand(script: string, versionId: string, timeoutMs = 600_000, markerRoot = "/var/opengeni"): string {
+  const timeoutSecs = Math.max(1, Math.ceil(timeoutMs / 1000));
+  const lockWaitSecs = timeoutSecs + 6;
+  const marker = `${markerRoot.replace(/\/+$/, "")}/rig-setup-${versionId}.done`;
+  return [
+    "set -u",
+    `mkdir -p ${shellQuote(markerRoot)}`,
+    `__OG_RIG_MARKER=${shellQuote(marker)}`,
+    '__OG_RIG_LOCK="$__OG_RIG_MARKER.lock"',
+    `__OG_RIG_TIMEOUT_SECS=${timeoutSecs}`,
+    `__OG_RIG_LOCK_WAIT_SECS=${lockWaitSecs}`,
+    `if [ -f "$__OG_RIG_MARKER" ]; then printf '%s\\n' ${shellQuote(RIG_SETUP_SKIPPED_SENTINEL)}; exit 0; fi`,
+    "while :; do",
+    '  if mkdir "$__OG_RIG_LOCK" 2>/dev/null; then',
+    '    trap \'rm -rf "$__OG_RIG_LOCK"\' EXIT',
+    `    if [ -f "$__OG_RIG_MARKER" ]; then printf '%s\\n' ${shellQuote(RIG_SETUP_SKIPPED_SENTINEL)}; exit 0; fi`,
+    '__OG_RIG_SCRIPT="$(mktemp)"',
+    "cat > \"$__OG_RIG_SCRIPT\" <<'__OPENGENI_RIG_SETUP_SCRIPT_EOF__'",
+    script,
+    "__OPENGENI_RIG_SETUP_SCRIPT_EOF__",
+    '    timeout -k 5s "${__OG_RIG_TIMEOUT_SECS}s" bash "$__OG_RIG_SCRIPT"',
+    "__OG_RIG_RC=$?",
+    '    rm -f "$__OG_RIG_SCRIPT"',
+    '    if [ "$__OG_RIG_RC" -eq 0 ]; then touch "$__OG_RIG_MARKER"; fi',
+    '    exit "$__OG_RIG_RC"',
+    "  fi",
+    "  __OG_RIG_WAITED=0",
+    '  while [ "$__OG_RIG_WAITED" -lt "$__OG_RIG_LOCK_WAIT_SECS" ]; do',
+    `    if [ -f "$__OG_RIG_MARKER" ]; then printf '%s\\n' ${shellQuote(RIG_SETUP_SKIPPED_SENTINEL)}; exit 0; fi`,
+    '    if [ ! -d "$__OG_RIG_LOCK" ]; then break; fi',
+    "    sleep 1",
+    '    __OG_RIG_WAITED=$((__OG_RIG_WAITED + 1))',
+    "  done",
+    `  if [ -f "$__OG_RIG_MARKER" ]; then printf '%s\\n' ${shellQuote(RIG_SETUP_SKIPPED_SENTINEL)}; exit 0; fi`,
+    '  if [ ! -d "$__OG_RIG_LOCK" ]; then continue; fi',
+    '  rmdir "$__OG_RIG_LOCK" 2>/dev/null || true',
+    "done",
+  ].join("\n");
+}
+
+/**
+ * The rig-setup beforeAgentStart hook (M3). Runs the frozen rig version's setup
+ * script exactly once per box (marker-guarded), under the RIG's own timeout
+ * (context.rigSetup.timeoutMs, NOT the 120s lifecycle default). Emits
+ * rig.setup.started, then one terminal event:
+ *   - rig.setup.skipped   — marker already present,
+ *   - rig.setup.completed — script ran and exited 0,
+ *   - rig.setup.failed    — nonzero exit / timeout,
+ * and on failure THROWS (fail the turn closed) with a message naming the
+ * rig/version and a bounded tail of the setup output.
+ */
+export async function runRigSetupHook(
+  session: SandboxSessionLike,
+  context: SandboxLifecycleHookContext = { environment: {} },
+): Promise<void> {
+  const rigSetup = context.rigSetup;
+  if (!rigSetup) {
+    return;
+  }
+  const payload = {
+    rigId: rigSetup.rigId,
+    versionId: rigSetup.versionId,
+    rigName: rigSetup.rigName,
+  };
+  await context.onRuntimeEvent?.({ type: "rig.setup.started", payload });
+  const command = rigSetupScriptCommand(rigSetup.script, rigSetup.versionId, rigSetup.timeoutMs);
+  const execArgs = {
+    cmd: command,
+    workdir: "/workspace",
+    ...(context.runAs ? { runAs: context.runAs } : {}),
+    // The in-box coreutils timeout is the hard deadline; the SDK yield waits a
+    // little longer so it observes timeout's non-zero exit instead of a live
+    // still-running process.
+    yieldTimeMs: rigSetup.timeoutMs + 7_000,
+    maxOutputTokens: 20_000,
+  };
+  let result: unknown;
+  try {
+    if (session.exec) {
+      result = await session.exec(execArgs);
+    } else if (session.execCommand) {
+      result = await session.execCommand(execArgs);
+    } else {
+      throw new Error("Sandbox session does not support command execution");
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await context.onRuntimeEvent?.({ type: "rig.setup.failed", payload: { ...payload, error: message.slice(-RIG_SETUP_OUTPUT_TAIL_LIMIT) } });
+    throw new Error(`Rig setup failed for rig "${rigSetup.rigName}" (version ${rigSetup.versionId}): ${message}`);
+  }
+  const output = sandboxCommandOutput(result);
+  // Marker present → the guard skipped the script. Distinct terminal signal.
+  if (output.includes(RIG_SETUP_SKIPPED_SENTINEL)) {
+    await context.onRuntimeEvent?.({ type: "rig.setup.skipped", payload });
+    return;
+  }
+  // Ran → classify. A "still running" result means the script outlived the rig
+  // timeout; any nonzero/absent exit code is a setup failure. Both fail closed.
+  const stillRunning = sandboxCommandStillRunning(result);
+  const exitCode = sandboxCommandExitCode(result);
+  if (stillRunning || exitCode === null || exitCode !== 0) {
+    const tail = output.length > RIG_SETUP_OUTPUT_TAIL_LIMIT ? output.slice(-RIG_SETUP_OUTPUT_TAIL_LIMIT) : output;
+    const reason = stillRunning
+      ? `did not finish within the rig setup timeout (${rigSetup.timeoutMs}ms)`
+      : exitCode === null
+        ? "did not report an exit code"
+        : `exited with code ${exitCode}`;
+    const failure = new Error(
+      `Rig setup failed for rig "${rigSetup.rigName}" (version ${rigSetup.versionId}): the setup script ${reason}${tail ? `:\n${tail}` : ""}`,
+    );
+    await context.onRuntimeEvent?.({ type: "rig.setup.failed", payload: { ...payload, error: failure.message.slice(-RIG_SETUP_OUTPUT_TAIL_LIMIT) } });
+    throw failure;
+  }
+  await context.onRuntimeEvent?.({ type: "rig.setup.completed", payload: { ...payload, skipped: false } });
 }
 
 export async function runRepositoryCloneHook(

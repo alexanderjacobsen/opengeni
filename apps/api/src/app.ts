@@ -34,6 +34,7 @@ import { registerBillingRoutes } from "./routes/billing";
 import { registerGitHubRoutes } from "./routes/github";
 import { registerInstallRoutes } from "./routes/install";
 import { registerPackRoutes } from "./routes/packs";
+import { registerRigRoutes } from "./routes/rigs";
 import { registerScheduledTaskRoutes } from "./routes/scheduled-tasks";
 import { registerSessionRoutes } from "./routes/sessions";
 import { registerSocialRoutes } from "./routes/social";
@@ -254,6 +255,7 @@ export function createApp(deps: AppDependencies): Hono {
   registerEnrollmentRoutes(app, routeDeps);
   registerMachineRoutes(app, routeDeps);
   registerEnvironmentRoutes(app, routeDeps);
+  registerRigRoutes(app, routeDeps);
   registerPackRoutes(app, routeDeps);
   registerSessionRoutes(app, routeDeps);
   registerScheduledTaskRoutes(app, routeDeps);
@@ -377,6 +379,7 @@ const routeLabelPatterns: Array<{ pattern: RegExp; label: string }> = [
   { pattern: /^\/v1\/webhooks\/stripe$/, label: "/v1/webhooks/stripe" },
   { pattern: /^\/v1\/workspaces\/[^/]+\/mcp$/, label: "/v1/workspaces/:workspaceId/mcp" },
   { pattern: /^\/v1\/workspaces\/[^/]+\/mcp\/docs$/, label: "/v1/workspaces/:workspaceId/mcp/docs" },
+  { pattern: /^\/v1\/workspaces\/[^/]+\/default-rig$/, label: "/v1/workspaces/:workspaceId/default-rig" },
   { pattern: /^\/v1\/workspaces\/[^/]+\/sessions$/, label: "/v1/workspaces/:workspaceId/sessions" },
   { pattern: /^\/v1\/workspaces\/[^/]+\/sessions\/[^/]+\/events\/stream$/, label: "/v1/workspaces/:workspaceId/sessions/:id/events/stream" },
   { pattern: /^\/v1\/workspaces\/[^/]+\/sessions\/[^/]+\/lineage$/, label: "/v1/workspaces/:workspaceId/sessions/:id/lineage" },

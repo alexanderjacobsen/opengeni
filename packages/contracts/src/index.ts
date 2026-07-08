@@ -472,8 +472,12 @@ export const Permission = z.enum([
   "api_keys:manage",
   "connections:read",
   "connections:write",
+  /** @deprecated alias of variable-sets:manage */
   "environments:manage",
+  /** @deprecated alias of variable-sets:use */
   "environments:use",
+  "variable-sets:manage",
+  "variable-sets:use",
   // Attach or rotate per-session third-party MCP server credentials. Deliberately
   // not part of the worker's default first-party MCP permission set: a sandboxed
   // agent must not be able to hand itself new bearer credentials.
@@ -490,6 +494,13 @@ export const Permission = z.enum([
   // admin-shaped action. workspace:admin is the super-wildcard over both.
   "enrollments:read",
   "enrollments:manage",
+  // Rigs (workspace-scoped, versioned sandbox machine definitions). rigs:use is
+  // read + propose-change (the agent-native, additive path a sandboxed session
+  // is trusted with); rigs:manage is create/edit/activate/promote/delete (the
+  // admin-shaped path that mints or rolls versions). workspace:admin is the
+  // super-wildcard over both.
+  "rigs:use",
+  "rigs:manage",
 ]);
 export type Permission = z.infer<typeof Permission>;
 
@@ -532,13 +543,15 @@ export const Workspace = z.object({
   // Per-workspace agent persona template (white-label override). null means
   // the deployment default (OPENGENI_AGENT_INSTRUCTIONS_TEMPLATE /
   // DEFAULT_AGENT_INSTRUCTIONS) is used. The runtime always injects the
-  // non-bypassable CORE (goal-loop ownership + environment block), so an
+  // non-bypassable CORE (goal-loop ownership + variableSet block), so an
   // override restyles the persona without dropping that contract.
   agentInstructions: z.string().nullable(),
   // Growth-ready per-workspace settings bag (migration 0045). Known keys are
   // validated by WorkspaceSettingsSchema; unknown keys are preserved across
   // PATCH merges so newer settings survive an older server.
   settings: z.record(z.string(), z.unknown()),
+  // Workspace default rig used by session/scheduled-task create fallback.
+  defaultRigId: z.string().uuid().nullable(),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
@@ -565,6 +578,11 @@ export const UpdateWorkspaceSettingsRequest = z.object({
   memoryEnabled: z.boolean().optional(),
 }).passthrough();
 export type UpdateWorkspaceSettingsRequest = z.infer<typeof UpdateWorkspaceSettingsRequest>;
+
+export const SetWorkspaceDefaultRigRequest = z.object({
+  rigId: z.string().uuid().nullable(),
+});
+export type SetWorkspaceDefaultRigRequest = z.infer<typeof SetWorkspaceDefaultRigRequest>;
 
 export const AccountGrant = z.object({
   accountId: z.string().uuid(),
@@ -1129,8 +1147,8 @@ export type GitCredentialRepositoryRef = z.infer<typeof GitCredentialRepositoryR
 //     `sandboxEnvironmentForRun` (standalone self-mints GitHub App tokens from
 //     `settings`; embedded hosts can broker GitHub, GitLab, and Azure DevOps)
 //     and seeded off-manifest into sandbox token files for git + provider CLIs.
-//   - SANDBOX secrets: the decrypted workspace environment values loaded in
-//     `loadWorkspaceEnvironmentForRun` (today decrypted with
+//   - SANDBOX secrets: the decrypted variable set values loaded in
+//     `loadVariableSetForRun` (today decrypted with
 //     `environmentsEncryptionKeyBytes(settings)`).
 //
 // In embedded/separate topologies the HOST owns these external connections
@@ -1181,20 +1199,20 @@ export type GitCredentials = {
 export type SandboxSecretsRequest = {
   accountId: string;
   workspaceId: string;
-  // The workspace environment the run's session declares (null = unattached;
+  // The variable set the run's session declares (null = unattached;
   // the provider, like the self-mint path, returns null values for it).
-  environmentId: string;
+  variableSetId: string;
 };
 
 export type SandboxSecrets = {
-  // The decrypted environment values the run injects, replacing the local
+  // The decrypted variableSet values the run injects, replacing the local
   // `environmentsEncryptionKeyBytes` decrypt. Same shape the self-mint path
   // produces (plaintext name→value).
   values: Record<string, string>;
   // FORK-7 echo: the workspace the provider scoped these secrets to.
   workspaceId: string;
-  // Optional environment metadata; when omitted the activity uses the
-  // environmentId as both id and name (the local decrypt carries the row's
+  // Optional variableSet metadata; when omitted the activity uses the
+  // variableSetId as both id and name (the local decrypt carries the row's
   // id/name/description, but only `id` is load-bearing downstream).
   id?: string;
   name?: string;
@@ -1886,52 +1904,222 @@ export const ReorderSessionTurnsRequest = z.object({
 });
 export type ReorderSessionTurnsRequest = z.infer<typeof ReorderSessionTurnsRequest>;
 
-export const WorkspaceEnvironmentVariableName = z.string().regex(/^[A-Z][A-Z0-9_]*$/).max(128);
-export type WorkspaceEnvironmentVariableName = z.infer<typeof WorkspaceEnvironmentVariableName>;
+export const VariableSetVariableName = z.string().regex(/^[A-Z][A-Z0-9_]*$/).max(128);
+export type VariableSetVariableName = z.infer<typeof VariableSetVariableName>;
+
+function withVariableSetIdAlias<T extends z.ZodRawShape>(shape: T) {
+  return z.preprocess((input) => {
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      return input;
+    }
+    const record = input as Record<string, unknown>;
+    if (record.variableSetId !== undefined || record.environmentId === undefined) {
+      return record;
+    }
+    return { ...record, variableSetId: record.environmentId };
+  }, z.object(shape));
+}
 
 // Metadata only by design: no schema in this file ever carries a variable value
 // back to a client. Values are write-only and decrypted exclusively inside the
 // worker at sandbox materialization time.
-export const WorkspaceEnvironmentVariableMetadata = z.object({
-  name: WorkspaceEnvironmentVariableName,
+export const VariableSetVariableMetadata = z.object({
+  name: VariableSetVariableName,
   version: z.number().int().positive(),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
-export type WorkspaceEnvironmentVariableMetadata = z.infer<typeof WorkspaceEnvironmentVariableMetadata>;
+export type VariableSetVariableMetadata = z.infer<typeof VariableSetVariableMetadata>;
+/** @deprecated use VariableSetVariableMetadata */
+export const WorkspaceEnvironmentVariableMetadata = VariableSetVariableMetadata;
+/** @deprecated use VariableSetVariableMetadata */
+export type WorkspaceEnvironmentVariableMetadata = VariableSetVariableMetadata;
 
-export const WorkspaceEnvironment = z.object({
+export const VariableSet = z.object({
   id: z.string().uuid(),
   accountId: z.string().uuid(),
   workspaceId: z.string().uuid(),
   name: z.string(),
   description: z.string().nullable(),
-  variables: z.array(WorkspaceEnvironmentVariableMetadata),
+  variables: z.array(VariableSetVariableMetadata),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
-export type WorkspaceEnvironment = z.infer<typeof WorkspaceEnvironment>;
+export type VariableSet = z.infer<typeof VariableSet>;
+/** @deprecated use VariableSet */
+export const WorkspaceEnvironment = VariableSet;
+/** @deprecated use VariableSet */
+export type WorkspaceEnvironment = VariableSet;
 
-export const CreateWorkspaceEnvironmentRequest = z.object({
+export const CreateVariableSetRequest = z.object({
   name: z.string().min(1).max(120),
   description: z.string().max(2000).optional(),
   variables: z.array(z.object({
-    name: WorkspaceEnvironmentVariableName,
+    name: VariableSetVariableName,
     value: z.string().min(1).max(32768),
   })).default([]),
 });
-export type CreateWorkspaceEnvironmentRequest = z.infer<typeof CreateWorkspaceEnvironmentRequest>;
+export type CreateVariableSetRequest = z.infer<typeof CreateVariableSetRequest>;
+/** @deprecated use CreateVariableSetRequest */
+export const CreateWorkspaceEnvironmentRequest = CreateVariableSetRequest;
+/** @deprecated use CreateVariableSetRequest */
+export type CreateWorkspaceEnvironmentRequest = CreateVariableSetRequest;
 
-export const UpdateWorkspaceEnvironmentRequest = z.object({
+export const UpdateVariableSetRequest = z.object({
   name: z.string().min(1).max(120).optional(),
   description: z.string().max(2000).nullable().optional(),
 });
-export type UpdateWorkspaceEnvironmentRequest = z.infer<typeof UpdateWorkspaceEnvironmentRequest>;
+export type UpdateVariableSetRequest = z.infer<typeof UpdateVariableSetRequest>;
+/** @deprecated use UpdateVariableSetRequest */
+export const UpdateWorkspaceEnvironmentRequest = UpdateVariableSetRequest;
+/** @deprecated use UpdateVariableSetRequest */
+export type UpdateWorkspaceEnvironmentRequest = UpdateVariableSetRequest;
 
-export const SetWorkspaceEnvironmentVariableRequest = z.object({
+export const SetVariableSetVariableRequest = z.object({
   value: z.string().min(1).max(32768),
 });
-export type SetWorkspaceEnvironmentVariableRequest = z.infer<typeof SetWorkspaceEnvironmentVariableRequest>;
+export type SetVariableSetVariableRequest = z.infer<typeof SetVariableSetVariableRequest>;
+/** @deprecated use SetVariableSetVariableRequest */
+export const SetWorkspaceEnvironmentVariableRequest = SetVariableSetVariableRequest;
+/** @deprecated use SetVariableSetVariableRequest */
+export type SetWorkspaceEnvironmentVariableRequest = SetVariableSetVariableRequest;
+
+// --- Rigs ---------------------------------------------------------------------
+// Workspace-scoped, versioned sandbox machine definitions. A rig is the named
+// truth; each sandbox is a disposable fork of a rig version. Versions are
+// append-only and content-immutable; exactly one is active per rig.
+
+// A self-declared health check: a name + the shell command that must exit 0.
+export const RigCheck = z.object({
+  name: z.string().min(1).max(120),
+  command: z.string().min(1).max(8192),
+});
+export type RigCheck = z.infer<typeof RigCheck>;
+
+export const RigVersion = z.object({
+  id: z.string().uuid(),
+  rigId: z.string().uuid(),
+  version: z.number().int().positive(),
+  image: z.string().nullable(),
+  setupScript: z.string().nullable(),
+  checks: z.array(RigCheck),
+  credentialHooks: z.array(z.string()),
+  defaultVariableSetIds: z.array(z.string().uuid()),
+  changelog: z.string().nullable(),
+  // Attribution: 'user:<subject>' | 'session:<id>' | 'system'.
+  createdBy: z.string().nullable(),
+  active: z.boolean(),
+  createdAt: z.string(),
+});
+export type RigVersion = z.infer<typeof RigVersion>;
+
+export const RigVerificationHealth = z.object({
+  checkHealth: z.enum(["passing", "failing", "unknown"]),
+  lastVerifiedAt: z.string().nullable(),
+});
+export type RigVerificationHealth = z.infer<typeof RigVerificationHealth>;
+
+export const Rig = z.object({
+  id: z.string().uuid(),
+  accountId: z.string().uuid(),
+  workspaceId: z.string().uuid(),
+  name: z.string(),
+  description: z.string().nullable(),
+  createdBy: z.string().nullable(),
+  // The rig's currently-active version (present after create; nullable so a
+  // partial/list read can omit it without a schema change).
+  activeVersion: RigVersion.nullable(),
+  // Summary for the currently active version. null only when there is no active
+  // version; otherwise "unknown" means the active version has no verification.
+  activeVersionHealth: RigVerificationHealth.nullable(),
+  versionCount: z.number().int().nonnegative(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+export type Rig = z.infer<typeof Rig>;
+
+export const RigChangeKind = z.enum(["setup_append", "definition_edit"]);
+export type RigChangeKind = z.infer<typeof RigChangeKind>;
+
+export const RigChangeStatus = z.enum(["proposed", "verifying", "merged", "rejected", "failed"]);
+export type RigChangeStatus = z.infer<typeof RigChangeStatus>;
+
+// A single check's outcome inside a verification run (populated in M4).
+export const RigCheckResult = z.object({
+  name: z.string(),
+  command: z.string(),
+  exitCode: z.number().int().nullable(),
+  output: z.string().optional(),
+});
+export type RigCheckResult = z.infer<typeof RigCheckResult>;
+
+// The verification record a rig-CI run writes onto a change (M4). Open-ended
+// (passthrough) so M4 can enrich it without a contracts break.
+export const RigChangeVerification = z.object({
+  startedAt: z.string().optional(),
+  finishedAt: z.string().optional(),
+  log: z.string().optional(),
+  checkResults: z.array(RigCheckResult).optional(),
+}).passthrough();
+export type RigChangeVerification = z.infer<typeof RigChangeVerification>;
+
+export const RigChange = z.object({
+  id: z.string().uuid(),
+  rigId: z.string().uuid(),
+  baseVersionId: z.string().uuid().nullable(),
+  kind: RigChangeKind,
+  payload: z.record(z.string(), z.unknown()),
+  status: RigChangeStatus,
+  proposedBy: z.string().nullable(),
+  verification: RigChangeVerification.nullable(),
+  resultVersionId: z.string().uuid().nullable(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+export type RigChange = z.infer<typeof RigChange>;
+
+export const CreateRigRequest = z.object({
+  name: z.string().min(1).max(120),
+  description: z.string().max(2000).optional(),
+  // Initial (version 1) content, inline.
+  image: z.string().max(1024).optional(),
+  setupScript: z.string().max(131072).optional(),
+  checks: z.array(RigCheck).max(100).default([]),
+  credentialHooks: z.array(z.string().min(1).max(200)).max(50).default([]),
+  defaultVariableSetIds: z.array(z.string().uuid()).max(25).default([]),
+});
+export type CreateRigRequest = z.infer<typeof CreateRigRequest>;
+
+export const UpdateRigRequest = z.object({
+  name: z.string().min(1).max(120).optional(),
+  description: z.string().max(2000).nullable().optional(),
+});
+export type UpdateRigRequest = z.infer<typeof UpdateRigRequest>;
+
+// setup_append: the exact command that already worked (+ an optional note).
+export const RigSetupAppendPayload = z.object({
+  command: z.string().min(1).max(8192),
+  note: z.string().max(2000).optional(),
+});
+export type RigSetupAppendPayload = z.infer<typeof RigSetupAppendPayload>;
+
+// definition_edit: the full next-version content (all fields optional; unset
+// fields inherit from the base version at promote time).
+export const RigDefinitionEditPayload = z.object({
+  image: z.string().max(1024).nullish(),
+  setupScript: z.string().max(131072).nullish(),
+  checks: z.array(RigCheck).max(100).optional(),
+  credentialHooks: z.array(z.string().min(1).max(200)).max(50).optional(),
+  defaultVariableSetIds: z.array(z.string().uuid()).max(25).optional(),
+  changelog: z.string().max(4096).nullish(),
+});
+export type RigDefinitionEditPayload = z.infer<typeof RigDefinitionEditPayload>;
+
+export const ProposeRigChangeRequest = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("setup_append"), payload: RigSetupAppendPayload }),
+  z.object({ kind: z.literal("definition_edit"), payload: RigDefinitionEditPayload }),
+]);
+export type ProposeRigChangeRequest = z.infer<typeof ProposeRigChangeRequest>;
 
 export const ScheduledTaskStatus = z.enum(["active", "paused"]);
 export type ScheduledTaskStatus = z.infer<typeof ScheduledTaskStatus>;
@@ -1994,7 +2182,13 @@ export const ScheduledTask = z.object({
   overlapPolicy: ScheduledTaskOverlapPolicy,
   agentConfig: ScheduledTaskAgentConfig,
   reusableSessionId: z.string().uuid().nullable(),
-  environmentId: z.string().uuid().nullable(),
+  variableSetId: z.string().uuid().nullable().default(null),
+  /** @deprecated use variableSetId */
+  environmentId: z.string().uuid().nullable().default(null),
+  // The rig each run binds to (M3). Stored on the task; the ACTIVE version is
+  // resolved PER FIRE (at dispatch), so a task always runs the rig's current
+  // version rather than one frozen at task-create time. Null ⇒ rig-less runs.
+  rigId: z.string().uuid().nullable().default(null),
   metadata: z.record(z.string(), z.unknown()),
   createdAt: z.string(),
   updatedAt: z.string(),
@@ -2018,26 +2212,33 @@ export const ScheduledTaskRun = z.object({
 });
 export type ScheduledTaskRun = z.infer<typeof ScheduledTaskRun>;
 
-export const CreateScheduledTaskRequest = z.object({
+export const CreateScheduledTaskRequest = withVariableSetIdAlias({
   name: z.string().min(1),
   schedule: ScheduledTaskScheduleSpec,
   runMode: ScheduledTaskRunMode.default("new_session_per_run"),
   overlapPolicy: ScheduledTaskOverlapPolicy.default("allow_concurrent"),
   agentConfig: ScheduledTaskAgentConfig,
   status: ScheduledTaskStatus.default("active"),
+  variableSetId: z.string().uuid().nullable().optional(),
   environmentId: z.string().uuid().nullable().optional(),
+  // The rig each run binds to (M3); its active version is resolved per fire.
+  rigId: z.string().uuid().nullable().optional(),
   metadata: z.record(z.string(), z.unknown()).default({}),
 });
 export type CreateScheduledTaskRequest = z.infer<typeof CreateScheduledTaskRequest>;
 
-export const UpdateScheduledTaskRequest = z.object({
+export const UpdateScheduledTaskRequest = withVariableSetIdAlias({
   name: z.string().min(1).optional(),
   schedule: ScheduledTaskScheduleSpec.optional(),
   runMode: ScheduledTaskRunMode.optional(),
   overlapPolicy: ScheduledTaskOverlapPolicy.optional(),
   agentConfig: ScheduledTaskAgentConfig.optional(),
   status: ScheduledTaskStatus.optional(),
+  variableSetId: z.string().uuid().nullable().optional(),
   environmentId: z.string().uuid().nullable().optional(),
+  // The rig each run binds to (M3); null clears it. Its active version is
+  // resolved per fire, so an update takes effect on the next dispatch.
+  rigId: z.string().uuid().nullable().optional(),
   metadata: z.record(z.string(), z.unknown()).optional(),
 });
 export type UpdateScheduledTaskRequest = z.infer<typeof UpdateScheduledTaskRequest>;
@@ -2137,7 +2338,37 @@ function isSafePackSkillRelativePath(path: string): boolean {
   return path.split("/").every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
 }
 
-export const CapabilityPack = z.object({
+const CapabilityPackVariableSet = z.object({
+  description: z.string().min(1),
+  requiredVariables: z.array(VariableSetVariableName).default([]),
+  required: z.boolean().default(false),
+});
+
+export const CapabilityPack = z.preprocess((input) => {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return input;
+  }
+  const record = input as Record<string, unknown>;
+  if (record.variableSet !== undefined) {
+    return record;
+  }
+  if (record.environment !== undefined) {
+    const { environment: _environment, ...rest } = record;
+    return { ...rest, variableSet: record.environment };
+  }
+  if (record.requiredVariables !== undefined) {
+    const { requiredVariables: _requiredVariables, ...rest } = record;
+    return {
+      ...rest,
+      variableSet: {
+        description: "Required variables",
+        requiredVariables: record.requiredVariables,
+        required: Array.isArray(record.requiredVariables) && record.requiredVariables.length > 0,
+      },
+    };
+  }
+  return record;
+}, z.object({
   id: z.string().min(1),
   name: z.string().min(1),
   description: z.string().min(1),
@@ -2163,13 +2394,9 @@ export const CapabilityPack = z.object({
   connectors: z.array(CapabilityPackConnector).default([]),
   knowledge: z.array(CapabilityPackKnowledge).default([]),
   scheduledTaskTemplates: z.array(CapabilityPackScheduledTaskTemplate).default([]),
-  environment: z.object({
-    description: z.string().min(1),
-    requiredVariables: z.array(WorkspaceEnvironmentVariableName).default([]),
-    required: z.boolean().default(false),
-  }).optional(),
+  variableSet: CapabilityPackVariableSet.optional(),
   metadata: z.record(z.string(), z.unknown()).default({}),
-});
+}));
 export type CapabilityPack = z.infer<typeof CapabilityPack>;
 
 // Registering a pack stores the manifest itself; the request body is a full
@@ -2201,7 +2428,8 @@ export const PackInstallation = z.object({
 });
 export type PackInstallation = z.infer<typeof PackInstallation>;
 
-export const EnablePackRequest = z.object({
+export const EnablePackRequest = withVariableSetIdAlias({
+  variableSetId: z.string().uuid().optional(),
   environmentId: z.string().uuid().optional(),
   metadata: z.record(z.string(), z.unknown()).default({}),
 });
@@ -2497,23 +2725,24 @@ export const CreateCapabilityCatalogItemRequest = z.object({
 });
 export type CreateCapabilityCatalogItemRequest = z.infer<typeof CreateCapabilityCatalogItemRequest>;
 
-export const EnableCapabilityRequest = z.object({
+export const EnableCapabilityRequest = withVariableSetIdAlias({
   config: z.record(z.string(), z.unknown()).default({}),
   metadata: z.record(z.string(), z.unknown()).default({}),
   connectionRef: McpServerConnectionRef.optional(),
   /**
    * Credential headers for remote MCP capabilities (for example an
    * Authorization bearer token). Values are encrypted at rest with the
-   * workspace-environments key, injected only into the runtime MCP client,
+   * workspace-variable-sets key, injected only into the runtime MCP client,
    * and never returned by the API — responses expose header names only.
    */
   headers: z.record(z.string(), z.string()).default({}),
   /**
-   * Initial environment attachment for kind=pack capabilities. Mirrors the
+   * Initial variableSet attachment for kind=pack capabilities. Mirrors the
    * dedicated POST /packs/:id/enable body: required to enable an
-   * environment.required pack through the unified capability-enable path,
+   * variableSet.required pack through the unified capability-enable path,
    * optional otherwise. Ignored by non-pack capabilities.
    */
+  variableSetId: z.string().uuid().optional(),
   environmentId: z.string().uuid().optional(),
 });
 export type EnableCapabilityRequest = z.infer<typeof EnableCapabilityRequest>;
@@ -2561,7 +2790,16 @@ export const Session = z.object({
   // stale in-flight op and retry against the new active sandbox.
   activeSandboxId: z.string().uuid().nullable(),
   activeEpoch: z.number().int().nonnegative(),
-  environmentId: z.string().uuid().nullable(),
+  variableSetId: z.string().uuid().nullable().default(null),
+  /** @deprecated use variableSetId */
+  environmentId: z.string().uuid().nullable().default(null),
+  // The rig this session rides (M3 runtime binding). Both are resolved and
+  // FROZEN at session create: rigId names the rig, rigVersionId pins the exact
+  // active version the session's box/env/setup/doctrine are built from for the
+  // session's whole life (a later promote does NOT move an existing session).
+  // Both null ⇒ a rig-less session (byte-for-byte today's behavior).
+  rigId: z.string().uuid().nullable().default(null),
+  rigVersionId: z.string().uuid().nullable().default(null),
   // Non-default first-party MCP token permissions (manager-style sessions);
   // null means the fixed worker default set.
   firstPartyMcpPermissions: z.array(Permission).nullable(),
@@ -2640,6 +2878,10 @@ export const SessionEventType = z.enum([
   "agent.model.usage",
   "tool.auth_needed",
   "agent.updated",
+  "rig.setup.started",
+  "rig.setup.completed",
+  "rig.setup.skipped",
+  "rig.setup.failed",
   "sandbox.operation.started",
   "sandbox.operation.completed",
   "sandbox.operation.failed",
@@ -3344,7 +3586,7 @@ export const SessionEvent = z.object({
 });
 export type SessionEvent = z.infer<typeof SessionEvent>;
 
-export const CreateSessionRequest = z.object({
+export const CreateSessionRequest = withVariableSetIdAlias({
   initialMessage: z.string().min(1),
   // Per-session agent persona/system instructions (org-visible metadata, NOT a
   // secret). Rides the SAME system-level instructions channel the per-workspace
@@ -3353,7 +3595,7 @@ export const CreateSessionRequest = z.object({
   // leaking them into the user-visible timeline (it is NEVER emitted as an
   // event, unlike goal/initialMessage). Trimmed, non-empty. The 32768-char cap
   // matches the codebase's largest free-form string convention (workspace
-  // environment variable values). Absent ⇒ byte-identical to today.
+  // variable set variable values). Absent ⇒ byte-identical to today.
   instructions: z.string().trim().min(1).max(32768).optional(),
   resources: z.array(ResourceRef).default([]),
   tools: z.array(ToolRef).default([]),
@@ -3372,9 +3614,15 @@ export const CreateSessionRequest = z.object({
   // (the agent's resolve_cwd handles both). Only valid WITH targetSandboxId
   // (workingDir alone is a 422); omitted ⇒ the machine's default workspace_root.
   workingDir: z.string().min(1).optional(),
-  // Workspace environment attachment is fixed at session creation; follow-up
+  // Variable set attachment is fixed at session creation; follow-up
   // user.message events cannot switch or add one.
+  variableSetId: z.string().uuid().optional(),
   environmentId: z.string().uuid().optional(),
+  // The rig to bind this session to (M3). Its ACTIVE version is resolved and
+  // FROZEN onto the session at create. Omitted ⇒ the workspace's default rig
+  // (workspaces.default_rig_id) when set, else a rig-less session (today's
+  // behavior). An id that does not name a rig in the workspace is a 422.
+  rigId: z.string().uuid().optional(),
   goal: GoalSpec.optional(),
   clientEventId: z.string().min(1).optional(),
   // Workspace-scoped CREATE idempotency key: collapses concurrent/retried
@@ -3386,7 +3634,7 @@ export const CreateSessionRequest = z.object({
   idempotencyKey: z.string().min(1).max(200).optional(),
   // Permissions the session's first-party MCP token should carry instead of
   // the fixed worker default — how an operator hands a manager-style session
-  // the orchestration/environment/github tools. Capped at creation: every
+  // the orchestration/variableSet/github tools. Capped at creation: every
   // requested permission must be held by the creating grant (no escalation).
   firstPartyMcpPermissions: z.array(Permission).optional(),
   // Third-party MCP servers attached only to this session. Credential headers are
@@ -3404,8 +3652,8 @@ export const CreateSessionRequest = z.object({
   // A shared spawn inherits the box's (backend, os) — it is literally the same
   // box; the child cannot pick its own backend. Cross-workspace sharing is
   // forbidden by construction (the parent/group reads are RLS-workspace-scoped).
-  // ENV-AWARE: the box's environment is fixed at creation, so a share requires
-  // the SAME environmentId as the creator's box. On a mismatch the inherited
+  // ENV-AWARE: the box's variable set is fixed at creation, so a share requires
+  // the SAME variableSetId as the creator's box. On a mismatch the inherited
   // default silently falls back to an own box; an explicit "shared"/{groupId}
   // request 422s at create (instead of the first turn dying on the SDK's
   // manifest-env guard).
@@ -4133,6 +4381,6 @@ function constantTimeEqual(actual: string, expected: string): boolean {
 
 export type HealthResponse = {
   service: string;
-  environment: string;
+  variableSet: string;
   ok: boolean;
 };

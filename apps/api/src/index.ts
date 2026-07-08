@@ -121,6 +121,22 @@ export async function createTemporalWorkflowClient(settings: ReturnType<typeof g
         throw error;
       }
     },
+    startRigVerification: async ({ workspaceId, changeId, versionId, workflowId }) => {
+      const targetId = changeId ?? versionId;
+      if (!targetId) {
+        throw new Error("rig verification requires changeId or versionId");
+      }
+      await temporal.workflow.start("rigVerificationWorkflow", {
+        taskQueue: settings.temporalTaskQueue,
+        workflowId: workflowId ?? `rig-verification-${targetId}-${crypto.randomUUID()}`,
+        workflowIdReusePolicy: "ALLOW_DUPLICATE",
+        args: [{
+          workspaceId,
+          ...(changeId ? { changeId } : {}),
+          ...(versionId ? { versionId } : {}),
+        }],
+      });
+    },
     check: async () => {
       await connection.workflowService.getSystemInfo({});
     },

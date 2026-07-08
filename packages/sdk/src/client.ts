@@ -38,7 +38,8 @@ import type {
   CreateKnowledgeMemoryRequest,
   CreateScheduledTaskRequest,
   CreateSessionRequest,
-  CreateWorkspaceEnvironmentRequest,
+  CreateVariableSetRequest,
+  CreateRigRequest,
   CreateWorkspaceRequest,
   // Enrollment UX (design 11): the click-Grant approve-page lookup/deny + headless
   // enroll-token mint.
@@ -128,13 +129,19 @@ import type {
   UpdateSessionGoalRequest,
   UpdateSessionRequest,
   UpdateSessionTurnRequest,
-  UpdateWorkspaceEnvironmentRequest,
+  UpdateVariableSetRequest,
+  UpdateRigRequest,
   UpdateWorkspaceMemberRequest,
   UpdateWorkspaceRequest,
   UpdateWorkspaceSettingsRequest,
+  SetWorkspaceDefaultRigRequest,
   UploadFileInput,
-  WorkspaceEnvironment,
-  WorkspaceEnvironmentVariableMetadata,
+  VariableSet,
+  VariableSetVariableMetadata,
+  Rig,
+  RigVersion,
+  RigChange,
+  ProposeRigChangeRequest,
   WorkspaceMember,
   WorkspaceMemorySearchRequest,
   WorkspaceMemorySearchResponse,
@@ -194,7 +201,7 @@ export class OpenGeniClient {
   constructor(options: OpenGeniClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
     this.options = options;
-    // Bind lazily so environments that polyfill fetch after module load work.
+    // Bind lazily so variable sets that polyfill fetch after module load work.
     this.fetchImpl = options.fetch ?? ((input, init) => fetch(input, init));
   }
 
@@ -893,56 +900,176 @@ export class OpenGeniClient {
     );
   }
 
-  // --- Environments --------------------------------------------------------------
+  // --- VariableSets --------------------------------------------------------------
   // Variable values are write-only: reads return name/version metadata only.
 
-  async listEnvironments(workspaceId: string): Promise<WorkspaceEnvironment[]> {
-    return await this.requestJson<WorkspaceEnvironment[]>("GET", `/v1/workspaces/${workspaceId}/environments`);
+  async listVariableSets(workspaceId: string): Promise<VariableSet[]> {
+    return await this.requestJson<VariableSet[]>("GET", `/v1/workspaces/${workspaceId}/variable-sets`);
   }
 
-  async createEnvironment(workspaceId: string, request: CreateWorkspaceEnvironmentRequest): Promise<WorkspaceEnvironment> {
-    return await this.requestJson<WorkspaceEnvironment>("POST", `/v1/workspaces/${workspaceId}/environments`, request);
+  async createVariableSet(workspaceId: string, request: CreateVariableSetRequest): Promise<VariableSet> {
+    return await this.requestJson<VariableSet>("POST", `/v1/workspaces/${workspaceId}/variable-sets`, request);
   }
 
-  async getEnvironment(workspaceId: string, environmentId: string): Promise<WorkspaceEnvironment> {
-    return await this.requestJson<WorkspaceEnvironment>("GET", `/v1/workspaces/${workspaceId}/environments/${environmentId}`);
+  async getVariableSet(workspaceId: string, variableSetId: string): Promise<VariableSet> {
+    return await this.requestJson<VariableSet>("GET", `/v1/workspaces/${workspaceId}/variable-sets/${variableSetId}`);
   }
 
-  async updateEnvironment(
+  async updateVariableSet(
     workspaceId: string,
-    environmentId: string,
-    request: UpdateWorkspaceEnvironmentRequest,
-  ): Promise<WorkspaceEnvironment> {
-    return await this.requestJson<WorkspaceEnvironment>(
+    variableSetId: string,
+    request: UpdateVariableSetRequest,
+  ): Promise<VariableSet> {
+    return await this.requestJson<VariableSet>(
       "PATCH",
-      `/v1/workspaces/${workspaceId}/environments/${environmentId}`,
+      `/v1/workspaces/${workspaceId}/variable-sets/${variableSetId}`,
       request,
     );
   }
 
-  async deleteEnvironment(workspaceId: string, environmentId: string): Promise<void> {
-    await this.requestJson<unknown>("DELETE", `/v1/workspaces/${workspaceId}/environments/${environmentId}`);
+  async deleteVariableSet(workspaceId: string, variableSetId: string): Promise<void> {
+    await this.requestJson<unknown>("DELETE", `/v1/workspaces/${workspaceId}/variable-sets/${variableSetId}`);
   }
 
   /** Create or rotate a variable. The value never comes back on any read. */
-  async setEnvironmentVariable(
+  async setVariableSetVariable(
     workspaceId: string,
-    environmentId: string,
+    variableSetId: string,
     name: string,
     value: string,
-  ): Promise<WorkspaceEnvironmentVariableMetadata> {
-    return await this.requestJson<WorkspaceEnvironmentVariableMetadata>(
+  ): Promise<VariableSetVariableMetadata> {
+    return await this.requestJson<VariableSetVariableMetadata>(
       "PUT",
-      `/v1/workspaces/${workspaceId}/environments/${environmentId}/variables/${encodeURIComponent(name)}`,
+      `/v1/workspaces/${workspaceId}/variable-sets/${variableSetId}/variables/${encodeURIComponent(name)}`,
       { value },
     );
   }
 
-  async deleteEnvironmentVariable(workspaceId: string, environmentId: string, name: string): Promise<void> {
+  async deleteVariableSetVariable(workspaceId: string, variableSetId: string, name: string): Promise<void> {
     await this.requestJson<unknown>(
       "DELETE",
-      `/v1/workspaces/${workspaceId}/environments/${environmentId}/variables/${encodeURIComponent(name)}`,
+      `/v1/workspaces/${workspaceId}/variable-sets/${variableSetId}/variables/${encodeURIComponent(name)}`,
     );
+  }
+
+  // --- Rigs ------------------------------------------------------------------
+  // Workspace-scoped, versioned sandbox machine definitions. rigs:use gates read
+  // + proposeRigChange; rigs:manage gates create / update / delete / activate.
+
+  async listRigs(workspaceId: string): Promise<Rig[]> {
+    return await this.requestJson<Rig[]>("GET", `/v1/workspaces/${workspaceId}/rigs`);
+  }
+
+  async createRig(workspaceId: string, request: CreateRigRequest): Promise<Rig> {
+    return await this.requestJson<Rig>("POST", `/v1/workspaces/${workspaceId}/rigs`, request);
+  }
+
+  async getRig(workspaceId: string, rigId: string): Promise<Rig> {
+    return await this.requestJson<Rig>("GET", `/v1/workspaces/${workspaceId}/rigs/${rigId}`);
+  }
+
+  async updateRig(workspaceId: string, rigId: string, request: UpdateRigRequest): Promise<Rig> {
+    return await this.requestJson<Rig>("PATCH", `/v1/workspaces/${workspaceId}/rigs/${rigId}`, request);
+  }
+
+  async deleteRig(workspaceId: string, rigId: string): Promise<void> {
+    await this.requestJson<unknown>("DELETE", `/v1/workspaces/${workspaceId}/rigs/${rigId}`);
+  }
+
+  async listRigVersions(workspaceId: string, rigId: string): Promise<RigVersion[]> {
+    return await this.requestJson<RigVersion[]>("GET", `/v1/workspaces/${workspaceId}/rigs/${rigId}/versions`);
+  }
+
+  /** Roll the active version to an existing one (rollback / promote-activate). */
+  async activateRigVersion(workspaceId: string, rigId: string, versionId: string): Promise<RigVersion> {
+    return await this.requestJson<RigVersion>(
+      "POST",
+      `/v1/workspaces/${workspaceId}/rigs/${rigId}/versions/${versionId}/activate`,
+    );
+  }
+
+  async listRigChanges(workspaceId: string, rigId: string): Promise<RigChange[]> {
+    return await this.requestJson<RigChange[]>("GET", `/v1/workspaces/${workspaceId}/rigs/${rigId}/changes`);
+  }
+
+  /** Propose a change against the rig's active version (rigs:use). */
+  async proposeRigChange(workspaceId: string, rigId: string, request: ProposeRigChangeRequest): Promise<RigChange> {
+    return await this.requestJson<RigChange>("POST", `/v1/workspaces/${workspaceId}/rigs/${rigId}/changes`, request);
+  }
+
+  async getRigChange(workspaceId: string, rigId: string, changeId: string): Promise<RigChange> {
+    return await this.requestJson<RigChange>("GET", `/v1/workspaces/${workspaceId}/rigs/${rigId}/changes/${changeId}`);
+  }
+
+  /**
+   * Re-run verification for a change (rigs:use). Verification is asynchronous:
+   * this returns the change immediately with status `verifying`; poll
+   * `getRigChange`/`listRigChanges` for the terminal outcome + logs.
+   */
+  async verifyRigChange(workspaceId: string, rigId: string, changeId: string): Promise<RigChange> {
+    return await this.requestJson<RigChange>(
+      "POST",
+      `/v1/workspaces/${workspaceId}/rigs/${rigId}/changes/${changeId}/verify`,
+    );
+  }
+
+  /**
+   * Promote a verified `definition_edit` change into a new active rig version
+   * (rigs:manage). Only valid once the change's verification passed; returns the
+   * newly minted version.
+   */
+  async promoteRigChange(workspaceId: string, rigId: string, changeId: string): Promise<RigVersion> {
+    return await this.requestJson<RigVersion>(
+      "POST",
+      `/v1/workspaces/${workspaceId}/rigs/${rigId}/changes/${changeId}/promote`,
+    );
+  }
+
+  /**
+   * Re-run the active version's checks in a clean throwaway sandbox (rigs:use).
+   * Asynchronous — returns the version id being verified; the outcome lands on
+   * the version's audit trail.
+   */
+  async verifyRig(workspaceId: string, rigId: string): Promise<{ ok: boolean; versionId: string }> {
+    return await this.requestJson<{ ok: boolean; versionId: string }>(
+      "POST",
+      `/v1/workspaces/${workspaceId}/rigs/${rigId}/verify`,
+    );
+  }
+
+  /** @deprecated use listVariableSets */
+  async listEnvironments(workspaceId: string): Promise<VariableSet[]> {
+    return await this.listVariableSets(workspaceId);
+  }
+
+  /** @deprecated use createVariableSet */
+  async createEnvironment(workspaceId: string, request: CreateVariableSetRequest): Promise<VariableSet> {
+    return await this.createVariableSet(workspaceId, request);
+  }
+
+  /** @deprecated use getVariableSet */
+  async getEnvironment(workspaceId: string, environmentId: string): Promise<VariableSet> {
+    return await this.getVariableSet(workspaceId, environmentId);
+  }
+
+  /** @deprecated use updateVariableSet */
+  async updateEnvironment(workspaceId: string, environmentId: string, request: UpdateVariableSetRequest): Promise<VariableSet> {
+    return await this.updateVariableSet(workspaceId, environmentId, request);
+  }
+
+  /** @deprecated use deleteVariableSet */
+  async deleteEnvironment(workspaceId: string, environmentId: string): Promise<void> {
+    await this.deleteVariableSet(workspaceId, environmentId);
+  }
+
+  /** @deprecated use setVariableSetVariable */
+  async setEnvironmentVariable(workspaceId: string, environmentId: string, name: string, value: string): Promise<VariableSetVariableMetadata> {
+    return await this.setVariableSetVariable(workspaceId, environmentId, name, value);
+  }
+
+  /** @deprecated use deleteVariableSetVariable */
+  async deleteEnvironmentVariable(workspaceId: string, environmentId: string, name: string): Promise<void> {
+    await this.deleteVariableSetVariable(workspaceId, environmentId, name);
   }
 
   // --- Files -----------------------------------------------------------------------
@@ -1099,6 +1226,10 @@ export class OpenGeniClient {
   /** Deep-merge a settings patch into the workspace (preserves unknown keys). */
   async updateWorkspaceSettings(workspaceId: string, request: UpdateWorkspaceSettingsRequest): Promise<Workspace> {
     return await this.requestJson<Workspace>("PATCH", `/v1/workspaces/${workspaceId}/settings`, request);
+  }
+
+  async setWorkspaceDefaultRig(workspaceId: string, request: SetWorkspaceDefaultRigRequest): Promise<Workspace> {
+    return await this.requestJson<Workspace>("PUT", `/v1/workspaces/${workspaceId}/default-rig`, request);
   }
 
   // --- Capability packs ------------------------------------------------------------------

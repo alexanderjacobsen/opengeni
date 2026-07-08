@@ -56,10 +56,17 @@ import type {
   ReasoningEffort,
   UsageEvent,
   Workspace,
-  WorkspaceEnvironment,
-  WorkspaceEnvironmentVariableMetadata,
+  VariableSet,
+  VariableSetVariableMetadata,
   WorkspaceMember,
   WorkspaceRegisteredPack,
+  Rig,
+  RigVersion,
+  RigVerificationHealth,
+  RigChange,
+  RigChangeKind,
+  RigChangeStatus,
+  RigCheck,
 } from "@opengeni/contracts";
 import { reasoningEffortForMetadata, CLEARED_RUN_STATE_BLOB, resolveWorkspaceMemoryEnabled } from "@opengeni/contracts";
 import { environmentsEncryptionKeyBytes, type Settings } from "@opengeni/config";
@@ -93,7 +100,12 @@ import {
 
 export { sql as dbSql } from "drizzle-orm";
 export { decryptEnvironmentValue, encryptEnvironmentValue } from "./environment-crypto";
+export {
+  decryptEnvironmentValue as decryptVariableSetValue,
+  encryptEnvironmentValue as encryptVariableSetValue,
+} from "./environment-crypto";
 export { sanitizeEventPayload, sanitizeEventString } from "./event-payload-sanitizer";
+export { sanitizeMemoryText } from "./memory-domain";
 // Re-exported so external consumers can `import { migrate } from "@opengeni/db"`.
 // The `@opengeni/db/migrate` subpath stays available too (internal callers + the
 // db:migrate script use it). Re-exporting does NOT run migrate.ts's
@@ -376,8 +388,8 @@ export const allWorkspacePermissions: Permission[] = [
   "api_keys:manage",
   "connections:read",
   "connections:write",
-  "environments:manage",
-  "environments:use",
+  "variable-sets:manage",
+  "variable-sets:use",
   "mcp_servers:attach",
   "goals:manage",
   "enrollments:read",
@@ -669,6 +681,17 @@ export async function updateWorkspace(db: Database, workspaceId: string, input: 
 export async function updateWorkspaceSettings(db: Database, workspaceId: string, patch: Record<string, unknown>): Promise<Workspace> {
   const [row] = await db.update(schema.workspaces).set({
     settings: sql`${schema.workspaces.settings} || ${JSON.stringify(patch)}::jsonb`,
+    updatedAt: new Date(),
+  }).where(eq(schema.workspaces.id, workspaceId)).returning();
+  if (!row) {
+    throw new Error(`Workspace not found: ${workspaceId}`);
+  }
+  return mapWorkspace(row);
+}
+
+export async function setWorkspaceDefaultRig(db: Database, workspaceId: string, rigId: string | null): Promise<Workspace> {
+  const [row] = await db.update(schema.workspaces).set({
+    defaultRigId: rigId,
     updatedAt: new Date(),
   }).where(eq(schema.workspaces.id, workspaceId)).returning();
   if (!row) {
@@ -1146,7 +1169,9 @@ export type CreateScheduledTaskInput = {
   runMode: ScheduledTaskRunMode;
   overlapPolicy: ScheduledTaskOverlapPolicy;
   agentConfig: ScheduledTaskAgentConfig;
-  environmentId?: string | null;
+  variableSetId?: string | null;
+  // The rig each run binds to (M3); active version resolved per fire at dispatch.
+  rigId?: string | null;
   metadata: Record<string, unknown>;
 };
 
@@ -1158,7 +1183,8 @@ export type UpdateScheduledTaskInput = Partial<{
   overlapPolicy: ScheduledTaskOverlapPolicy;
   agentConfig: ScheduledTaskAgentConfig;
   reusableSessionId: string | null;
-  environmentId: string | null;
+  variableSetId: string | null;
+  rigId: string | null;
   metadata: Record<string, unknown>;
 }>;
 
@@ -1425,7 +1451,7 @@ export type EnabledMcpCapabilityServer = {
   cacheToolsList?: boolean;
   /**
    * Credential request headers stored encrypted at enable time
-   * (AES-256-GCM under the workspace-environments key). Decrypted only at
+   * (AES-256-GCM under the workspace-variableSets key). Decrypted only at
    * the runtime boundary that builds the MCP client; never exposed by the
    * capability API surface.
    */
@@ -3539,7 +3565,8 @@ export async function updateScheduledTask(db: Database, workspaceId: string, tas
       ...(input.overlapPolicy !== undefined ? { overlapPolicy: input.overlapPolicy } : {}),
       ...(input.agentConfig !== undefined ? { agentConfig: input.agentConfig } : {}),
       ...(input.reusableSessionId !== undefined ? { reusableSessionId: input.reusableSessionId } : {}),
-      ...(input.environmentId !== undefined ? { environmentId: input.environmentId } : {}),
+      ...(input.variableSetId !== undefined ? { variableSetId: input.variableSetId } : {}),
+      ...(input.rigId !== undefined ? { rigId: input.rigId } : {}),
       ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
       updatedAt: new Date(),
     }).where(and(eq(schema.scheduledTasks.workspaceId, workspaceId), eq(schema.scheduledTasks.id, taskId))).returning();
@@ -3642,248 +3669,999 @@ export async function listScheduledTaskRuns(db: Database, workspaceId: string, t
   });
 }
 
-export async function createWorkspaceEnvironment(db: Database, input: {
+export async function createVariableSet(db: Database, input: {
   accountId: string;
   workspaceId: string;
   name: string;
   description?: string | null;
   variables?: Array<{ name: string; valueEncrypted: string }>;
-}): Promise<WorkspaceEnvironment> {
-  // withRlsContext wraps the callback in one transaction, so the environment
+}): Promise<VariableSet> {
+  // withRlsContext wraps the callback in one transaction, so the variableSet
   // row and all initial variables commit or roll back together.
   return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId }, async (scopedDb) => {
-    const [row] = await scopedDb.insert(schema.workspaceEnvironments).values({
+    const [row] = await scopedDb.insert(schema.workspaceVariableSets).values({
       accountId: input.accountId,
       workspaceId: input.workspaceId,
       name: input.name,
       description: input.description ?? null,
     }).returning();
     if (!row) {
-      throw new Error("Failed to create workspace environment");
+      throw new Error("Failed to create variable set");
     }
     const variables = input.variables ?? [];
     if (variables.length === 0) {
-      return mapWorkspaceEnvironment(row, []);
+      return mapVariableSet(row, []);
     }
-    const inserted = await scopedDb.insert(schema.workspaceEnvironmentVariables).values(variables.map((variable) => ({
+    const inserted = await scopedDb.insert(schema.workspaceVariableSetVariables).values(variables.map((variable) => ({
       accountId: input.accountId,
       workspaceId: input.workspaceId,
-      environmentId: row.id,
+      variableSetId: row.id,
       name: variable.name,
       valueEncrypted: variable.valueEncrypted,
     }))).returning({
-      name: schema.workspaceEnvironmentVariables.name,
-      version: schema.workspaceEnvironmentVariables.version,
-      createdAt: schema.workspaceEnvironmentVariables.createdAt,
-      updatedAt: schema.workspaceEnvironmentVariables.updatedAt,
+      name: schema.workspaceVariableSetVariables.name,
+      version: schema.workspaceVariableSetVariables.version,
+      createdAt: schema.workspaceVariableSetVariables.createdAt,
+      updatedAt: schema.workspaceVariableSetVariables.updatedAt,
     });
-    return mapWorkspaceEnvironment(row, inserted
-      .map(mapWorkspaceEnvironmentVariableMetadata)
+    return mapVariableSet(row, inserted
+      .map(mapVariableSetVariableMetadata)
       .sort((a, b) => a.name.localeCompare(b.name)));
   });
 }
 
-export async function listWorkspaceEnvironments(db: Database, workspaceId: string): Promise<WorkspaceEnvironment[]> {
+export async function listVariableSets(db: Database, workspaceId: string): Promise<VariableSet[]> {
   return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
-    const rows = await scopedDb.select().from(schema.workspaceEnvironments)
-      .where(eq(schema.workspaceEnvironments.workspaceId, workspaceId))
-      .orderBy(asc(schema.workspaceEnvironments.createdAt));
+    const rows = await scopedDb.select().from(schema.workspaceVariableSets)
+      .where(eq(schema.workspaceVariableSets.workspaceId, workspaceId))
+      .orderBy(asc(schema.workspaceVariableSets.createdAt));
     const variableRows = await scopedDb.select({
-      environmentId: schema.workspaceEnvironmentVariables.environmentId,
-      name: schema.workspaceEnvironmentVariables.name,
-      version: schema.workspaceEnvironmentVariables.version,
-      createdAt: schema.workspaceEnvironmentVariables.createdAt,
-      updatedAt: schema.workspaceEnvironmentVariables.updatedAt,
-    }).from(schema.workspaceEnvironmentVariables)
-      .where(eq(schema.workspaceEnvironmentVariables.workspaceId, workspaceId))
-      .orderBy(asc(schema.workspaceEnvironmentVariables.name));
-    const grouped = new Map<string, WorkspaceEnvironmentVariableMetadata[]>();
+      variableSetId: schema.workspaceVariableSetVariables.variableSetId,
+      name: schema.workspaceVariableSetVariables.name,
+      version: schema.workspaceVariableSetVariables.version,
+      createdAt: schema.workspaceVariableSetVariables.createdAt,
+      updatedAt: schema.workspaceVariableSetVariables.updatedAt,
+    }).from(schema.workspaceVariableSetVariables)
+      .where(eq(schema.workspaceVariableSetVariables.workspaceId, workspaceId))
+      .orderBy(asc(schema.workspaceVariableSetVariables.name));
+    const grouped = new Map<string, VariableSetVariableMetadata[]>();
     for (const variable of variableRows) {
-      const list = grouped.get(variable.environmentId) ?? [];
-      list.push(mapWorkspaceEnvironmentVariableMetadata(variable));
-      grouped.set(variable.environmentId, list);
+      const list = grouped.get(variable.variableSetId) ?? [];
+      list.push(mapVariableSetVariableMetadata(variable));
+      grouped.set(variable.variableSetId, list);
     }
-    return rows.map((row) => mapWorkspaceEnvironment(row, grouped.get(row.id) ?? []));
+    return rows.map((row) => mapVariableSet(row, grouped.get(row.id) ?? []));
   });
 }
 
-export async function getWorkspaceEnvironment(db: Database, workspaceId: string, environmentId: string): Promise<WorkspaceEnvironment | null> {
+export async function getVariableSet(db: Database, workspaceId: string, variableSetId: string): Promise<VariableSet | null> {
   return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
-    const [row] = await scopedDb.select().from(schema.workspaceEnvironments)
-      .where(and(eq(schema.workspaceEnvironments.workspaceId, workspaceId), eq(schema.workspaceEnvironments.id, environmentId)))
+    const [row] = await scopedDb.select().from(schema.workspaceVariableSets)
+      .where(and(eq(schema.workspaceVariableSets.workspaceId, workspaceId), eq(schema.workspaceVariableSets.id, variableSetId)))
       .limit(1);
     if (!row) {
       return null;
     }
-    return mapWorkspaceEnvironment(row, await listEnvironmentVariableMetadata(scopedDb, workspaceId, environmentId));
+    return mapVariableSet(row, await listVariableSetVariableMetadata(scopedDb, workspaceId, variableSetId));
   });
 }
 
-export async function getWorkspaceEnvironmentByName(db: Database, workspaceId: string, name: string): Promise<WorkspaceEnvironment | null> {
+export async function getVariableSetByName(db: Database, workspaceId: string, name: string): Promise<VariableSet | null> {
   return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
-    const [row] = await scopedDb.select().from(schema.workspaceEnvironments)
-      .where(and(eq(schema.workspaceEnvironments.workspaceId, workspaceId), eq(schema.workspaceEnvironments.name, name)))
+    const [row] = await scopedDb.select().from(schema.workspaceVariableSets)
+      .where(and(eq(schema.workspaceVariableSets.workspaceId, workspaceId), eq(schema.workspaceVariableSets.name, name)))
       .limit(1);
     if (!row) {
       return null;
     }
-    return mapWorkspaceEnvironment(row, await listEnvironmentVariableMetadata(scopedDb, workspaceId, row.id));
+    return mapVariableSet(row, await listVariableSetVariableMetadata(scopedDb, workspaceId, row.id));
   });
 }
 
-export async function updateWorkspaceEnvironment(db: Database, workspaceId: string, environmentId: string, input: {
+export async function updateVariableSet(db: Database, workspaceId: string, variableSetId: string, input: {
   name?: string;
   description?: string | null;
-}): Promise<WorkspaceEnvironment> {
+}): Promise<VariableSet> {
   return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
-    const [row] = await scopedDb.update(schema.workspaceEnvironments).set({
+    const [row] = await scopedDb.update(schema.workspaceVariableSets).set({
       ...(input.name !== undefined ? { name: input.name } : {}),
       ...(input.description !== undefined ? { description: input.description } : {}),
       updatedAt: new Date(),
-    }).where(and(eq(schema.workspaceEnvironments.workspaceId, workspaceId), eq(schema.workspaceEnvironments.id, environmentId))).returning();
+    }).where(and(eq(schema.workspaceVariableSets.workspaceId, workspaceId), eq(schema.workspaceVariableSets.id, variableSetId))).returning();
     if (!row) {
-      throw new Error(`Workspace environment not found: ${environmentId}`);
+      throw new Error(`Variable set not found: ${variableSetId}`);
     }
-    return mapWorkspaceEnvironment(row, await listEnvironmentVariableMetadata(scopedDb, workspaceId, environmentId));
+    return mapVariableSet(row, await listVariableSetVariableMetadata(scopedDb, workspaceId, variableSetId));
   });
 }
 
-export async function deleteWorkspaceEnvironment(db: Database, workspaceId: string, environmentId: string): Promise<boolean> {
+export async function deleteVariableSet(db: Database, workspaceId: string, variableSetId: string): Promise<boolean> {
   return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
-    const rows = await scopedDb.delete(schema.workspaceEnvironments)
-      .where(and(eq(schema.workspaceEnvironments.workspaceId, workspaceId), eq(schema.workspaceEnvironments.id, environmentId)))
-      .returning({ id: schema.workspaceEnvironments.id });
+    const rows = await scopedDb.delete(schema.workspaceVariableSets)
+      .where(and(eq(schema.workspaceVariableSets.workspaceId, workspaceId), eq(schema.workspaceVariableSets.id, variableSetId)))
+      .returning({ id: schema.workspaceVariableSets.id });
     return rows.length > 0;
   });
 }
 
-export async function countWorkspaceEnvironments(db: Database, workspaceId: string): Promise<number> {
+export async function countVariableSets(db: Database, workspaceId: string): Promise<number> {
   return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
     const [{ count } = { count: 0 }] = await scopedDb.select({
       count: sql<number>`count(*)::int`,
-    }).from(schema.workspaceEnvironments).where(eq(schema.workspaceEnvironments.workspaceId, workspaceId));
+    }).from(schema.workspaceVariableSets).where(eq(schema.workspaceVariableSets.workspaceId, workspaceId));
     return Number(count);
   });
 }
 
-export async function countScheduledTasksUsingEnvironment(db: Database, workspaceId: string, environmentId: string): Promise<number> {
+export async function countScheduledTasksUsingVariableSet(db: Database, workspaceId: string, variableSetId: string): Promise<number> {
   return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
     const [{ count } = { count: 0 }] = await scopedDb.select({
       count: sql<number>`count(*)::int`,
     }).from(schema.scheduledTasks)
-      .where(and(eq(schema.scheduledTasks.workspaceId, workspaceId), eq(schema.scheduledTasks.environmentId, environmentId)));
+      .where(and(eq(schema.scheduledTasks.workspaceId, workspaceId), eq(schema.scheduledTasks.variableSetId, variableSetId)));
     return Number(count);
   });
 }
 
-export async function countActiveSessionsUsingEnvironment(db: Database, workspaceId: string, environmentId: string): Promise<number> {
+export async function countActiveSessionsUsingVariableSet(db: Database, workspaceId: string, variableSetId: string): Promise<number> {
   return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
     const [{ count } = { count: 0 }] = await scopedDb.select({
       count: sql<number>`count(*)::int`,
     }).from(schema.sessions)
       .where(and(
         eq(schema.sessions.workspaceId, workspaceId),
-        eq(schema.sessions.environmentId, environmentId),
+        eq(schema.sessions.variableSetId, variableSetId),
         inArray(schema.sessions.status, ["queued", "running", "requires_action"]),
       ));
     return Number(count);
   });
 }
 
-export async function setWorkspaceEnvironmentVariable(db: Database, input: {
+export async function setVariableSetVariable(db: Database, input: {
   accountId: string;
   workspaceId: string;
-  environmentId: string;
+  variableSetId: string;
   name: string;
   valueEncrypted: string;
-}): Promise<WorkspaceEnvironmentVariableMetadata> {
+}): Promise<VariableSetVariableMetadata> {
   return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId }, async (scopedDb) => {
     const now = new Date();
-    const [row] = await scopedDb.insert(schema.workspaceEnvironmentVariables).values({
+    const [row] = await scopedDb.insert(schema.workspaceVariableSetVariables).values({
       accountId: input.accountId,
       workspaceId: input.workspaceId,
-      environmentId: input.environmentId,
+      variableSetId: input.variableSetId,
       name: input.name,
       valueEncrypted: input.valueEncrypted,
     }).onConflictDoUpdate({
       target: [
-        schema.workspaceEnvironmentVariables.workspaceId,
-        schema.workspaceEnvironmentVariables.environmentId,
-        schema.workspaceEnvironmentVariables.name,
+        schema.workspaceVariableSetVariables.workspaceId,
+        schema.workspaceVariableSetVariables.variableSetId,
+        schema.workspaceVariableSetVariables.name,
       ],
       set: {
         valueEncrypted: input.valueEncrypted,
-        version: sql`${schema.workspaceEnvironmentVariables.version} + 1`,
+        version: sql`${schema.workspaceVariableSetVariables.version} + 1`,
         updatedAt: now,
       },
     }).returning({
-      name: schema.workspaceEnvironmentVariables.name,
-      version: schema.workspaceEnvironmentVariables.version,
-      createdAt: schema.workspaceEnvironmentVariables.createdAt,
-      updatedAt: schema.workspaceEnvironmentVariables.updatedAt,
+      name: schema.workspaceVariableSetVariables.name,
+      version: schema.workspaceVariableSetVariables.version,
+      createdAt: schema.workspaceVariableSetVariables.createdAt,
+      updatedAt: schema.workspaceVariableSetVariables.updatedAt,
     });
     if (!row) {
-      throw new Error("Failed to set workspace environment variable");
+      throw new Error("Failed to set variable set variable");
     }
-    await scopedDb.update(schema.workspaceEnvironments).set({ updatedAt: now })
-      .where(and(eq(schema.workspaceEnvironments.workspaceId, input.workspaceId), eq(schema.workspaceEnvironments.id, input.environmentId)));
-    return mapWorkspaceEnvironmentVariableMetadata(row);
+    await scopedDb.update(schema.workspaceVariableSets).set({ updatedAt: now })
+      .where(and(eq(schema.workspaceVariableSets.workspaceId, input.workspaceId), eq(schema.workspaceVariableSets.id, input.variableSetId)));
+    return mapVariableSetVariableMetadata(row);
   });
 }
 
-export async function deleteWorkspaceEnvironmentVariable(db: Database, workspaceId: string, environmentId: string, name: string): Promise<boolean> {
+export async function deleteVariableSetVariable(db: Database, workspaceId: string, variableSetId: string, name: string): Promise<boolean> {
   return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
-    const rows = await scopedDb.delete(schema.workspaceEnvironmentVariables)
+    const rows = await scopedDb.delete(schema.workspaceVariableSetVariables)
       .where(and(
-        eq(schema.workspaceEnvironmentVariables.workspaceId, workspaceId),
-        eq(schema.workspaceEnvironmentVariables.environmentId, environmentId),
-        eq(schema.workspaceEnvironmentVariables.name, name),
+        eq(schema.workspaceVariableSetVariables.workspaceId, workspaceId),
+        eq(schema.workspaceVariableSetVariables.variableSetId, variableSetId),
+        eq(schema.workspaceVariableSetVariables.name, name),
       ))
-      .returning({ id: schema.workspaceEnvironmentVariables.id });
+      .returning({ id: schema.workspaceVariableSetVariables.id });
     if (rows.length > 0) {
-      await scopedDb.update(schema.workspaceEnvironments).set({ updatedAt: new Date() })
-        .where(and(eq(schema.workspaceEnvironments.workspaceId, workspaceId), eq(schema.workspaceEnvironments.id, environmentId)));
+      await scopedDb.update(schema.workspaceVariableSets).set({ updatedAt: new Date() })
+        .where(and(eq(schema.workspaceVariableSets.workspaceId, workspaceId), eq(schema.workspaceVariableSets.id, variableSetId)));
     }
     return rows.length > 0;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Rigs (migration 0047). Workspace-scoped, versioned sandbox machine definitions.
+// Versions are append-only + content-immutable: NO function below ever UPDATEs a
+// content column of rig_versions — only activateRigVersion flips the `active`
+// boolean. Every function runs through withWorkspaceRls / withRlsContext.
+// ---------------------------------------------------------------------------
+
+// Thrown when a rig_change status transition is illegal (merged/rejected are
+// terminal). The domain/route layer maps this to a 409.
+export class RigChangeTransitionError extends Error {
+  constructor(
+    public readonly changeId: string,
+    public readonly fromStatus: string,
+    public readonly toStatus: string,
+  ) {
+    super(`Rig change ${changeId} is ${fromStatus} (terminal); cannot transition to ${toStatus}`);
+    this.name = "RigChangeTransitionError";
+  }
+}
+
+export class RigActiveVersionChangedError extends Error {
+  constructor(
+    public readonly rigId: string,
+    public readonly expectedVersionId: string,
+    public readonly actualVersionId: string | null,
+  ) {
+    super(`Rig ${rigId} moved since verification: expected active ${expectedVersionId}, current active ${actualVersionId ?? "none"}`);
+    this.name = "RigActiveVersionChangedError";
+  }
+}
+
+export class RigChangeAlreadyVerifyingError extends Error {
+  constructor(public readonly changeId: string) {
+    super(`Rig change ${changeId} is already verifying`);
+    this.name = "RigChangeAlreadyVerifyingError";
+  }
+}
+
+export type RigVersionContentInput = {
+  image?: string | null;
+  setupScript?: string | null;
+  checks?: RigCheck[];
+  credentialHooks?: string[];
+  defaultVariableSetIds?: string[];
+  changelog?: string | null;
+  createdBy?: string | null;
+};
+
+function mapRigVersion(row: typeof schema.rigVersions.$inferSelect): RigVersion {
+  return {
+    id: row.id,
+    rigId: row.rigId,
+    version: row.version,
+    image: row.image,
+    setupScript: row.setupScript,
+    checks: row.checks,
+    credentialHooks: row.credentialHooks,
+    defaultVariableSetIds: row.defaultVariableSetIds,
+    changelog: row.changelog,
+    createdBy: row.createdBy,
+    active: row.active,
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+function unknownRigHealth(activeVersion: RigVersion | null): RigVerificationHealth | null {
+  return activeVersion ? { checkHealth: "unknown", lastVerifiedAt: null } : null;
+}
+
+function mapRig(row: typeof schema.rigs.$inferSelect, activeVersion: RigVersion | null, versionCount: number, activeVersionHealth: RigVerificationHealth | null = unknownRigHealth(activeVersion)): Rig {
+  return {
+    id: row.id,
+    accountId: row.accountId,
+    workspaceId: row.workspaceId,
+    name: row.name,
+    description: row.description,
+    createdBy: row.createdBy,
+    activeVersion,
+    activeVersionHealth,
+    versionCount,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+function mapRigChange(row: typeof schema.rigChanges.$inferSelect): RigChange {
+  return {
+    id: row.id,
+    rigId: row.rigId,
+    baseVersionId: row.baseVersionId,
+    kind: row.kind as RigChangeKind,
+    payload: row.payload,
+    status: row.status as RigChangeStatus,
+    proposedBy: row.proposedBy,
+    verification: (row.verification ?? null) as RigChange["verification"],
+    resultVersionId: row.resultVersionId,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+// Load a rig's active version + total version count within an existing RLS scope.
+async function loadRigActiveAndCount(scopedDb: Database, workspaceId: string, rigId: string): Promise<{ activeVersion: RigVersion | null; versionCount: number }> {
+  const [activeRow] = await scopedDb.select().from(schema.rigVersions)
+    .where(and(
+      eq(schema.rigVersions.workspaceId, workspaceId),
+      eq(schema.rigVersions.rigId, rigId),
+      eq(schema.rigVersions.active, true),
+    ))
+    .limit(1);
+  const [{ count } = { count: 0 }] = await scopedDb.select({ count: sql<number>`count(*)::int` })
+    .from(schema.rigVersions)
+    .where(and(eq(schema.rigVersions.workspaceId, workspaceId), eq(schema.rigVersions.rigId, rigId)));
+  return { activeVersion: activeRow ? mapRigVersion(activeRow) : null, versionCount: Number(count) };
+}
+
+type RigHealthCandidate = {
+  versionId: string;
+  checkHealth: "passing" | "failing";
+  verifiedAt: string;
+};
+
+function latestRigHealth(candidates: RigHealthCandidate[]): RigVerificationHealth {
+  let latest: RigHealthCandidate | null = null;
+  for (const candidate of candidates) {
+    if (!latest || Date.parse(candidate.verifiedAt) >= Date.parse(latest.verifiedAt)) {
+      latest = candidate;
+    }
+  }
+  return latest
+    ? { checkHealth: latest.checkHealth, lastVerifiedAt: latest.verifiedAt }
+    : { checkHealth: "unknown", lastVerifiedAt: null };
+}
+
+function verificationTimestamp(verification: Record<string, unknown> | null | undefined, fallback: Date): string {
+  return typeof verification?.finishedAt === "string" ? verification.finishedAt : fallback.toISOString();
+}
+
+async function loadRigHealthByActiveVersion(scopedDb: Database, workspaceId: string, activeVersions: RigVersion[]): Promise<Map<string, RigVerificationHealth>> {
+  const versionIds = activeVersions.map((version) => version.id);
+  const healthByVersion: Map<string, RigVerificationHealth> = new Map(
+    versionIds.map((versionId) => [versionId, { checkHealth: "unknown", lastVerifiedAt: null }]),
+  );
+  if (versionIds.length === 0) {
+    return healthByVersion;
+  }
+  const candidatesByVersion = new Map<string, RigHealthCandidate[]>();
+  const pushCandidate = (candidate: RigHealthCandidate) => {
+    candidatesByVersion.set(candidate.versionId, [...(candidatesByVersion.get(candidate.versionId) ?? []), candidate]);
+  };
+
+  const changes = await scopedDb.select({
+    resultVersionId: schema.rigChanges.resultVersionId,
+    verification: schema.rigChanges.verification,
+    updatedAt: schema.rigChanges.updatedAt,
+  }).from(schema.rigChanges)
+    .where(and(
+      eq(schema.rigChanges.workspaceId, workspaceId),
+      inArray(schema.rigChanges.resultVersionId, versionIds),
+    ));
+  for (const change of changes) {
+    if (!change.resultVersionId) {
+      continue;
+    }
+    const verification = (change.verification ?? null) as Record<string, unknown> | null;
+    if (verification?.passed === true) {
+      pushCandidate({
+        versionId: change.resultVersionId,
+        checkHealth: "passing",
+        verifiedAt: verificationTimestamp(verification, change.updatedAt),
+      });
+    } else if (verification?.passed === false) {
+      pushCandidate({
+        versionId: change.resultVersionId,
+        checkHealth: "failing",
+        verifiedAt: verificationTimestamp(verification, change.updatedAt),
+      });
+    }
+  }
+
+  const auditRows = await scopedDb.select({
+    action: schema.auditEvents.action,
+    metadata: schema.auditEvents.metadata,
+    occurredAt: schema.auditEvents.occurredAt,
+  }).from(schema.auditEvents)
+    .where(and(
+      eq(schema.auditEvents.workspaceId, workspaceId),
+      eq(schema.auditEvents.targetType, "rig"),
+      inArray(schema.auditEvents.action, ["rig.verification.passed", "rig.verification.failed"]),
+      inArray(sql<string>`${schema.auditEvents.metadata}->>'versionId'`, versionIds),
+    ));
+  for (const row of auditRows) {
+    const metadata = row.metadata ?? {};
+    const versionId = typeof metadata.versionId === "string" ? metadata.versionId : null;
+    if (!versionId || !healthByVersion.has(versionId)) {
+      continue;
+    }
+    const passed = typeof metadata.passed === "boolean" ? metadata.passed : row.action === "rig.verification.passed";
+    pushCandidate({
+      versionId,
+      checkHealth: passed ? "passing" : "failing",
+      verifiedAt: typeof metadata.finishedAt === "string" ? metadata.finishedAt : row.occurredAt.toISOString(),
+    });
+  }
+
+  for (const versionId of versionIds) {
+    healthByVersion.set(versionId, latestRigHealth(candidatesByVersion.get(versionId) ?? []));
+  }
+  return healthByVersion;
+}
+
+// Creates the rig row AND its version 1 (active) in one transaction: a failure
+// leaves nothing behind. version-1 content comes from `initialVersion`.
+export async function createRig(db: Database, input: {
+  accountId: string;
+  workspaceId: string;
+  name: string;
+  description?: string | null;
+  createdBy?: string | null;
+  initialVersion?: RigVersionContentInput;
+}): Promise<Rig> {
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId }, async (scopedDb) => {
+    const [rigRow] = await scopedDb.insert(schema.rigs).values({
+      accountId: input.accountId,
+      workspaceId: input.workspaceId,
+      name: input.name,
+      description: input.description ?? null,
+      createdBy: input.createdBy ?? null,
+    }).returning();
+    if (!rigRow) {
+      throw new Error("Failed to create rig");
+    }
+    const content = input.initialVersion ?? {};
+    const [versionRow] = await scopedDb.insert(schema.rigVersions).values({
+      accountId: input.accountId,
+      workspaceId: input.workspaceId,
+      rigId: rigRow.id,
+      version: 1,
+      image: content.image ?? null,
+      setupScript: content.setupScript ?? null,
+      checks: content.checks ?? [],
+      credentialHooks: content.credentialHooks ?? [],
+      defaultVariableSetIds: content.defaultVariableSetIds ?? [],
+      changelog: content.changelog ?? null,
+      createdBy: content.createdBy ?? input.createdBy ?? null,
+      active: true,
+    }).returning();
+    if (!versionRow) {
+      throw new Error("Failed to create initial rig version");
+    }
+    return mapRig(rigRow, mapRigVersion(versionRow), 1);
+  });
+}
+
+export async function listRigs(db: Database, workspaceId: string): Promise<Rig[]> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const rows = await scopedDb.select().from(schema.rigs)
+      .where(eq(schema.rigs.workspaceId, workspaceId))
+      .orderBy(asc(schema.rigs.createdAt));
+    if (rows.length === 0) {
+      return [];
+    }
+    const activeRows = await scopedDb.select().from(schema.rigVersions)
+      .where(and(eq(schema.rigVersions.workspaceId, workspaceId), eq(schema.rigVersions.active, true)));
+    const activeByRig = new Map(activeRows.map((row) => [row.rigId, mapRigVersion(row)]));
+    const healthByVersion = await loadRigHealthByActiveVersion(scopedDb, workspaceId, [...activeByRig.values()]);
+    const countRows = await scopedDb.select({
+      rigId: schema.rigVersions.rigId,
+      count: sql<number>`count(*)::int`,
+    }).from(schema.rigVersions)
+      .where(eq(schema.rigVersions.workspaceId, workspaceId))
+      .groupBy(schema.rigVersions.rigId);
+    const countByRig = new Map(countRows.map((row) => [row.rigId, Number(row.count)]));
+    return rows.map((row) => {
+      const activeVersion = activeByRig.get(row.id) ?? null;
+      return mapRig(row, activeVersion, countByRig.get(row.id) ?? 0, activeVersion ? healthByVersion.get(activeVersion.id) ?? unknownRigHealth(activeVersion) : null);
+    });
+  });
+}
+
+export async function getRig(db: Database, workspaceId: string, rigId: string): Promise<Rig | null> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [row] = await scopedDb.select().from(schema.rigs)
+      .where(and(eq(schema.rigs.workspaceId, workspaceId), eq(schema.rigs.id, rigId)))
+      .limit(1);
+    if (!row) {
+      return null;
+    }
+    const { activeVersion, versionCount } = await loadRigActiveAndCount(scopedDb, workspaceId, rigId);
+    const healthByVersion = await loadRigHealthByActiveVersion(scopedDb, workspaceId, activeVersion ? [activeVersion] : []);
+    return mapRig(row, activeVersion, versionCount, activeVersion ? healthByVersion.get(activeVersion.id) ?? unknownRigHealth(activeVersion) : null);
+  });
+}
+
+export async function getRigByName(db: Database, workspaceId: string, name: string): Promise<Rig | null> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [row] = await scopedDb.select().from(schema.rigs)
+      .where(and(eq(schema.rigs.workspaceId, workspaceId), eq(schema.rigs.name, name)))
+      .limit(1);
+    if (!row) {
+      return null;
+    }
+    const { activeVersion, versionCount } = await loadRigActiveAndCount(scopedDb, workspaceId, row.id);
+    const healthByVersion = await loadRigHealthByActiveVersion(scopedDb, workspaceId, activeVersion ? [activeVersion] : []);
+    return mapRig(row, activeVersion, versionCount, activeVersion ? healthByVersion.get(activeVersion.id) ?? unknownRigHealth(activeVersion) : null);
+  });
+}
+
+// name/description only — never touches versions (content immutability).
+export async function updateRig(db: Database, workspaceId: string, rigId: string, input: {
+  name?: string;
+  description?: string | null;
+}): Promise<Rig> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [row] = await scopedDb.update(schema.rigs).set({
+      ...(input.name !== undefined ? { name: input.name } : {}),
+      ...(input.description !== undefined ? { description: input.description } : {}),
+      updatedAt: new Date(),
+    }).where(and(eq(schema.rigs.workspaceId, workspaceId), eq(schema.rigs.id, rigId))).returning();
+    if (!row) {
+      throw new Error(`Rig not found: ${rigId}`);
+    }
+    const { activeVersion, versionCount } = await loadRigActiveAndCount(scopedDb, workspaceId, rigId);
+    const healthByVersion = await loadRigHealthByActiveVersion(scopedDb, workspaceId, activeVersion ? [activeVersion] : []);
+    return mapRig(row, activeVersion, versionCount, activeVersion ? healthByVersion.get(activeVersion.id) ?? unknownRigHealth(activeVersion) : null);
+  });
+}
+
+export async function deleteRig(db: Database, workspaceId: string, rigId: string): Promise<boolean> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const rows = await scopedDb.delete(schema.rigs)
+      .where(and(eq(schema.rigs.workspaceId, workspaceId), eq(schema.rigs.id, rigId)))
+      .returning({ id: schema.rigs.id });
+    return rows.length > 0;
+  });
+}
+
+export async function deleteRigIfNoActiveSessions(db: Database, workspaceId: string, rigId: string): Promise<{ deleted: boolean; activeSessionCount: number }> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [rig] = await scopedDb.select({ id: schema.rigs.id })
+      .from(schema.rigs)
+      .where(and(eq(schema.rigs.workspaceId, workspaceId), eq(schema.rigs.id, rigId)))
+      .for("update")
+      .limit(1);
+    if (!rig) {
+      return { deleted: false, activeSessionCount: 0 };
+    }
+    const [{ count } = { count: 0 }] = await scopedDb.select({ count: sql<number>`count(*)::int` })
+      .from(schema.sessions)
+      .where(and(
+        eq(schema.sessions.workspaceId, workspaceId),
+        eq(schema.sessions.rigId, rigId),
+        sql`${schema.sessions.status} not in ('failed', 'cancelled')`,
+      ));
+    const activeSessionCount = Number(count);
+    if (activeSessionCount > 0) {
+      return { deleted: false, activeSessionCount };
+    }
+    const rows = await scopedDb.delete(schema.rigs)
+      .where(and(eq(schema.rigs.workspaceId, workspaceId), eq(schema.rigs.id, rigId)))
+      .returning({ id: schema.rigs.id });
+    return { deleted: rows.length > 0, activeSessionCount };
+  });
+}
+
+export async function countRigs(db: Database, workspaceId: string): Promise<number> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [{ count } = { count: 0 }] = await scopedDb.select({ count: sql<number>`count(*)::int` })
+      .from(schema.rigs).where(eq(schema.rigs.workspaceId, workspaceId));
+    return Number(count);
+  });
+}
+
+export async function countSessionsUsingRig(db: Database, workspaceId: string, rigId: string): Promise<number> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [{ count } = { count: 0 }] = await scopedDb.select({ count: sql<number>`count(*)::int` })
+      .from(schema.sessions)
+      .where(and(eq(schema.sessions.workspaceId, workspaceId), eq(schema.sessions.rigId, rigId)));
+    return Number(count);
+  });
+}
+
+// Mints the next version for a rig (promote/rollback-mint paths, M4). Row-locks
+// the rig so concurrent mints get strictly-monotonic version numbers. When
+// `activate` is set, atomically deactivates the current active version first.
+export async function createRigVersion(db: Database, workspaceId: string, rigId: string, input: RigVersionContentInput, options: { activate?: boolean } = {}): Promise<RigVersion> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [rig] = await scopedDb.select({ id: schema.rigs.id, accountId: schema.rigs.accountId })
+      .from(schema.rigs)
+      .where(and(eq(schema.rigs.workspaceId, workspaceId), eq(schema.rigs.id, rigId)))
+      .for("update")
+      .limit(1);
+    if (!rig) {
+      throw new Error(`Rig not found: ${rigId}`);
+    }
+    const [{ max } = { max: 0 }] = await scopedDb.select({
+      max: sql<number>`coalesce(max(${schema.rigVersions.version}), 0)::int`,
+    }).from(schema.rigVersions)
+      .where(and(eq(schema.rigVersions.workspaceId, workspaceId), eq(schema.rigVersions.rigId, rigId)));
+    const nextVersion = Number(max) + 1;
+    if (options.activate) {
+      await scopedDb.update(schema.rigVersions).set({ active: false })
+        .where(and(
+          eq(schema.rigVersions.workspaceId, workspaceId),
+          eq(schema.rigVersions.rigId, rigId),
+          eq(schema.rigVersions.active, true),
+        ));
+    }
+    const [row] = await scopedDb.insert(schema.rigVersions).values({
+      accountId: rig.accountId,
+      workspaceId,
+      rigId,
+      version: nextVersion,
+      image: input.image ?? null,
+      setupScript: input.setupScript ?? null,
+      checks: input.checks ?? [],
+      credentialHooks: input.credentialHooks ?? [],
+      defaultVariableSetIds: input.defaultVariableSetIds ?? [],
+      changelog: input.changelog ?? null,
+      createdBy: input.createdBy ?? null,
+      active: options.activate ?? false,
+    }).returning();
+    if (!row) {
+      throw new Error("Failed to create rig version");
+    }
+    await scopedDb.update(schema.rigs).set({ updatedAt: new Date() })
+      .where(and(eq(schema.rigs.workspaceId, workspaceId), eq(schema.rigs.id, rigId)));
+    return mapRigVersion(row);
+  });
+}
+
+export async function createRigVersionForChangePromotion(db: Database, workspaceId: string, rigId: string, changeId: string, input: RigVersionContentInput & {
+  expectedActiveVersionId: string;
+}): Promise<{ version: RigVersion; change: RigChange }> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [rig] = await scopedDb.select({ id: schema.rigs.id, accountId: schema.rigs.accountId })
+      .from(schema.rigs)
+      .where(and(eq(schema.rigs.workspaceId, workspaceId), eq(schema.rigs.id, rigId)))
+      .for("update")
+      .limit(1);
+    if (!rig) {
+      throw new Error(`Rig not found: ${rigId}`);
+    }
+    const [currentChange] = await scopedDb.select().from(schema.rigChanges)
+      .where(and(
+        eq(schema.rigChanges.workspaceId, workspaceId),
+        eq(schema.rigChanges.rigId, rigId),
+        eq(schema.rigChanges.id, changeId),
+      ))
+      .for("update")
+      .limit(1);
+    if (!currentChange) {
+      throw new Error(`Rig change not found: ${changeId}`);
+    }
+    if (currentChange.status === "merged" || currentChange.status === "rejected") {
+      throw new RigChangeTransitionError(changeId, currentChange.status, "merged");
+    }
+    if (currentChange.baseVersionId !== input.expectedActiveVersionId) {
+      throw new RigActiveVersionChangedError(rigId, input.expectedActiveVersionId, currentChange.baseVersionId);
+    }
+    const [active] = await scopedDb.select({ id: schema.rigVersions.id })
+      .from(schema.rigVersions)
+      .where(and(
+        eq(schema.rigVersions.workspaceId, workspaceId),
+        eq(schema.rigVersions.rigId, rigId),
+        eq(schema.rigVersions.active, true),
+      ))
+      .limit(1);
+    if (active?.id !== input.expectedActiveVersionId) {
+      throw new RigActiveVersionChangedError(rigId, input.expectedActiveVersionId, active?.id ?? null);
+    }
+    const [{ max } = { max: 0 }] = await scopedDb.select({
+      max: sql<number>`coalesce(max(${schema.rigVersions.version}), 0)::int`,
+    }).from(schema.rigVersions)
+      .where(and(eq(schema.rigVersions.workspaceId, workspaceId), eq(schema.rigVersions.rigId, rigId)));
+    const nextVersion = Number(max) + 1;
+    await scopedDb.update(schema.rigVersions).set({ active: false })
+      .where(and(
+        eq(schema.rigVersions.workspaceId, workspaceId),
+        eq(schema.rigVersions.rigId, rigId),
+        eq(schema.rigVersions.active, true),
+      ));
+    const [versionRow] = await scopedDb.insert(schema.rigVersions).values({
+      accountId: rig.accountId,
+      workspaceId,
+      rigId,
+      version: nextVersion,
+      image: input.image ?? null,
+      setupScript: input.setupScript ?? null,
+      checks: input.checks ?? [],
+      credentialHooks: input.credentialHooks ?? [],
+      defaultVariableSetIds: input.defaultVariableSetIds ?? [],
+      changelog: input.changelog ?? null,
+      createdBy: input.createdBy ?? null,
+      active: true,
+    }).returning();
+    if (!versionRow) {
+      throw new Error("Failed to create rig version");
+    }
+    const [changeRow] = await scopedDb.update(schema.rigChanges).set({
+      status: "merged",
+      resultVersionId: versionRow.id,
+      updatedAt: new Date(),
+    }).where(and(eq(schema.rigChanges.workspaceId, workspaceId), eq(schema.rigChanges.id, changeId))).returning();
+    if (!changeRow) {
+      throw new Error(`Rig change not found: ${changeId}`);
+    }
+    await scopedDb.update(schema.rigs).set({ updatedAt: new Date() })
+      .where(and(eq(schema.rigs.workspaceId, workspaceId), eq(schema.rigs.id, rigId)));
+    return { version: mapRigVersion(versionRow), change: mapRigChange(changeRow) };
+  });
+}
+
+export async function listRigVersions(db: Database, workspaceId: string, rigId: string): Promise<RigVersion[]> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const rows = await scopedDb.select().from(schema.rigVersions)
+      .where(and(eq(schema.rigVersions.workspaceId, workspaceId), eq(schema.rigVersions.rigId, rigId)))
+      .orderBy(desc(schema.rigVersions.version));
+    return rows.map(mapRigVersion);
+  });
+}
+
+export async function getRigVersion(db: Database, workspaceId: string, rigId: string, versionId: string): Promise<RigVersion | null> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [row] = await scopedDb.select().from(schema.rigVersions)
+      .where(and(
+        eq(schema.rigVersions.workspaceId, workspaceId),
+        eq(schema.rigVersions.rigId, rigId),
+        eq(schema.rigVersions.id, versionId),
+      ))
+      .limit(1);
+    return row ? mapRigVersion(row) : null;
+  });
+}
+
+export async function getRigVersionById(db: Database, workspaceId: string, versionId: string): Promise<RigVersion | null> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [row] = await scopedDb.select().from(schema.rigVersions)
+      .where(and(
+        eq(schema.rigVersions.workspaceId, workspaceId),
+        eq(schema.rigVersions.id, versionId),
+      ))
+      .limit(1);
+    return row ? mapRigVersion(row) : null;
+  });
+}
+
+// M3 runtime: the rig's display name only (for the turn's doctrine block + setup
+// events/errors), without the extra active-version + count reads getRig does.
+export async function getRigName(db: Database, workspaceId: string, rigId: string): Promise<string | null> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [row] = await scopedDb.select({ name: schema.rigs.name }).from(schema.rigs)
+      .where(and(eq(schema.rigs.workspaceId, workspaceId), eq(schema.rigs.id, rigId)))
+      .limit(1);
+    return row?.name ?? null;
+  });
+}
+
+// Flips which version is active (rollback / promote-activate). Row-locks the rig
+// to serialize concurrent activations, deactivates the current active, activates
+// the target. Only touches the `active` flag — never content.
+export async function activateRigVersion(db: Database, workspaceId: string, rigId: string, versionId: string): Promise<RigVersion> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [rig] = await scopedDb.select({ id: schema.rigs.id }).from(schema.rigs)
+      .where(and(eq(schema.rigs.workspaceId, workspaceId), eq(schema.rigs.id, rigId)))
+      .for("update")
+      .limit(1);
+    if (!rig) {
+      throw new Error(`Rig not found: ${rigId}`);
+    }
+    const [target] = await scopedDb.select({ id: schema.rigVersions.id }).from(schema.rigVersions)
+      .where(and(
+        eq(schema.rigVersions.workspaceId, workspaceId),
+        eq(schema.rigVersions.rigId, rigId),
+        eq(schema.rigVersions.id, versionId),
+      ))
+      .limit(1);
+    if (!target) {
+      throw new Error(`Rig version not found: ${versionId}`);
+    }
+    await scopedDb.update(schema.rigVersions).set({ active: false })
+      .where(and(
+        eq(schema.rigVersions.workspaceId, workspaceId),
+        eq(schema.rigVersions.rigId, rigId),
+        eq(schema.rigVersions.active, true),
+      ));
+    const [row] = await scopedDb.update(schema.rigVersions).set({ active: true })
+      .where(and(
+        eq(schema.rigVersions.workspaceId, workspaceId),
+        eq(schema.rigVersions.rigId, rigId),
+        eq(schema.rigVersions.id, versionId),
+      )).returning();
+    if (!row) {
+      throw new Error(`Rig version not found: ${versionId}`);
+    }
+    await scopedDb.update(schema.rigs).set({ updatedAt: new Date() })
+      .where(and(eq(schema.rigs.workspaceId, workspaceId), eq(schema.rigs.id, rigId)));
+    return mapRigVersion(row);
+  });
+}
+
+export async function createRigChange(db: Database, input: {
+  accountId: string;
+  workspaceId: string;
+  rigId: string;
+  baseVersionId?: string | null;
+  kind: RigChangeKind;
+  payload: Record<string, unknown>;
+  proposedBy?: string | null;
+}): Promise<RigChange> {
+  return await withRlsContext(db, { accountId: input.accountId, workspaceId: input.workspaceId }, async (scopedDb) => {
+    const [row] = await scopedDb.insert(schema.rigChanges).values({
+      accountId: input.accountId,
+      workspaceId: input.workspaceId,
+      rigId: input.rigId,
+      baseVersionId: input.baseVersionId ?? null,
+      kind: input.kind,
+      payload: input.payload,
+      status: "proposed",
+      proposedBy: input.proposedBy ?? null,
+    }).returning();
+    if (!row) {
+      throw new Error("Failed to create rig change");
+    }
+    return mapRigChange(row);
+  });
+}
+
+export async function listRigChanges(db: Database, workspaceId: string, rigId: string, limit = 100): Promise<RigChange[]> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const rows = await scopedDb.select().from(schema.rigChanges)
+      .where(and(eq(schema.rigChanges.workspaceId, workspaceId), eq(schema.rigChanges.rigId, rigId)))
+      .orderBy(desc(schema.rigChanges.createdAt))
+      .limit(limit);
+    return rows.map(mapRigChange);
+  });
+}
+
+export async function getRigChange(db: Database, workspaceId: string, changeId: string): Promise<RigChange | null> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [row] = await scopedDb.select().from(schema.rigChanges)
+      .where(and(eq(schema.rigChanges.workspaceId, workspaceId), eq(schema.rigChanges.id, changeId)))
+      .limit(1);
+    return row ? mapRigChange(row) : null;
+  });
+}
+
+// Advances a change's lifecycle. merged/rejected are terminal (any attempted
+// transition throws RigChangeTransitionError). A supplied verification payload is
+// shallow-merged onto the existing one so a status bump can enrich it (M4).
+export async function updateRigChangeStatus(db: Database, workspaceId: string, changeId: string, input: {
+  status: RigChangeStatus;
+  verification?: Record<string, unknown> | null;
+  resultVersionId?: string | null;
+}): Promise<RigChange> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [current] = await scopedDb.select().from(schema.rigChanges)
+      .where(and(eq(schema.rigChanges.workspaceId, workspaceId), eq(schema.rigChanges.id, changeId)))
+      .for("update")
+      .limit(1);
+    if (!current) {
+      throw new Error(`Rig change not found: ${changeId}`);
+    }
+    const terminal = current.status === "merged" || current.status === "rejected";
+    if (terminal) {
+      throw new RigChangeTransitionError(changeId, current.status, input.status);
+    }
+    const mergedVerification = input.verification
+      ? { ...((current.verification as Record<string, unknown> | null) ?? {}), ...input.verification }
+      : undefined;
+    const [row] = await scopedDb.update(schema.rigChanges).set({
+      status: input.status,
+      ...(mergedVerification !== undefined ? { verification: mergedVerification } : {}),
+      ...(input.resultVersionId !== undefined ? { resultVersionId: input.resultVersionId } : {}),
+      updatedAt: new Date(),
+    }).where(and(eq(schema.rigChanges.workspaceId, workspaceId), eq(schema.rigChanges.id, changeId))).returning();
+    if (!row) {
+      throw new Error(`Rig change not found: ${changeId}`);
+    }
+    return mapRigChange(row);
+  });
+}
+
+export async function beginRigChangeVerificationAttempt(db: Database, workspaceId: string, changeId: string, input: {
+  startedAt: string;
+  allowAlreadyVerifying?: boolean;
+}): Promise<RigChange> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [current] = await scopedDb.select().from(schema.rigChanges)
+      .where(and(eq(schema.rigChanges.workspaceId, workspaceId), eq(schema.rigChanges.id, changeId)))
+      .for("update")
+      .limit(1);
+    if (!current) {
+      throw new Error(`Rig change not found: ${changeId}`);
+    }
+    if (current.status === "verifying") {
+      if (input.allowAlreadyVerifying) {
+        return mapRigChange(current);
+      }
+      throw new RigChangeAlreadyVerifyingError(changeId);
+    }
+    if (current.status === "merged") {
+      throw new RigChangeTransitionError(changeId, current.status, "verifying");
+    }
+    const previousVerification = (current.verification as Record<string, unknown> | null) ?? {};
+    const previousAttempt = typeof previousVerification.attempt === "number" ? previousVerification.attempt : 0;
+    const [row] = await scopedDb.update(schema.rigChanges).set({
+      status: "verifying",
+      verification: {
+        ...previousVerification,
+        attempt: previousAttempt + 1,
+        startedAt: input.startedAt,
+        checkResults: [],
+        finishedAt: null,
+        passed: null,
+        error: null,
+      },
+      updatedAt: new Date(),
+    }).where(and(eq(schema.rigChanges.workspaceId, workspaceId), eq(schema.rigChanges.id, changeId))).returning();
+    if (!row) {
+      throw new Error(`Rig change not found: ${changeId}`);
+    }
+    return mapRigChange(row);
   });
 }
 
 /**
  * The ONLY helper that selects value_encrypted. Used exclusively by the worker
  * activity that materializes a sandbox for a run whose session carries an
- * environment attachment. Do not call from API routes: values are write-only.
+ * variableSet attachment. Do not call from API routes: values are write-only.
  */
-export async function getWorkspaceEnvironmentValuesForRun(db: Database, workspaceId: string, environmentId: string): Promise<{
-  environment: { id: string; name: string; description: string | null };
+export async function getVariableSetValuesForRun(db: Database, workspaceId: string, variableSetId: string): Promise<{
+  variableSet: { id: string; name: string; description: string | null };
   values: Record<string, string>;
 } | null> {
   return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
-    const [environment] = await scopedDb.select({
-      id: schema.workspaceEnvironments.id,
-      name: schema.workspaceEnvironments.name,
-      description: schema.workspaceEnvironments.description,
-    }).from(schema.workspaceEnvironments)
-      .where(and(eq(schema.workspaceEnvironments.workspaceId, workspaceId), eq(schema.workspaceEnvironments.id, environmentId)))
+    const [variableSet] = await scopedDb.select({
+      id: schema.workspaceVariableSets.id,
+      name: schema.workspaceVariableSets.name,
+      description: schema.workspaceVariableSets.description,
+    }).from(schema.workspaceVariableSets)
+      .where(and(eq(schema.workspaceVariableSets.workspaceId, workspaceId), eq(schema.workspaceVariableSets.id, variableSetId)))
       .limit(1);
-    if (!environment) {
+    if (!variableSet) {
       return null;
     }
     const rows = await scopedDb.select({
-      name: schema.workspaceEnvironmentVariables.name,
-      valueEncrypted: schema.workspaceEnvironmentVariables.valueEncrypted,
-    }).from(schema.workspaceEnvironmentVariables)
+      name: schema.workspaceVariableSetVariables.name,
+      valueEncrypted: schema.workspaceVariableSetVariables.valueEncrypted,
+    }).from(schema.workspaceVariableSetVariables)
       .where(and(
-        eq(schema.workspaceEnvironmentVariables.workspaceId, workspaceId),
-        eq(schema.workspaceEnvironmentVariables.environmentId, environmentId),
+        eq(schema.workspaceVariableSetVariables.workspaceId, workspaceId),
+        eq(schema.workspaceVariableSetVariables.variableSetId, variableSetId),
       ));
     return {
-      environment: { id: environment.id, name: environment.name, description: environment.description },
+      variableSet: { id: variableSet.id, name: variableSet.name, description: variableSet.description },
       values: Object.fromEntries(rows.map((row) => [row.name, row.valueEncrypted])),
     };
   });
 }
 
-export type WorkspaceEnvironmentForRun = {
+/** @deprecated use createVariableSet */
+export const createWorkspaceEnvironment = createVariableSet;
+/** @deprecated use listVariableSets */
+export const listWorkspaceEnvironments = listVariableSets;
+/** @deprecated use getVariableSet */
+export const getWorkspaceEnvironment = getVariableSet;
+/** @deprecated use getVariableSetByName */
+export const getWorkspaceEnvironmentByName = getVariableSetByName;
+/** @deprecated use updateVariableSet */
+export const updateWorkspaceEnvironment = updateVariableSet;
+/** @deprecated use deleteVariableSet */
+export const deleteWorkspaceEnvironment = deleteVariableSet;
+/** @deprecated use countVariableSets */
+export const countWorkspaceEnvironments = countVariableSets;
+/** @deprecated use countScheduledTasksUsingVariableSet */
+export const countScheduledTasksUsingEnvironment = countScheduledTasksUsingVariableSet;
+/** @deprecated use countActiveSessionsUsingVariableSet */
+export const countActiveSessionsUsingEnvironment = countActiveSessionsUsingVariableSet;
+/** @deprecated use setVariableSetVariable */
+export const setWorkspaceEnvironmentVariable = setVariableSetVariable;
+/** @deprecated use deleteVariableSetVariable */
+export const deleteWorkspaceEnvironmentVariable = deleteVariableSetVariable;
+/** @deprecated use getVariableSetValuesForRun */
+export const getWorkspaceEnvironmentValuesForRun = getVariableSetValuesForRun;
+
+export type VariableSetForRun = {
   id: string;
   name: string;
   description: string | null;
@@ -3891,35 +4669,35 @@ export type WorkspaceEnvironmentForRun = {
 };
 
 /**
- * Load and decrypt the workspace environment attached to a run's session. SHARED
+ * Load and decrypt the variable set attached to a run's session. SHARED
  * by the worker TURN path (apps/worker agent-turn) AND the API-direct ATTACH paths
  * (viewer / Channel-A / desktop / terminal) so a box first warmed by an attach is
- * created with the SAME decrypted workspace-environment values the turn declares —
+ * created with the SAME decrypted workspace-variableSet values the turn declares —
  * the box-manifest env must match the agent-manifest env or the SDK's
- * `validateNoEnvironmentDelta` throws when the agent injects its manifest into the
+ * `validateNoVariableSetDelta` throws when the agent injects its manifest into the
  * resumed non-owned box.
  *
- * `environmentId === null` is the unattached path: zero DB work and behavior
+ * `variableSetId === null` is the unattached path: zero DB work and behavior
  * byte-identical to deployments without this feature. Attached runs fail closed: a
- * missing key or a deleted environment throws (names/ids only in messages) instead
+ * missing key or a deleted variableSet throws (names/ids only in messages) instead
  * of silently running without the secrets the run expects.
  */
-export async function loadWorkspaceEnvironmentForRun(
+export async function loadVariableSetForRun(
   db: Database,
   settings: Settings,
   workspaceId: string,
-  environmentId: string | null,
-): Promise<WorkspaceEnvironmentForRun | null> {
-  if (!environmentId) {
+  variableSetId: string | null,
+): Promise<VariableSetForRun | null> {
+  if (!variableSetId) {
     return null;
   }
   const key = environmentsEncryptionKeyBytes(settings);
   if (!key) {
-    throw new Error("workspace environment attached but OPENGENI_ENVIRONMENTS_ENCRYPTION_KEY is not configured");
+    throw new Error("variable set attached but OPENGENI_ENVIRONMENTS_ENCRYPTION_KEY is not configured");
   }
-  const stored = await getWorkspaceEnvironmentValuesForRun(db, workspaceId, environmentId);
+  const stored = await getVariableSetValuesForRun(db, workspaceId, variableSetId);
   if (!stored) {
-    throw new Error(`workspace environment not found: ${environmentId}`);
+    throw new Error(`variable set not found: ${variableSetId}`);
   }
   const values: Record<string, string> = {};
   for (const [name, encrypted] of Object.entries(stored.values)) {
@@ -3927,16 +4705,21 @@ export async function loadWorkspaceEnvironmentForRun(
       values[name] = decryptEnvironmentValue(key, encrypted);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      throw new Error(`failed to decrypt workspace environment variable ${name}: ${reason}`);
+      throw new Error(`failed to decrypt variable set variable ${name}: ${reason}`);
     }
   }
   return {
-    id: stored.environment.id,
-    name: stored.environment.name,
-    description: stored.environment.description,
+    id: stored.variableSet.id,
+    name: stored.variableSet.name,
+    description: stored.variableSet.description,
     values,
   };
 }
+
+/** @deprecated use loadVariableSetForRun */
+export const loadWorkspaceEnvironmentForRun = loadVariableSetForRun;
+/** @deprecated use VariableSetForRun */
+export type WorkspaceEnvironmentForRun = VariableSetForRun;
 
 // ---------------------------------------------------------------------------
 // Codex (ChatGPT) subscription credentials
@@ -4781,22 +5564,22 @@ export async function recordAuditEvent(db: Database, input: {
   });
 }
 
-async function listEnvironmentVariableMetadata(db: Database, workspaceId: string, environmentId: string): Promise<WorkspaceEnvironmentVariableMetadata[]> {
+async function listVariableSetVariableMetadata(db: Database, workspaceId: string, variableSetId: string): Promise<VariableSetVariableMetadata[]> {
   const rows = await db.select({
-    name: schema.workspaceEnvironmentVariables.name,
-    version: schema.workspaceEnvironmentVariables.version,
-    createdAt: schema.workspaceEnvironmentVariables.createdAt,
-    updatedAt: schema.workspaceEnvironmentVariables.updatedAt,
-  }).from(schema.workspaceEnvironmentVariables)
+    name: schema.workspaceVariableSetVariables.name,
+    version: schema.workspaceVariableSetVariables.version,
+    createdAt: schema.workspaceVariableSetVariables.createdAt,
+    updatedAt: schema.workspaceVariableSetVariables.updatedAt,
+  }).from(schema.workspaceVariableSetVariables)
     .where(and(
-      eq(schema.workspaceEnvironmentVariables.workspaceId, workspaceId),
-      eq(schema.workspaceEnvironmentVariables.environmentId, environmentId),
+      eq(schema.workspaceVariableSetVariables.workspaceId, workspaceId),
+      eq(schema.workspaceVariableSetVariables.variableSetId, variableSetId),
     ))
-    .orderBy(asc(schema.workspaceEnvironmentVariables.name));
-  return rows.map(mapWorkspaceEnvironmentVariableMetadata);
+    .orderBy(asc(schema.workspaceVariableSetVariables.name));
+  return rows.map(mapVariableSetVariableMetadata);
 }
 
-function mapWorkspaceEnvironment(row: typeof schema.workspaceEnvironments.$inferSelect, variables: WorkspaceEnvironmentVariableMetadata[]): WorkspaceEnvironment {
+function mapVariableSet(row: typeof schema.workspaceVariableSets.$inferSelect, variables: VariableSetVariableMetadata[]): VariableSet {
   return {
     id: row.id,
     accountId: row.accountId,
@@ -4809,12 +5592,12 @@ function mapWorkspaceEnvironment(row: typeof schema.workspaceEnvironments.$infer
   };
 }
 
-function mapWorkspaceEnvironmentVariableMetadata(row: {
+function mapVariableSetVariableMetadata(row: {
   name: string;
   version: number;
   createdAt: Date;
   updatedAt: Date;
-}): WorkspaceEnvironmentVariableMetadata {
+}): VariableSetVariableMetadata {
   return {
     name: row.name,
     version: row.version,
@@ -4983,7 +5766,11 @@ export async function createSession(db: Database, input: {
   metadata: Record<string, unknown>;
   model: string;
   sandboxBackend: SandboxBackend;
-  environmentId?: string | null;
+  variableSetId?: string | null;
+  // The rig + frozen active rig version resolved at create (M3). Both omitted/null
+  // ⇒ a rig-less session (byte-for-byte today's behavior).
+  rigId?: string | null;
+  rigVersionId?: string | null;
   firstPartyMcpPermissions?: Permission[] | null;
   // Per-session agent persona/system instructions (org-visible, not a secret).
   // Null/omitted ⇒ the session carries none (composed instructions unchanged).
@@ -5013,7 +5800,9 @@ export async function createSession(db: Database, input: {
       sandboxBackend: input.sandboxBackend,
       sandboxOs: input.sandboxOs ?? "linux",
       sandboxGroupId: input.sandboxGroupId ?? id,
-      environmentId: input.environmentId ?? null,
+      variableSetId: input.variableSetId ?? null,
+      rigId: input.rigId ?? null,
+      rigVersionId: input.rigVersionId ?? null,
       firstPartyMcpPermissions: input.firstPartyMcpPermissions ?? null,
       instructions: input.instructions ?? null,
       parentSessionId: input.parentSessionId ?? null,
@@ -5052,7 +5841,11 @@ export async function createSessionWithIdempotencyKey(db: Database, input: {
   metadata: Record<string, unknown>;
   model: string;
   sandboxBackend: SandboxBackend;
-  environmentId?: string | null;
+  variableSetId?: string | null;
+  // The rig + frozen active rig version resolved at create (M3). Both omitted/null
+  // ⇒ a rig-less session (byte-for-byte today's behavior).
+  rigId?: string | null;
+  rigVersionId?: string | null;
   firstPartyMcpPermissions?: Permission[] | null;
   // Per-session agent persona/system instructions (org-visible, not a secret).
   instructions?: string | null;
@@ -5080,7 +5873,9 @@ export async function createSessionWithIdempotencyKey(db: Database, input: {
       sandboxBackend: input.sandboxBackend,
       sandboxOs: input.sandboxOs ?? "linux",
       sandboxGroupId: input.sandboxGroupId ?? id,
-      environmentId: input.environmentId ?? null,
+      variableSetId: input.variableSetId ?? null,
+      rigId: input.rigId ?? null,
+      rigVersionId: input.rigVersionId ?? null,
       firstPartyMcpPermissions: input.firstPartyMcpPermissions ?? null,
       instructions: input.instructions ?? null,
       parentSessionId: input.parentSessionId ?? null,
@@ -5157,18 +5952,44 @@ export async function getAnySessionInGroup(db: Database, workspaceId: string, sa
 }
 
 /**
- * The DISTINCT environmentIds across a group's member sessions (workspace-
- * scoped; null = no environment attached). The env-aware create check compares
+ * The DISTINCT variableSetIds across a group's member sessions (workspace-
+ * scoped; null = no variableSet attached). The env-aware create check compares
  * a joiner against EVERY member — an arbitrary single member (getAnySessionInGroup)
  * makes the compatibility verdict nondeterministic for legacy env-blind groups
- * whose members carry mixed environmentIds.
+ * whose members carry mixed variableSetIds.
  */
-export async function listDistinctEnvironmentIdsInGroup(db: Database, workspaceId: string, sandboxGroupId: string): Promise<Array<string | null>> {
+export async function listDistinctVariableSetIdsInGroup(db: Database, workspaceId: string, sandboxGroupId: string): Promise<Array<string | null>> {
   return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
-    const rows = await scopedDb.selectDistinct({ environmentId: schema.sessions.environmentId }).from(schema.sessions)
+    const rows = await scopedDb.selectDistinct({ variableSetId: schema.sessions.variableSetId }).from(schema.sessions)
       .where(and(eq(schema.sessions.workspaceId, workspaceId), eq(schema.sessions.sandboxGroupId, sandboxGroupId)));
-    return rows.map((r) => r.environmentId ?? null);
+    return rows.map((r) => r.variableSetId ?? null);
   });
+}
+
+// M3 rig sharing gate: the distinct frozen rig_version_ids across a group's
+// sessions. Mirrors listDistinctVariableSetIdsInGroup — the box's rig-baked
+// setup is fixed at cold-create, so a session joining a group must carry the
+// SAME rig_version_id (or the join is a genuine shared-state conflict). A null
+// entry means a rig-less member (compatible only with another rig-less join).
+export async function listDistinctRigVersionIdsInGroup(db: Database, workspaceId: string, sandboxGroupId: string): Promise<Array<string | null>> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const rows = await scopedDb.selectDistinct({ rigVersionId: schema.sessions.rigVersionId }).from(schema.sessions)
+      .where(and(eq(schema.sessions.workspaceId, workspaceId), eq(schema.sessions.sandboxGroupId, sandboxGroupId)));
+    return rows.map((r) => r.rigVersionId ?? null);
+  });
+}
+
+// M3 default-rig fallback: the workspace's default rig id (workspaces.default_rig_id),
+// read WITHOUT surfacing it through the Workspace contract (a workspace-settings
+// UI concern deferred to M5). A create with no explicit rigId falls back to this.
+// Not RLS-scoped for the same reason getWorkspace is not: the workspace row is
+// addressed by its primary key and the caller already holds the workspace grant.
+export async function getWorkspaceDefaultRigId(db: Database, workspaceId: string): Promise<string | null> {
+  const [row] = await db.select({ defaultRigId: schema.workspaces.defaultRigId })
+    .from(schema.workspaces)
+    .where(eq(schema.workspaces.id, workspaceId))
+    .limit(1);
+  return row?.defaultRigId ?? null;
 }
 
 export type ListSessionsOptions = {
@@ -6330,6 +7151,7 @@ type LeaseRow = {
   backend: string;
   os: string;
   image: string | null;
+  rig_version_id: string | null;
   data_plane_url: string | null;
   terminal_data_plane_url: string | null;
   lease_epoch: number | string;
@@ -6354,6 +7176,11 @@ export interface LeaseSnapshot {
   // for a legacy/cold row (image unknown). Shared state: all the box's sessions run
   // this image; a resume resolving a different image conflicts (B3).
   image: string | null;
+  // The frozen rig version the group box was created under (M3). Like `image`,
+  // shared state: a resume resolving a DIFFERENT rig_version_id conflicts (solo
+  // recreates, N-holders throw SandboxRigConflictError). Null = rig unknown
+  // (legacy/cold row or a rig-less session), which never conflicts.
+  rigVersionId: string | null;
   dataPlaneUrl: string | null;
   // The cached ttyd pty-ws tunnel URL (7681), separate from dataPlaneUrl (the
   // 6080 desktop tunnel). Null until mintTerminalStream resolves + records it.
@@ -6389,6 +7216,12 @@ export interface AcquireLeaseInput {
   // box to recreate on this image, N-holders throw SandboxImageConflictError. Omitted
   // (null/undefined) -> image is not enforced (legacy/cold rows, selfhosted).
   image?: string | null;
+  // The frozen rig version this run rides (M3). Stamped on the cold-create + CAS
+  // and conflicted exactly like `image`: a live multi-holder box under a DIFFERENT
+  // rig version throws SandboxRigConflictError; a solo holder recreates the box cold
+  // on the new rig. Omitted (null/undefined) -> rig is not enforced (rig-less
+  // sessions never stamp or conflict; legacy/cold rows read null = compatible).
+  rigVersionId?: string | null;
   leaseTtlMs: number;          // refresh window for expires_at (turn-heartbeat cadence)
   // Expiry stamped only while a cold->warming spawner is allowed to create the
   // provider box before any instance_id exists. Warm/draining/attached refreshes
@@ -6441,6 +7274,26 @@ export class SandboxImageConflictError extends Error {
   }
 }
 
+// RIG IS SHARED STATE (M3): thrown when a resume resolves a rig version DIFFERENT from
+// the one the live shared box was set up under AND other holders are still on the box.
+// A rig bakes setup/tooling into the ONE shared filesystem; recreating it on a different
+// rig would yank that filesystem out from under the other sessions, so we refuse. The
+// turn activity surfaces this as an actionable error. A SOLO holder never hits this —
+// acquireLease recreates the box cold on the new rig instead. Mirrors SandboxImageConflictError.
+export class SandboxRigConflictError extends Error {
+  constructor(
+    public readonly sandboxGroupId: string,
+    public readonly currentRigVersionId: string,
+    public readonly requestedRigVersionId: string,
+  ) {
+    super(
+      `Sandbox group ${sandboxGroupId} was set up for rig version ${currentRigVersionId}; this run resolves rig version ${requestedRigVersionId}. `
+      + `A shared box requires one rig — spawn with sandbox:'new' for an isolated box or bind the group's rig.`,
+    );
+    this.name = "SandboxRigConflictError";
+  }
+}
+
 function mapLeaseRow(row: LeaseRow): LeaseSnapshot {
   return {
     id: row.id,
@@ -6453,6 +7306,7 @@ function mapLeaseRow(row: LeaseRow): LeaseSnapshot {
     backend: row.backend,
     os: row.os,
     image: row.image ?? null,
+    rigVersionId: row.rig_version_id ?? null,
     dataPlaneUrl: row.data_plane_url,
     terminalDataPlaneUrl: row.terminal_data_plane_url ?? null,
     // Defensive coercion: integer returns a number, but coerce regardless so the
@@ -6520,16 +7374,18 @@ export async function acquireLease(db: Database, input: AcquireLeaseInput): Prom
     await scopedDb.transaction(async (txRaw) => {
       const tx = txRaw as unknown as Database;
       const image = input.image ?? null;
+      const rigVersionId = input.rigVersionId ?? null;
       // (1) Materialize the singleton row if absent. ON CONFLICT DO NOTHING + the
       // unique index = idempotent under a race; concurrent inserts collapse to
       // one row. expires_at seeded so a never-warmed cold row has a valid TTL. The
-      // image (B3) is stamped on the cold-create so a fresh box records the image it
-      // will be built on; a conflict on an EXISTING live box is handled below.
+      // image (B3) + rig version (M3) are stamped on the cold-create so a fresh box
+      // records what it will be built on; a conflict on an EXISTING live box is
+      // handled below.
       await tx.execute(sql`
         insert into sandbox_leases
-          (account_id, workspace_id, sandbox_group_id, liveness, backend, os, image, expires_at)
+          (account_id, workspace_id, sandbox_group_id, liveness, backend, os, image, rig_version_id, expires_at)
         values
-          (${accountId}, ${workspaceId}, ${sandboxGroupId}, 'cold', ${backend}, ${os}, ${image},
+          (${accountId}, ${workspaceId}, ${sandboxGroupId}, 'cold', ${backend}, ${os}, ${image}, ${rigVersionId},
            now() + (${String(input.leaseTtlMs)} || ' milliseconds')::interval)
         on conflict (workspace_id, sandbox_group_id) do nothing
       `);
@@ -6547,37 +7403,50 @@ export async function acquireLease(db: Database, input: AcquireLeaseInput): Prom
 
       let liveness = row.liveness;
 
-      // -- IMAGE IS SHARED STATE (B3): a LIVE box (warm/draining/warming) already runs
-      // a specific image. If this run resolves a DIFFERENT image (both sides known),
-      // the shared filesystem cannot serve both. Under the held row lock we count the
-      // OTHER holders (holders that are not this exact (kind, holderId) — an idempotent
-      // retry of our own holder does not count as a rival):
-      //   - SOLO (no other holders): RECREATE. Reset the box to cold and re-stamp the
-      //     NEW image, then fall through to the cold branch below, which CASes us in as
-      //     the spawner. The spawner cold-creates a fresh box on the new image (the
-      //     archive replay in establishSandboxSessionFromEnvelope hydrates /workspace).
-      //   - OTHER holders present: REFUSE. Throw SandboxImageConflictError — recreating
-      //     would yank the running filesystem out from under the other sessions.
-      // Only enforced when BOTH images are known; a cold row / a legacy null-image box /
-      // an unset input image never conflicts (the selfhosted path passes no image).
-      if (liveness !== "cold" && image !== null && row.image !== null && row.image !== image) {
+      // -- SHARED STATE CONFLICT (B3 image + M3 rig): a LIVE box (warm/draining/warming)
+      // was created under a specific image AND rig version. If this run resolves a
+      // DIFFERENT image OR a DIFFERENT rig version (each checked only when both sides are
+      // known), the one shared filesystem cannot serve both. Under the held row lock we
+      // count the OTHER holders (not this exact (kind, holderId) — an idempotent retry of
+      // our own holder is not a rival):
+      //   - SOLO (no other holders): RECREATE. Reset the box to cold and re-stamp the NEW
+      //     image + rig version, then fall through to the cold branch below, which CASes us
+      //     in as the spawner. The spawner cold-creates a fresh box (the archive replay in
+      //     establishSandboxSessionFromEnvelope hydrates /workspace) — for the RIG case the
+      //     new box then re-runs the new rig's setup hook (fresh marker).
+      //   - OTHER holders present: REFUSE. Throw — recreating would yank the running
+      //     filesystem out from under the other sessions. Image conflict is reported first
+      //     so its (pre-rig) error is unchanged for the image-only case.
+      // Each axis is enforced only when BOTH sides are known; a cold row / a legacy null /
+      // an unset input never conflicts (the selfhosted path passes neither; a rig-less run
+      // passes no rigVersionId, so it never stamps or conflicts on rig).
+      const imageConflict = image !== null && row.image !== null && row.image !== image;
+      const rigConflict = rigVersionId !== null && row.rig_version_id !== null && row.rig_version_id !== rigVersionId;
+      if (liveness !== "cold" && (imageConflict || rigConflict)) {
         const others = await tx.execute<{ n: number }>(sql`
           select count(*)::int as n from sandbox_lease_holders
           where lease_id = ${row.id} and not (kind = ${kind} and holder_id = ${holderId})
         `);
         const otherHolders = Number(others[0]?.n ?? 0);
         if (otherHolders > 0) {
-          throw new SandboxImageConflictError(sandboxGroupId, row.image, image);
+          if (imageConflict) {
+            throw new SandboxImageConflictError(sandboxGroupId, row.image as string, image as string);
+          }
+          throw new SandboxRigConflictError(sandboxGroupId, row.rig_version_id as string, rigVersionId as string);
         }
-        // SOLO recreate: reset to cold + re-stamp the new image. Clear the live-box
-        // fields so no stale instance/tunnel survives the image roll (symmetric with
-        // failWarmingToCold). resume_state is nulled — a solo image change is an
-        // intentional fresh box (a divergent image cannot replay the old box's live
-        // state); the session envelope/archive still drives /workspace hydration on the
-        // cold re-create. Fall through to the cold branch, which CASes us in as spawner.
+        // SOLO recreate: reset to cold + re-stamp whichever axis this run carries (each
+        // conditional so a rig-only change does not null out a still-valid image and vice
+        // versa). Clear the live-box fields so no stale instance/tunnel survives the roll
+        // (symmetric with failWarmingToCold). resume_state is nulled — a solo image/rig
+        // change is an intentional fresh box (a divergent image/rig cannot replay the old
+        // box's live state); the session envelope/archive still drives /workspace
+        // hydration on the cold re-create. Fall through to the cold branch (CAS spawner).
         await tx.execute(sql`
           update sandbox_leases set
-            liveness = 'cold', image = ${image}, instance_id = null,
+            liveness = 'cold',
+            ${image !== null ? sql`image = ${image},` : sql``}
+            ${rigVersionId !== null ? sql`rig_version_id = ${rigVersionId},` : sql``}
+            instance_id = null,
             data_plane_url = null, terminal_data_plane_url = null,
             resume_backend_id = null, resume_state = null, updated_at = now()
           where id = ${row.id}
@@ -6601,6 +7470,7 @@ export async function acquireLease(db: Database, input: AcquireLeaseInput): Prom
           update sandbox_leases set
             liveness = 'warming',
             ${image !== null ? sql`image = ${image},` : sql``}
+            ${rigVersionId !== null ? sql`rig_version_id = ${rigVersionId},` : sql``}
             updated_at = now()
           where id = ${row.id} and liveness = 'cold'
           returning id
@@ -10286,7 +11156,12 @@ function mapSession(row: typeof schema.sessions.$inferSelect, mcpServers: Sessio
     // the fence exact even if the column type ever drifts (the lease-epoch lesson).
     activeSandboxId: row.activeSandboxId ?? null,
     activeEpoch: Number(row.activeEpoch),
-    environmentId: row.environmentId,
+    variableSetId: row.variableSetId,
+    environmentId: row.variableSetId,
+    // The rig + frozen rig version the session rides (M3). Both null for a
+    // rig-less session; frozen at create so a later promote never moves them.
+    rigId: row.rigId ?? null,
+    rigVersionId: row.rigVersionId ?? null,
     firstPartyMcpPermissions: (row.firstPartyMcpPermissions as Permission[] | null) ?? null,
     mcpServers,
     parentSessionId: row.parentSessionId ?? null,
@@ -10419,7 +11294,9 @@ function mapScheduledTask(row: typeof schema.scheduledTasks.$inferSelect): Sched
     overlapPolicy: row.overlapPolicy as ScheduledTaskOverlapPolicy,
     agentConfig: row.agentConfig as ScheduledTaskAgentConfig,
     reusableSessionId: row.reusableSessionId,
-    environmentId: row.environmentId,
+    variableSetId: row.variableSetId,
+    environmentId: row.variableSetId,
+    rigId: row.rigId ?? null,
     metadata: row.metadata,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
@@ -10563,6 +11440,7 @@ function mapWorkspace(row: typeof schema.workspaces.$inferSelect): Workspace {
     externalId: row.externalId,
     agentInstructions: row.agentInstructions ?? null,
     settings: (row.settings ?? {}) as Record<string, unknown>,
+    defaultRigId: row.defaultRigId ?? null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };

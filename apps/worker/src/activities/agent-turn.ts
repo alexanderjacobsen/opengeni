@@ -5,6 +5,8 @@ import {
   finishTurn,
   cancelTurnFromDyingDispatch,
   getBillingBalance,
+  getRigName,
+  getRigVersion,
   getSandbox,
   readActiveSandbox,
   requireFile,
@@ -67,6 +69,7 @@ import {
   type OpenGeniRuntime,
   type ComputerToolMode,
   type ModelResponseUsage,
+  type BuildAgentOptions,
   type EstablishedSandboxSession,
 } from "@opengeni/runtime";
 import { calculateModelUsageCostMicros, configuredModelPricing, configuredStaticUsageLimits, sandboxWarmRateMicrosPerSecond, type ModelUsageInput, type ModelProviderApi, type RegistryProviderKind, type Settings } from "@opengeni/config";
@@ -91,7 +94,7 @@ import {
 import { maybeCompactContext } from "./context-compaction";
 import { loadWorkspaceEnvironmentForRunWithCredentials, mintRunGitTokens, sandboxEnvironmentForRun } from "./environment";
 import { withCodexAppsTool, withFirstPartyTools } from "./goals";
-import { resolveWorkspaceAgentInstructions, resolveWorkspacePackRuntime, settingsWithPackSandboxImage } from "./packs";
+import { mergeRigDefaultVariableSetEnvironment, resolveWorkspaceAgentInstructions, resolveWorkspacePackRuntime, settingsWithPackSandboxImage, settingsWithRigImage } from "./packs";
 import { notifyParentOfChildTerminal } from "./parent-wake";
 import { createSecretRedactor, identityRedactor } from "./redaction";
 import { applyCodexHistoryStrip, turnInput, type TurnCodexAccount } from "./run-input";
@@ -1032,10 +1035,14 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
         console.error("session history dual-write failed (run unaffected)", persistError);
       }
     };
-    // Reassigned after the workspace environment loads; the publish closure is
-    // created (and used for turn.started) before the environment is available.
+    // Reassigned after the variable set loads; the publish closure is
+    // created (and used for turn.started) before the variableSet is available.
     let redact: (payload: unknown) => unknown = identityRedactor;
-    let environmentId = "";
+    let variableSetId = "";
+    // Rig telemetry (M3): set once the session loads; empty string for a rig-less
+    // turn (mirrors variableSetId). Read by the activity span's finally block.
+    let rigId = "";
+    let rigVersionId = "";
     // The Codex account this turn runs on (pin > workspace active), resolved once
     // a codex-billed turn is confirmed and threaded into the token resolver below.
     let effectiveCodexCredentialId: string | null = null;
@@ -1095,7 +1102,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       // the local credit read). Unset port → today's local-ledger path.
       await ensureRunAllowed(settings, db, input.accountId, input.workspaceId, isCodexTurn, entitlements);
       const activityContext = currentActivityContext();
-      // Setup (environment load, MCP connects, sandbox restore) does not
+      // Setup (variableSet load, MCP connects, sandbox restore) does not
       // stream and so never observes cancellation on its own; these explicit
       // checks let a graceful shutdown preempt the turn before the worker is
       // force-killed instead of riding the setup to a heartbeat timeout.
@@ -1283,6 +1290,25 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       // packs declaring images) fails the turn with its plain error instead
       // of failing the activity opaquely.
       const packRuntime = await resolveWorkspacePackRuntime(db, input.workspaceId);
+      // RIG BINDING (M3): load the session's FROZEN rig version (resolved+frozen
+      // at create). Everything rig-derived below (image precedence, env default
+      // sets, setup hook, credential hooks, doctrine, lease/telemetry stamps) is
+      // gated on this being non-null, so a rig-less session takes a zero-cost
+      // branch that is byte-for-byte today's turn. Both ids are frozen together;
+      // a defensive null (e.g. a since-deleted rig FK-nulled the columns) simply
+      // runs the turn rig-less.
+      const rigVersion = session.rigId && session.rigVersionId
+        ? await getRigVersion(db, input.workspaceId, session.rigId, session.rigVersionId)
+        : null;
+      // Rig display name for the doctrine block + setup events/errors (only on a
+      // rig-bound turn; null-safe fallback keeps the turn alive if the rig row is
+      // gone). Loaded once here alongside the version.
+      const rigName = rigVersion && session.rigId
+        ? (await getRigName(db, input.workspaceId, session.rigId)) ?? "rig"
+        : null;
+      // Telemetry: stamp the frozen rig binding (empty for a rig-less turn).
+      rigId = session.rigId ?? "";
+      rigVersionId = session.rigVersionId ?? "";
       // Workspace tier of the agent-persona resolution (session > workspace >
       // deployment default). null means the workspace has no override, so the
       // runtime falls back to runSettings.agentInstructionsTemplate (the
@@ -1290,7 +1316,14 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       const workspaceAgentInstructions = await resolveWorkspaceAgentInstructions(db, input.workspaceId);
       const workspaceMemory = await resolveWorkspaceMemoryBlock(db, input.workspaceId);
       const baseRunSettings = {
-        ...settingsWithPackSandboxImage(capabilitySettings, packRuntime.sandboxImage),
+        // IMAGE PRECEDENCE (M3): rig > pack > deployment. settingsWithRigImage runs
+        // OUTERMOST so a rig-pinned image overrides both the pack image and the
+        // deployment default; a rig with no image (or a rig-less turn) is a
+        // pass-through, leaving the pack/deployment chain exactly as today.
+        ...settingsWithRigImage(
+          settingsWithPackSandboxImage(capabilitySettings, packRuntime.sandboxImage),
+          rigVersion?.image ?? null,
+        ),
         openaiModel: turn.model,
         openaiReasoningEffort: turn.reasoningEffort,
         sandboxBackend: turn.sandboxBackend,
@@ -1345,19 +1378,47 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       // resolved at connect time from the codex ALS (see the withCodex-wrapped
       // prepareTools call below).
       const turnTools = withCodexAppsTool(runSettings, withFirstPartyTools(runSettings, mergeToolRefs(session.tools, turn.tools)));
-      // §7.6 P4a — load (and decrypt) the workspace environment via the host
+      // §7.6 P4a — load (and decrypt) the variable set via the host
       // `sandboxSecrets` provider when bound; unset → today's local decrypt.
       const connectionScope = { accountId: input.accountId, workspaceId: input.workspaceId };
-      const workspaceEnvironment = await loadWorkspaceEnvironmentForRunWithCredentials(
+      const workspaceVariableSet = await loadWorkspaceEnvironmentForRunWithCredentials(
         db,
         runSettings,
         connectionScope,
-        session.environmentId,
+        session.variableSetId,
         connectionCredentials?.sandboxSecrets,
       );
-      environmentId = workspaceEnvironment?.id ?? "";
+      variableSetId = workspaceVariableSet?.id ?? "";
+      // RIG DEFAULT VARIABLE SETS (M3): decrypt the frozen rig version's default
+      // variable sets and layer them BELOW the session's own set — the session's
+      // values WIN on any key collision. Loaded through the SAME host-secrets
+      // provider path as the session set (embedded-topology parity). Precedence
+      // WITHIN the rig defaults is listed order (a later set overrides an earlier
+      // one), then the session set overrides all. STABLE-ENV INVARIANT: the rig
+      // VERSION is frozen per session, so the SET of default variable sets is
+      // fixed for the session's life — the merged manifest env is therefore stable
+      // across the session's turns (the same guarantee the session's own variable
+      // set already relies on), keeping validateNoEnvironmentDelta empty.
+      const rigDefaultEnvironmentValues: Record<string, string> = {};
+      for (const rigDefaultVariableSetId of rigVersion?.defaultVariableSetIds ?? []) {
+        const rigDefaultSet = await loadWorkspaceEnvironmentForRunWithCredentials(
+          db,
+          runSettings,
+          connectionScope,
+          rigDefaultVariableSetId,
+          connectionCredentials?.sandboxSecrets,
+        );
+        Object.assign(rigDefaultEnvironmentValues, rigDefaultSet?.values ?? {});
+      }
+      // Session set wins collisions with the rig defaults (explicit precedence).
+      const sandboxWorkspaceEnvironmentValues = mergeRigDefaultVariableSetEnvironment(
+        rigDefaultEnvironmentValues,
+        workspaceVariableSet?.values ?? {},
+      );
+      // Redact EVERY exported secret value (rig defaults + session set) from turn
+      // output, not just the session set's.
       redact = createSecretRedactor(
-        Object.entries(workspaceEnvironment?.values ?? {}).map(([name, value]) => ({ name, value })),
+        Object.entries(sandboxWorkspaceEnvironmentValues).map(([name, value]) => ({ name, value })),
       );
       // EFFECTIVE compute backend, resolved ONCE at turn start (Case B + Stage D
       // D1-lite) and reused for EVERY downstream decision: the env mint (skip
@@ -1435,7 +1496,9 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       } = await sandboxEnvironmentForRun(
         runSettings,
         turnResources,
-        workspaceEnvironment?.values ?? {},
+        // Rig default sets merged BELOW the session set (session wins); rig-less
+        // turns pass exactly workspaceVariableSet?.values (byte-for-byte today).
+        sandboxWorkspaceEnvironmentValues,
         {
           skipGitHubToken: activeSandboxBackend === "selfhosted",
           deferGitHubToken: activeSandboxBackend !== "selfhosted" && establishPolicy === "on-demand",
@@ -1454,9 +1517,9 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       // backend is "none" -> never resolve (no box to touch).
       //
       // Established AFTER sandboxEnvironment is computed (not before) so the box's
-      // manifest is created with the SAME environment the agent declares — the SDK
+      // manifest is created with the SAME variableSet the agent declares — the SDK
       // applies the agent's manifest to this provided session and throws on ANY
-      // environment delta (validateNoEnvironmentDelta). Passing sandboxEnvironment
+      // variableSet delta (validateNoEnvironmentDelta). Passing sandboxEnvironment
       // here makes current==target so the delta is empty.
       if (settings.sandboxOwnershipEnabled && turn.sandboxBackend !== "none") {
         sandboxHolderId = dispatchId ?? `turn:${turnId}`;
@@ -1554,6 +1617,11 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
               ...((runSettings.modalImageRef ?? runSettings.dockerImage)
                 ? { image: runSettings.modalImageRef ?? runSettings.dockerImage }
                 : {}),
+              // RIG IS SHARED STATE (M3): stamp the frozen rig version so the lease
+              // conflicts on a live shared box set up under a different rig (solo
+              // recreate / N-holders SandboxRigConflictError). Omitted for a rig-less
+              // turn -> never stamped or enforced (shares exactly as today).
+              ...(rigVersion ? { rigVersionId: rigVersion.id } : {}),
             },
             "turn",
             sandboxHolderId,
@@ -1639,6 +1707,22 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       // resolved ONCE at turn start (above) via resolveActiveSandboxBackend (the
       // tested gate) and is reused here — resolving once is correct because the
       // clone hook runs at beforeAgentStart, so a mid-turn swap can't affect it.
+      // buildAgent's option key is `workspaceEnvironment` (internal runtime
+      // symbol; the product concept is a variable set). Built as a TYPED const —
+      // a direct literal assignment to Pick<BuildAgentOptions,...> IS excess-
+      // property-checked, so a wrong key fails tsc. A bare conditional spread
+      // inside the options literal is NOT checked, which is exactly how the M1
+      // key regression (workspaceVariableSet vs workspaceEnvironment) slipped
+      // through and silently dropped the variable-set instructions block.
+      const workspaceEnvironmentOption: Pick<BuildAgentOptions, "workspaceEnvironment"> = workspaceVariableSet
+        ? {
+          workspaceEnvironment: {
+            name: workspaceVariableSet.name,
+            description: workspaceVariableSet.description,
+            variableNames: Object.keys(workspaceVariableSet.values),
+          },
+        }
+        : {};
       const agent = runtime.buildAgent(runSettings, turnResources, {
         reasoningEffort: turn.reasoningEffort,
         genesisTitleHint: isGenesisTurn,
@@ -1717,13 +1801,27 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
         // Composed system-level AFTER the workspace persona so it refines it for
         // this one session; absent ⇒ byte-identical to today's composition.
         ...(session.instructions ? { sessionInstructions: session.instructions } : {}),
-        ...(workspaceEnvironment
+        ...workspaceEnvironmentOption,
+        // RIG RUNTIME (M3): the doctrine block, the setup-script hook (only when
+        // the frozen version carries a non-empty script), and the rig credential
+        // hooks. All absent for a rig-less turn (byte-for-byte today).
+        ...(rigVersion && rigName
           ? {
-            workspaceEnvironment: {
-              name: workspaceEnvironment.name,
-              description: workspaceEnvironment.description,
-              variableNames: Object.keys(workspaceEnvironment.values),
-            },
+            rig: { name: rigName, version: rigVersion.version },
+            ...(rigVersion.setupScript && rigVersion.setupScript.trim().length > 0
+              ? {
+                rigSetup: {
+                  rigId: session.rigId!,
+                  versionId: rigVersion.id,
+                  rigName,
+                  script: rigVersion.setupScript,
+                  timeoutMs: runSettings.rigSetupTimeoutMs,
+                },
+              }
+              : {}),
+            ...(rigVersion.credentialHooks.length > 0
+              ? { rigCredentialHookIds: rigVersion.credentialHooks }
+              : {}),
           }
           : {}),
       });
@@ -2818,7 +2916,9 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
         attributes: {
           "opengeni.turn_id": turnId ?? "",
           "opengeni.status": activityStatus,
-          "opengeni.environment_id": environmentId,
+          "opengeni.variable_set_id": variableSetId,
+          "opengeni.rig_id": rigId,
+          "opengeni.rig_version_id": rigVersionId,
           "opengeni.duration_ms": Math.round(durationSeconds * 1000),
         },
         error: activityError,

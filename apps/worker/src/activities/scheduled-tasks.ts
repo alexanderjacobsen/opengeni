@@ -5,7 +5,8 @@ import {
   createSessionGoal,
   enqueueSessionTurn,
   getBillingBalance,
-  getWorkspaceEnvironment,
+  getRig,
+  getVariableSet,
   isCodexBilledTurn,
   recordUsageEvent,
   requireScheduledTask,
@@ -69,13 +70,28 @@ export function createScheduledTaskActivities(services: () => Promise<ActivitySe
         // goal tools, and the permission-gated tools), matching the API path.
         const taskTools = withFirstPartyTools(settings, task.agentConfig.tools);
         if (task.runMode === "new_session_per_run" || !task.reusableSessionId) {
-          // The FK on scheduled_tasks.environment_id is ON DELETE RESTRICT, so
-          // an attached environment must still exist here; fail closed if not.
-          const environment = task.environmentId
-            ? await getWorkspaceEnvironment(db, task.workspaceId, task.environmentId)
+          // The FK on scheduled_tasks.variable_set_id is ON DELETE RESTRICT, so
+          // an attached variableSet must still exist here; fail closed if not.
+          const variableSet = task.variableSetId
+            ? await getVariableSet(db, task.workspaceId, task.variableSetId)
             : null;
-          if (task.environmentId && !environment) {
-            throw new Error(`workspace environment not found: ${task.environmentId}`);
+          if (task.variableSetId && !variableSet) {
+            throw new Error(`variable set not found: ${task.variableSetId}`);
+          }
+          // RIG BINDING (M3): resolve the task's rig to its CURRENTLY-ACTIVE
+          // version at FIRE time (not task-create time) and freeze that version
+          // onto the new session — a task always runs the rig's latest active
+          // version. A deleted rig FK-nulls task.rigId (rig-less run); a rig that
+          // somehow has no active version fails the fire closed.
+          let frozenRigId: string | null = null;
+          let frozenRigVersionId: string | null = null;
+          if (task.rigId) {
+            const rig = await getRig(db, task.workspaceId, task.rigId);
+            if (!rig || !rig.activeVersion) {
+              throw new Error(`rig has no active version to bind: ${task.rigId}`);
+            }
+            frozenRigId = rig.id;
+            frozenRigVersionId = rig.activeVersion.id;
           }
           const session = await createSession(db, {
             accountId: task.accountId,
@@ -92,7 +108,9 @@ export function createScheduledTaskActivities(services: () => Promise<ActivitySe
             },
             model,
             sandboxBackend,
-            environmentId: task.environmentId ?? null,
+            variableSetId: task.variableSetId ?? null,
+            rigId: frozenRigId,
+            rigVersionId: frozenRigVersionId,
           });
           const goal = goalSpec
             ? await createSessionGoal(db, {
@@ -118,7 +136,7 @@ export function createScheduledTaskActivities(services: () => Promise<ActivitySe
                 scheduledTaskId: task.id,
                 scheduledTaskRunId: run.id,
                 // Names/ids only; never values.
-                ...(environment ? { environmentId: environment.id, environmentName: environment.name } : {}),
+                ...(variableSet ? { variableSetId: variableSet.id, variableSetName: variableSet.name } : {}),
               },
             },
             ...(goal ? [{
@@ -188,8 +206,8 @@ export function createScheduledTaskActivities(services: () => Promise<ActivitySe
           // Defensive backstop for the API-level 409: a reusable session keeps
           // its creation-time attachment, so a diverged task attachment must
           // fail the run instead of silently running with the wrong secrets.
-          if ((session.environmentId ?? null) !== (task.environmentId ?? null)) {
-            throw new Error("scheduled task environment attachment does not match its reusable session");
+          if ((session.variableSetId ?? null) !== (task.variableSetId ?? null)) {
+            throw new Error("scheduled task variableSet attachment does not match its reusable session");
           }
           // A recurring "maintain X" task re-establishes its objective on every
           // fire: replace the goal text, reactivate it, and reset the counters.

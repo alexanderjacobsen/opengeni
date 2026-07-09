@@ -866,6 +866,136 @@ describe("connections routes", () => {
     }
   });
 
+  test("oauth start uses configured operator credentials for Slack-shaped authorization servers", async () => {
+    if (!available) return;
+    const workspace = await freshWorkspace();
+    const as = startFakeAuthorizationServer({
+      issuer: "https://mcp.slack.com",
+      clientIdMetadataDocumentSupported: false,
+      tokenEndpointAuthMethodsSupported: ["client_secret_post"],
+      scopesSupported: ["search:read.public", "chat:write"],
+    });
+    const mcp = startTestMcpServer({
+      requiredAuthorization: "Bearer mcp-access-token",
+      unauthorizedAuthenticateHeader: `Bearer resource_metadata="${as.url}/.well-known/oauth-protected-resource", scope="search:read.public chat:write"`,
+    });
+    try {
+      const response = await app({
+        integrationsOauthClientsJson: JSON.stringify({
+          "https://mcp.slack.com": {
+            clientId: "slack-client-id",
+            clientSecret: "slack-client-secret",
+            tokenEndpointAuthMethod: "client_secret_post",
+          },
+        }),
+      }).request(`/v1/workspaces/${workspace.workspaceId}/connections/oauth/start`, {
+        method: "POST",
+        headers: {
+          authorization: await bearer(workspace, "subject-a", ["connections:write"]),
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          providerDomain: "slack.com",
+          mcpUrl: mcp.url,
+          returnPath: "/capabilities?connect_item=slack",
+        }),
+      });
+
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { state: string; authorizationUrl: string };
+      const authUrl = new URL(body.authorizationUrl);
+      expect(authUrl.searchParams.get("client_id")).toBe("slack-client-id");
+      expect(authUrl.searchParams.get("scope")).toBe("search:read.public chat:write");
+
+      const state = readSignedState(body.state, STATE_SECRET) as Record<string, unknown> | null;
+      expect(state?.providerDomain).toBe("slack.com");
+      expect(state?.clientRegistrationMethod).toBe("operator");
+      expect(state?.clientId).toBe("slack-client-id");
+      expect(JSON.stringify(state)).not.toContain("slack-client-secret");
+
+      const callback = await publicApp(client.db, {
+        integrationsOauthClientsJson: JSON.stringify({
+          "https://mcp.slack.com": {
+            clientId: "slack-client-id",
+            clientSecret: "slack-client-secret",
+            tokenEndpointAuthMethod: "client_secret_post",
+          },
+        }),
+      }).request(
+        `/v1/integrations/oauth/callback?code=abc&state=${encodeURIComponent(body.state)}`,
+      );
+      expect(callback.status).toBe(302);
+      expect(callback.headers.get("location")).toContain("integration_oauth=success");
+      expect(as.tokenRequests).toHaveLength(1);
+      expect(as.tokenRequests[0]!.get("client_id")).toBe("slack-client-id");
+      expect(as.tokenRequests[0]!.get("client_secret")).toBe("slack-client-secret");
+      expect(as.tokenRequestAuthHeaders[0]).toBeNull();
+    } finally {
+      mcp.close();
+      as.close();
+    }
+  });
+
+  test("oauth start uses one-time manual credentials for Slack-shaped authorization servers", async () => {
+    if (!available) return;
+    const workspace = await freshWorkspace();
+    const as = startFakeAuthorizationServer({
+      issuer: "https://mcp.slack.com",
+      clientIdMetadataDocumentSupported: false,
+      tokenEndpointAuthMethodsSupported: ["client_secret_post"],
+      scopesSupported: ["search:read.public", "chat:write"],
+    });
+    const mcp = startTestMcpServer({
+      requiredAuthorization: "Bearer mcp-access-token",
+      unauthorizedAuthenticateHeader: `Bearer resource_metadata="${as.url}/.well-known/oauth-protected-resource", scope="search:read.public chat:write"`,
+    });
+    try {
+      const response = await app().request(
+        `/v1/workspaces/${workspace.workspaceId}/connections/oauth/start`,
+        {
+          method: "POST",
+          headers: {
+            authorization: await bearer(workspace, "subject-a", ["connections:write"]),
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            providerDomain: "slack.com",
+            mcpUrl: mcp.url,
+            returnPath: "/capabilities?connect_item=slack",
+            oauthClient: {
+              clientId: "manual-slack-client-id",
+              clientSecret: "manual-slack-client-secret",
+              tokenEndpointAuthMethod: "client_secret_post",
+            },
+          }),
+        },
+      );
+
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { state: string; authorizationUrl: string };
+      expect(new URL(body.authorizationUrl).searchParams.get("client_id")).toBe(
+        "manual-slack-client-id",
+      );
+      const state = readSignedState(body.state, STATE_SECRET) as Record<string, unknown> | null;
+      expect(state?.clientRegistrationMethod).toBe("manual");
+      expect(state?.clientId).toBe("manual-slack-client-id");
+      expect(typeof state?.encryptedClientSecret).toBe("string");
+      expect(JSON.stringify(state)).not.toContain("manual-slack-client-secret");
+
+      const callback = await publicApp(client.db).request(
+        `/v1/integrations/oauth/callback?code=abc&state=${encodeURIComponent(body.state)}`,
+      );
+      expect(callback.status).toBe(302);
+      expect(callback.headers.get("location")).toContain("integration_oauth=success");
+      expect(as.tokenRequests).toHaveLength(1);
+      expect(as.tokenRequests[0]!.get("client_id")).toBe("manual-slack-client-id");
+      expect(as.tokenRequests[0]!.get("client_secret")).toBe("manual-slack-client-secret");
+    } finally {
+      mcp.close();
+      as.close();
+    }
+  });
+
   test("oauth start uses CIMD for Linear when CIMD is advertised", async () => {
     if (!available) return;
     const workspace = await freshWorkspace();

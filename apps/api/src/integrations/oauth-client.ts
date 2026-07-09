@@ -73,7 +73,7 @@ type AuthorizationServerMetadata = {
 };
 
 type OAuthClientRegistration = {
-  method: "operator" | "cimd" | "dcr";
+  method: "operator" | "manual" | "cimd" | "dcr";
   issuer: string;
   authorizationServer: string;
   clientId: string;
@@ -97,6 +97,7 @@ type OAuthStatePayload = {
   issuer: string;
   clientRegistrationMethod: OAuthClientRegistration["method"];
   tokenEndpointAuthMethod: OAuthClientRegistration["tokenEndpointAuthMethod"];
+  encryptedClientSecret?: string;
   returnPath: string;
   connectionId?: string;
   connectionVersion?: number;
@@ -164,6 +165,7 @@ export async function startMcpOAuth(
     metadataUrl,
     redirectUri,
     authorizeScopes,
+    context.payload.oauthClient,
   );
   const key = requireEnvironmentEncryption(settings);
   const state = createSignedState(requireIntegrationsStateSecret(settings), {
@@ -182,6 +184,9 @@ export async function startMcpOAuth(
     issuer: client.issuer,
     clientRegistrationMethod: client.method,
     tokenEndpointAuthMethod: client.tokenEndpointAuthMethod,
+    ...(client.method === "manual" && client.clientSecret
+      ? { encryptedClientSecret: encryptEnvironmentValue(key, client.clientSecret) }
+      : {}),
     returnPath,
     ...(existing ? { connectionId: existing.id, connectionVersion: existing.version } : {}),
   });
@@ -470,6 +475,7 @@ async function registerOAuthClient(
   metadataUrl: string,
   redirectUri: string,
   scopes: string[],
+  manual: OAuthStartRequest["oauthClient"],
 ): Promise<OAuthClientRegistration> {
   const operator = operatorClientForAs(settings, as);
   if (operator) {
@@ -482,6 +488,19 @@ async function registerOAuthClient(
       authorizationServer: as.authorizationServer,
       clientId: metadataUrl,
       tokenEndpointAuthMethod: "none",
+    };
+  }
+  if (manual) {
+    return {
+      method: "manual",
+      issuer: as.issuer,
+      authorizationServer: as.authorizationServer,
+      clientId: manual.clientId,
+      ...(manual.clientSecret ? { clientSecret: manual.clientSecret } : {}),
+      tokenEndpointAuthMethod: tokenAuthMethod(
+        manual.tokenEndpointAuthMethod,
+        Boolean(manual.clientSecret),
+      ),
     };
   }
   return await getOrCreateDynamicClientRegistration(db, settings, as, redirectUri, scopes);
@@ -761,6 +780,9 @@ function readOAuthState(state: string, settings: Settings): OAuthStatePayload {
     issuer: requiredString(payload.issuer, "state.issuer"),
     clientRegistrationMethod: registrationMethod(payload.clientRegistrationMethod),
     tokenEndpointAuthMethod: tokenAuthMethod(stringValue(payload.tokenEndpointAuthMethod), false),
+    ...(stringValue(payload.encryptedClientSecret)
+      ? { encryptedClientSecret: stringValue(payload.encryptedClientSecret)! }
+      : {}),
     returnPath: safeReturnPath(stringValue(payload.returnPath) ?? "/integrations"),
     nonce: requiredString(payload.nonce, "state.nonce"),
     iat,
@@ -786,6 +808,19 @@ async function clientForState(
       authorizationServer: state.authorizationServer,
       clientId: state.clientId,
       tokenEndpointAuthMethod: "none",
+    };
+  }
+  if (state.clientRegistrationMethod === "manual") {
+    const key = requireEnvironmentEncryption(settings);
+    return {
+      method: "manual",
+      issuer: state.issuer,
+      authorizationServer: state.authorizationServer,
+      clientId: state.clientId,
+      ...(state.encryptedClientSecret
+        ? { clientSecret: decryptEnvironmentValue(key, state.encryptedClientSecret) }
+        : {}),
+      tokenEndpointAuthMethod: state.tokenEndpointAuthMethod,
     };
   }
   if (state.clientRegistrationMethod === "dcr") {
@@ -1271,7 +1306,7 @@ function tokenAuthMethod(
 }
 
 function registrationMethod(value: unknown): OAuthClientRegistration["method"] {
-  if (value === "operator" || value === "cimd" || value === "dcr") {
+  if (value === "operator" || value === "manual" || value === "cimd" || value === "dcr") {
     return value;
   }
   throw new HTTPException(400, { message: "invalid OAuth state" });

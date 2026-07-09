@@ -13960,6 +13960,22 @@ export async function wakeParentSessionForChildCompletion(
           return { delivered: false, reason: "already_delivered" as const };
         }
 
+        // Child completion is follow-up work for the manager turn that spawned
+        // or supervised it. Preserve the newest model/reasoning policy that
+        // actually reached agent execution. Falling straight back to
+        // `parent.model` can silently switch providers (and billing owners)
+        // after an explicit per-turn model selection. A turn that failed
+        // admission has no `turn.started` event and cannot poison this policy.
+        const latestStartedTurn = await latestStartedSessionTurnRow(
+          tx as unknown as Database,
+          input.workspaceId,
+          parent.id,
+        );
+        const continuationModel = latestStartedTurn?.model ?? parent.model;
+        const continuationReasoningEffort =
+          (latestStartedTurn?.reasoningEffort as ReasoningEffort | undefined) ??
+          reasoningEffortForMetadata(parent.metadata, input.reasoningEffortFallback);
+
         const shouldQueue = parent.status === "idle" || parent.status === "failed";
         const workflowId = parent.temporalWorkflowId ?? `session-${parent.id}`;
         let sequence = parent.lastSequence;
@@ -14016,11 +14032,8 @@ export async function wakeParentSessionForChildCompletion(
             prompt: input.text,
             resources: [],
             tools: parent.tools as ToolRef[],
-            model: parent.model,
-            reasoningEffort: reasoningEffortForMetadata(
-              parent.metadata,
-              input.reasoningEffortFallback,
-            ),
+            model: continuationModel,
+            reasoningEffort: continuationReasoningEffort,
             sandboxBackend: parent.sandboxBackend as SandboxBackend,
             metadata: { childCompletion: input.childCompletion },
           })
@@ -14238,6 +14251,29 @@ export async function getSessionTurn(
         and(eq(schema.sessionTurns.workspaceId, workspaceId), eq(schema.sessionTurns.id, turnId)),
       )
       .limit(1);
+    return row ? mapSessionTurn(row) : null;
+  });
+}
+
+/**
+ * Return the newest turn that reached agent execution for a session. A claimed
+ * turn's `started_at` is set before worker admission, so it is not sufficient
+ * evidence that the turn's model/reasoning policy was actually used. The
+ * durable `turn.started` event is emitted only after admission succeeds and is
+ * therefore the continuation boundary used by goal and parent-wake synthesis.
+ *
+ * Preflight-rejected turns (credit/limit/config failures) deliberately do not
+ * override the last effective policy. This matters when an explicit per-turn
+ * model differs from the persisted session default: follow-up work must keep
+ * the model that actually ran rather than reverting to a stale default.
+ */
+export async function getLatestStartedSessionTurn(
+  db: Database,
+  workspaceId: string,
+  sessionId: string,
+): Promise<SessionTurn | null> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const row = await latestStartedSessionTurnRow(scopedDb, workspaceId, sessionId);
     return row ? mapSessionTurn(row) : null;
   });
 }
@@ -14738,6 +14774,37 @@ function mapSessionTurn(row: typeof schema.sessionTurns.$inferSelect): SessionTu
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };
+}
+
+async function latestStartedSessionTurnRow(
+  db: Database,
+  workspaceId: string,
+  sessionId: string,
+): Promise<typeof schema.sessionTurns.$inferSelect | null> {
+  const [row] = await db
+    .select({ turn: schema.sessionTurns })
+    .from(schema.sessionEvents)
+    .innerJoin(
+      schema.sessionTurns,
+      and(
+        eq(schema.sessionEvents.workspaceId, schema.sessionTurns.workspaceId),
+        eq(schema.sessionEvents.sessionId, schema.sessionTurns.sessionId),
+        eq(schema.sessionEvents.turnId, schema.sessionTurns.id),
+      ),
+    )
+    .where(
+      and(
+        eq(schema.sessionEvents.workspaceId, workspaceId),
+        eq(schema.sessionEvents.sessionId, sessionId),
+        eq(schema.sessionEvents.type, "turn.started"),
+      ),
+    )
+    // session_events_workspace_session_sequence_idx supports this backward
+    // scan; the PK join then fetches exactly one turn row even for very long
+    // sessions with thousands of timeline deltas per turn.
+    .orderBy(desc(schema.sessionEvents.sequence))
+    .limit(1);
+  return row?.turn ?? null;
 }
 
 async function nextTurnPosition(

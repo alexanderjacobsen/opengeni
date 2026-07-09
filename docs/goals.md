@@ -58,6 +58,10 @@ activity for a decision:
    the goal text and success criteria, the session's tool surface plus the
    first-party `opengeni` MCP server (so the goal tools are always reachable),
    and the session's stored conversation — the agent keeps its full context.
+   Its model and reasoning effort come from the newest turn that durably emitted
+   `turn.started`, falling back to the session default only when no turn has
+   actually run. This preserves an explicit per-turn provider/billing selection;
+   a newer turn rejected during admission cannot poison the continuation policy.
    By default that conversation comes from `session_history_items` (the
    SDK-native memory store; see `docs/run-lifecycle.md`); the legacy run-state
    blob path remains available behind `OPENGENI_SESSION_HISTORY_SOURCE`.

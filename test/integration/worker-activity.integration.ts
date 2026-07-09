@@ -3350,6 +3350,87 @@ describe("worker activities integration", () => {
     expect((pausedEvent?.payload as { reason?: string } | undefined)?.reason).toBe("limits");
   });
 
+  test("goal continuation preserves the latest actually-started per-turn model policy", async () => {
+    const grant = await testGrant(dbClient.db);
+    const session = await createOwnedSession(dbClient.db, grant, {
+      initialMessage: "legacy default",
+      resources: [],
+      metadata: { reasoningEffort: "medium" },
+      model: "scripted-model",
+      sandboxBackend: "none",
+    });
+    await createSessionGoal(dbClient.db, {
+      accountId: grant.accountId,
+      workspaceId: grant.workspaceId,
+      sessionId: session.id,
+      text: "continue with the effective Codex policy",
+      createdBy: "api",
+    });
+    const [trigger] = await appendOwnedEvents(dbClient.db, grant, session.id, [
+      { type: "user.message", payload: { text: "switch to Codex" } },
+    ]);
+    const executed = await enqueueSessionTurn(dbClient.db, {
+      accountId: grant.accountId,
+      workspaceId: grant.workspaceId,
+      sessionId: session.id,
+      triggerEventId: trigger!.id,
+      temporalWorkflowId: `session-${session.id}`,
+      source: "user",
+      prompt: "switch to Codex",
+      resources: [],
+      tools: [],
+      model: "codex/gpt-5.6-sol",
+      reasoningEffort: "xhigh",
+      sandboxBackend: "none",
+      metadata: {},
+    });
+    await appendOwnedEvents(dbClient.db, grant, session.id, [
+      { turnId: executed.id, type: "turn.started", payload: { turnId: executed.id } },
+    ]);
+    await finishTurn(dbClient.db, grant.workspaceId, executed.id, "completed");
+
+    // Reproduce the incident's newer admission failure: it was claimed and
+    // finished, but never emitted turn.started, so its stale session-default
+    // model must not become the continuation policy.
+    const [rejectedTrigger] = await appendOwnedEvents(dbClient.db, grant, session.id, [
+      { type: "user.message", payload: { text: "child completed" } },
+    ]);
+    const rejected = await enqueueSessionTurn(dbClient.db, {
+      accountId: grant.accountId,
+      workspaceId: grant.workspaceId,
+      sessionId: session.id,
+      triggerEventId: rejectedTrigger!.id,
+      temporalWorkflowId: `session-${session.id}`,
+      source: "user",
+      prompt: "child completed",
+      resources: [],
+      tools: [],
+      model: session.model,
+      reasoningEffort: "medium",
+      sandboxBackend: "none",
+      metadata: {},
+    });
+    await finishTurn(dbClient.db, grant.workspaceId, rejected.id, "failed");
+    await setSessionStatus(dbClient.db, grant.workspaceId, session.id, "idle", null);
+
+    const activities = createActivities({
+      settings: testSettings({ databaseUrl: services.databaseUrl, natsUrl: services.natsUrl }),
+      db: dbClient.db,
+      bus,
+    });
+    const result = await activities.maybeContinueGoal({
+      accountId: grant.accountId,
+      workspaceId: grant.workspaceId,
+      sessionId: session.id,
+      workflowId: `session-${session.id}`,
+    });
+    expect(result.action).toBe("continue");
+    const turns = await listSessionTurns(dbClient.db, grant.workspaceId, session.id, 20);
+    const continuation = turns.find((turn) => turn.source === "goal");
+    expect(continuation?.model).toBe("codex/gpt-5.6-sol");
+    expect(continuation?.reasoningEffort).toBe("xhigh");
+  });
+
   test("user interrupts pause active goals even when no turn is active", async () => {
     const grant = await testGrant(dbClient.db);
     const session = await createOwnedSession(dbClient.db, grant, {
@@ -3868,6 +3949,75 @@ describe("worker activities integration", () => {
     );
     expect(managerTurnsAfterRetry).toHaveLength(1);
     expect(wakes).toHaveLength(1);
+  });
+
+  test("waking the parent preserves the latest actually-started per-turn model policy", async () => {
+    const grant = await testGrant(dbClient.db);
+    const manager = await createOwnedSession(dbClient.db, grant, {
+      initialMessage: "orchestrate",
+      resources: [],
+      metadata: { reasoningEffort: "medium" },
+      model: "scripted-model",
+      sandboxBackend: "none",
+    });
+    const [managerTrigger] = await appendOwnedEvents(dbClient.db, grant, manager.id, [
+      { type: "user.message", payload: { text: "use Codex for this work" } },
+    ]);
+    const executed = await enqueueSessionTurn(dbClient.db, {
+      accountId: grant.accountId,
+      workspaceId: grant.workspaceId,
+      sessionId: manager.id,
+      triggerEventId: managerTrigger!.id,
+      temporalWorkflowId: `session-${manager.id}`,
+      source: "user",
+      prompt: "use Codex for this work",
+      resources: [],
+      tools: [],
+      model: "codex/gpt-5.6-sol",
+      reasoningEffort: "xhigh",
+      sandboxBackend: "none",
+      metadata: {},
+    });
+    await appendOwnedEvents(dbClient.db, grant, manager.id, [
+      { turnId: executed.id, type: "turn.started", payload: { turnId: executed.id } },
+    ]);
+    await finishTurn(dbClient.db, grant.workspaceId, executed.id, "completed");
+    await setSessionStatus(dbClient.db, grant.workspaceId, manager.id, "idle", null);
+
+    const worker = await createOwnedSession(dbClient.db, grant, {
+      initialMessage: "do the work",
+      resources: [],
+      metadata: {},
+      model: "scripted-model",
+      sandboxBackend: "none",
+      parentSessionId: manager.id,
+    });
+    await appendOwnedEvents(dbClient.db, grant, worker.id, [
+      { type: "turn.completed", payload: { output: "done" } },
+    ]);
+    await setSessionStatus(dbClient.db, grant.workspaceId, worker.id, "running", null);
+
+    const wakes: Array<{ sessionId: string; workflowId: string }> = [];
+    const activities = wakeActivities(wakes);
+    await activities.markSessionIdle({ workspaceId: grant.workspaceId, sessionId: worker.id });
+
+    const turns = await listSessionTurns(dbClient.db, grant.workspaceId, manager.id, 20);
+    const wake = turns.find((turn) =>
+      Boolean((turn.metadata as { childCompletion?: unknown }).childCompletion),
+    );
+    expect(wake?.model).toBe("codex/gpt-5.6-sol");
+    expect(wake?.reasoningEffort).toBe("xhigh");
+    expect(wakes).toEqual([{ sessionId: manager.id, workflowId: `session-${manager.id}` }]);
+
+    // The existing idempotency gate still wins: a repeated terminal callback
+    // does not enqueue another wake while preserving the inherited policy.
+    await activities.markSessionIdle({ workspaceId: grant.workspaceId, sessionId: worker.id });
+    const afterRetry = await listSessionTurns(dbClient.db, grant.workspaceId, manager.id, 20);
+    expect(
+      afterRetry.filter((turn) =>
+        Boolean((turn.metadata as { childCompletion?: unknown }).childCompletion),
+      ),
+    ).toHaveLength(1);
   });
 
   test("waking the parent: a genuinely new idle-after-work episode notifies again, churn does not", async () => {

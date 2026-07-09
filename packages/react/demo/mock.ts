@@ -1539,18 +1539,18 @@ const ACCOUNT_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 
 /**
  * A two-provider deployment config so the demo composer exercises the
- * <ModelPicker>: the built-in OpenAI provider serving gpt-5.5 (the default,
+ * <ModelPicker>: the built-in OpenAI provider serving gpt-5.6 (the default,
  * `responses` wire API) plus a Fireworks AI registry provider serving GLM 5.2
  * (`chat` wire API) — exactly the host config example in model-providers.md.
  */
 const CLIENT_CONFIG: ClientConfig = {
   deploymentRevision: "demo",
-  defaultModel: "gpt-5.5",
-  allowedModels: ["gpt-5.5", "accounts/fireworks/models/glm-5p2"],
+  defaultModel: "gpt-5.6",
+  allowedModels: ["gpt-5.6", "accounts/fireworks/models/glm-5p2"],
   models: [
     {
-      id: "gpt-5.5",
-      label: "gpt-5.5",
+      id: "gpt-5.6",
+      label: "gpt-5.6",
       provider: "openai",
       providerLabel: "OpenAI",
       api: "responses",

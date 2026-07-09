@@ -203,9 +203,9 @@ const SettingsSchema = z.object({
   //   "server" / "client" -> force that path regardless of provider.
   //   "off" -> neither path (legacy unbounded growth; escape hatch only).
   contextCompactionMode: z.enum(["auto", "server", "client", "off"]).default("auto"),
-  // The model's real context window in tokens. gpt-5.5's true window is
-  // 1,050,000; it is absent from the SDK's hardcoded compaction window map (it
-  // knows only up to gpt-5.4), so the SDK's DynamicCompactionPolicy would fall
+  // The model family's real context window in tokens. GPT-5.6's window is
+  // 1,050,000; until the SDK hardcoded compaction window map catches up, the
+  // SDK's DynamicCompactionPolicy may fall
   // back to a wrong 240k. We pass an explicit StaticCompactionPolicy threshold
   // derived from these settings on the server path, and use the same numbers to
   // budget the client path.
@@ -252,8 +252,8 @@ const SettingsSchema = z.object({
   openaiProvider: z.enum(["openai", "azure"]).default("openai"),
   openaiApiKey: z.string().optional(),
   openaiBaseUrl: z.string().optional(),
-  openaiModel: z.string().default("gpt-5.5"),
-  openaiAllowedModels: z.string().default("gpt-5.5,gpt-5.4,gpt-5.4-mini"),
+  openaiModel: z.string().default("gpt-5.6"),
+  openaiAllowedModels: z.string().default("gpt-5.6,gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna"),
   modelPricingJson: z.string().default("{}"),
   // Extra (non-built-in) model providers, declared by the host as a JSON
   // provider registry. Each entry carries its own base URL, API key, wire API
@@ -805,10 +805,28 @@ export interface ConfiguredModel {
 }
 
 export const defaultModelPricing: Record<string, ModelPricing> = {
-  "gpt-5.5": {
+  "gpt-5.6": {
     inputMicrosPerMillionTokens: 5_000_000,
     cachedInputMicrosPerMillionTokens: 500_000,
     outputMicrosPerMillionTokens: 30_000_000,
+    marginBps: 2_500,
+  },
+  "gpt-5.6-sol": {
+    inputMicrosPerMillionTokens: 5_000_000,
+    cachedInputMicrosPerMillionTokens: 500_000,
+    outputMicrosPerMillionTokens: 30_000_000,
+    marginBps: 2_500,
+  },
+  "gpt-5.6-terra": {
+    inputMicrosPerMillionTokens: 2_500_000,
+    cachedInputMicrosPerMillionTokens: 250_000,
+    outputMicrosPerMillionTokens: 15_000_000,
+    marginBps: 2_500,
+  },
+  "gpt-5.6-luna": {
+    inputMicrosPerMillionTokens: 1_000_000,
+    cachedInputMicrosPerMillionTokens: 100_000,
+    outputMicrosPerMillionTokens: 6_000_000,
     marginBps: 2_500,
   },
   "gpt-5.4": {
@@ -1303,7 +1321,7 @@ export function configuredModels(settings: Settings): ConfiguredModel[] {
   // contains "/") that a registry actually owns is never a valid Azure/OpenAI
   // deployment name, and a `codex/`-prefixed id never is either — exclude both
   // from the built-in list. A BARE id a registry merely redeclares (e.g.
-  // "gpt-5.5") is left in place so the built-in still wins it via the first-wins
+  // "gpt-5.6") is left in place so the built-in still wins it via the first-wins
   // de-dup below (preserving the documented built-in-precedence contract). When
   // a codex/ id has NO codex provider injected (no active subscription) it then
   // resolves to nothing and getModel fails loud with
@@ -1416,7 +1434,7 @@ export function configuredModelPricing(settings: Settings): Record<string, Model
 /**
  * Resolved conversation-context compaction path for a run.
  *  - "server": let the OpenAI platform Responses API compact server-side (the
- *    SDK emits context_management; we pass the correct gpt-5.5 threshold).
+ *    SDK emits context_management; we pass the correct GPT-5.6 threshold).
  *  - "client": run OpenGeni's own client-side compaction (Azure and any other
  *    backend that rejects/ignores context_management).
  *  - "off": neither (legacy unbounded growth; escape hatch).
@@ -1454,7 +1472,7 @@ export function contextInputBudgetTokens(
  * Server-path compact_threshold (tokens) handed to the SDK's
  * StaticCompactionPolicy: the explicit override when set, else
  * floor(B * softFraction). This is what sidesteps the SDK's wrong 240k
- * fallback for gpt-5.5 (which is absent from its hardcoded window map).
+ * fallback for newer GPT-5.x models that are absent from its hardcoded window map.
  */
 export function contextServerCompactThreshold(
   settings: Pick<

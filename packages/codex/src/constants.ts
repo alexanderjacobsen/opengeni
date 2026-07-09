@@ -27,12 +27,13 @@ export const CODEX_MODEL_ID_PREFIX = "codex/";
 
 // Offline fallback catalog. The live catalog from GET /models supersedes this
 // when wired; until then these are the selectable codex models and the
-// longest-prefix resolution targets. Confirmed live (2026-06) against a pro plan:
-// GET /codex/models returned exactly these (plus the internal codex-auto-review).
+// longest-prefix resolution targets. Prefer the current Codex-family slugs over
+// old generic GPT-5-era fallbacks; the live catalog from GET /models wins when
+// available.
 export const CODEX_FALLBACK_MODEL_SLUGS = [
-  "gpt-5.5",
-  "gpt-5.4",
-  "gpt-5.4-mini",
+  "gpt-5.3-codex",
+  "gpt-5.2-codex",
+  "gpt-5.1-codex",
   "gpt-5.3-codex-spark",
 ] as const;
 

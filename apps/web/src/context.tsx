@@ -183,7 +183,7 @@ export function RootRouteComponent() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [accessLoading, setAccessLoading] = useState(false);
   const [accessError, setAccessError] = useState<string | null>(null);
-  const [model, setModel] = useState("gpt-5.5");
+  const [model, setModel] = useState("gpt-5.6");
   // Per-session model overrides (session id → model). A session with no entry
   // inherits the deployment default `model`; selecting in its picker writes here
   // so each open session keeps its own choice independently.

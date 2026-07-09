@@ -168,7 +168,7 @@ const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"/>
   ${sections.map(sectionHtml).join("")}
   <section id="live">
     <h2>M8 live verification — real stack, real box</h2>
-    <p class="lead">Brought up the full docker-sandbox stack (postgres/nats/temporal/minio + api + worker), drove a real gpt-5.5 turn, and verified the deferred live-only checks against real capture data.</p>
+    <p class="lead">Brought up the full docker-sandbox stack (postgres/nats/temporal/minio + api + worker), drove a real gpt-5.6-sol turn, and verified the deferred live-only checks against real capture data.</p>
     <div class="verdict">
       <h3>Live check results</h3>
       <table>

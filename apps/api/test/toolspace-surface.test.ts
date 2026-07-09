@@ -103,7 +103,7 @@ async function seedSession(input: { selects: string[]; withActiveTurn: boolean }
     resources: [],
     tools: input.selects.map((id) => ({ kind: "mcp", id })),
     metadata: {},
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     sandboxBackend: "none",
   });
   if (input.withActiveTurn) {
@@ -113,7 +113,7 @@ async function seedSession(input: { selects: string[]; withActiveTurn: boolean }
          status, position, prompt, model, reasoning_effort, sandbox_backend)
       values
         (${account!.id}, ${workspace!.id}, ${session.id}, gen_random_uuid(), 'wf-1',
-         'running', 0, 'hi', 'gpt-5.5', 'medium', 'none')
+         'running', 0, 'hi', 'gpt-5.6-sol', 'medium', 'none')
       returning id`;
     await admin`update sessions set active_turn_id = ${turn!.id} where id = ${session.id}`;
   }

@@ -57,7 +57,7 @@ describe("API edge credit gate — codex bypass", () => {
         workspaceId: WORKSPACE,
         action: "agent_run:create",
         quantity: 1,
-        model: "codex/gpt-5.5",
+        model: "codex/gpt-5.6-sol",
       });
       expect(decision.allowed).toBe(true);
       // requireLimit must NOT throw a 402 for a codex-billed turn.
@@ -66,7 +66,7 @@ describe("API edge credit gate — codex bypass", () => {
         workspaceId: WORKSPACE,
         action: "agent_run:create",
         quantity: 1,
-        model: "codex/gpt-5.5",
+        model: "codex/gpt-5.6-sol",
       });
     } finally {
       restoreCred();
@@ -83,7 +83,7 @@ describe("API edge credit gate — codex bypass", () => {
         workspaceId: WORKSPACE,
         action: "agent_run:create",
         quantity: 1,
-        model: "codex/gpt-5.5",
+        model: "codex/gpt-5.6-sol",
       });
       expect(decision.allowed).toBe(false);
       expect(decision.code).toBe("insufficient_credits");
@@ -93,7 +93,7 @@ describe("API edge credit gate — codex bypass", () => {
           workspaceId: WORKSPACE,
           action: "agent_run:create",
           quantity: 1,
-          model: "codex/gpt-5.5",
+          model: "codex/gpt-5.6-sol",
         }),
       ).rejects.toMatchObject({ status: 402 });
     } finally {

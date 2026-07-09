@@ -128,11 +128,11 @@ describe("sandbox preparation profiles", () => {
     const settings = {
       ...withEnv({}, () => getSettings()),
       openaiModel: "custom-model",
-      openaiAllowedModels: "gpt-5.5",
+      openaiAllowedModels: "gpt-5.6-sol",
       openaiReasoningEffort: "xhigh" as const,
       openaiAllowedReasoningEfforts: "low,medium,high",
     };
-    expect(configuredAllowedModels(settings)).toEqual(["custom-model", "gpt-5.5"]);
+    expect(configuredAllowedModels(settings)).toEqual(["custom-model", "gpt-5.6-sol"]);
     expect(configuredAllowedReasoningEfforts(settings)).toEqual(["xhigh", "low", "medium", "high"]);
   });
 
@@ -761,9 +761,9 @@ describe("sandbox preparation profiles", () => {
   });
 
   test("parses static and managed entitlement overlays", () => {
-    expect(parseStaticEntitlementsJson('{"github":true,"models":["gpt-5.5"]}')).toEqual({
+    expect(parseStaticEntitlementsJson('{"github":true,"models":["gpt-5.6-sol"]}')).toEqual({
       github: true,
-      models: ["gpt-5.5"],
+      models: ["gpt-5.6-sol"],
     });
 
     withEnv(

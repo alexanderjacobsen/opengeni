@@ -802,12 +802,12 @@ describe("useAvailableModels", () => {
         calls += 1;
         return {
           deploymentRevision: "rev-1",
-          defaultModel: "gpt-5.5",
-          allowedModels: ["gpt-5.5", "accounts/fireworks/models/glm-5p2"],
+          defaultModel: "gpt-5.6-sol",
+          allowedModels: ["gpt-5.6-sol", "accounts/fireworks/models/glm-5p2"],
           models: [
             {
-              id: "gpt-5.5",
-              label: "gpt-5.5",
+              id: "gpt-5.6-sol",
+              label: "gpt-5.6-sol",
               provider: "openai",
               providerLabel: "OpenAI",
               api: "responses",
@@ -833,8 +833,8 @@ describe("useAvailableModels", () => {
     await flush();
     expect(calls).toBe(1);
     expect(hook.result.current.loading).toBe(false);
-    expect(hook.result.current.defaultModel).toBe("gpt-5.5");
-    expect(hook.result.current.models.map((model) => model.label)).toEqual(["gpt-5.5", "GLM 5.2"]);
+    expect(hook.result.current.defaultModel).toBe("gpt-5.6-sol");
+    expect(hook.result.current.models.map((model) => model.label)).toEqual(["gpt-5.6-sol", "GLM 5.2"]);
     expect(hook.result.current.models.map((model) => model.providerLabel)).toEqual([
       "OpenAI",
       "Fireworks AI",

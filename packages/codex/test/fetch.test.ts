@@ -58,7 +58,7 @@ describe("codexSubscriptionFetch", () => {
           "content-type": "application/json",
         },
         body: JSON.stringify({
-          model: "gpt-5.5",
+          model: "gpt-5.6-sol",
           store: true,
           max_output_tokens: 50,
           input: [{ type: "message", id: "m1", role: "user", content: [] }],
@@ -124,7 +124,7 @@ describe("codexSubscriptionFetch", () => {
     const res = await codexRequestStorage.run(ctx(), () =>
       fetchImpl("https://chatgpt.com/backend-api/responses", {
         method: "POST",
-        body: JSON.stringify({ model: "gpt-5.5", input: [] }),
+        body: JSON.stringify({ model: "gpt-5.6-sol", input: [] }),
       }),
     );
     expect(res.headers.get("content-type")).toContain("application/json");
@@ -139,7 +139,7 @@ describe("codexSubscriptionFetch", () => {
     const res = await codexRequestStorage.run(ctx(), () =>
       fetchImpl("https://chatgpt.com/backend-api/responses", {
         method: "POST",
-        body: JSON.stringify({ model: "gpt-5.5", stream: true, input: [] }),
+        body: JSON.stringify({ model: "gpt-5.6-sol", stream: true, input: [] }),
       }),
     );
     const text = await res.text();
@@ -165,11 +165,11 @@ describe("codexSubscriptionFetch", () => {
     await fetchImpl("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: { "OpenAI-Beta": "x" },
-      body: '{"model":"gpt-5.5"}',
+      body: '{"model":"gpt-5.6-sol"}',
     });
     expect(captures[0]?.url).toBe("https://api.openai.com/v1/responses"); // not rewritten
     expect(new Headers(captures[0]?.init?.headers).get("openai-beta")).toBe("x"); // not stripped
-    expect(captures[0]?.init?.body).toBe('{"model":"gpt-5.5"}'); // not normalized
+    expect(captures[0]?.init?.body).toBe('{"model":"gpt-5.6-sol"}'); // not normalized
   });
 
   test("P1-d: a 429 usage_limit_reached is re-emitted as JSON with x-should-retry:false (preserving the body)", async () => {
@@ -182,7 +182,7 @@ describe("codexSubscriptionFetch", () => {
     const res = await codexRequestStorage.run(ctx(), () =>
       fetchImpl("https://chatgpt.com/backend-api/responses", {
         method: "POST",
-        body: JSON.stringify({ model: "gpt-5.5", stream: true, input: [] }),
+        body: JSON.stringify({ model: "gpt-5.6-sol", stream: true, input: [] }),
       }),
     );
     expect(res.status).toBe(429);
@@ -207,7 +207,7 @@ describe("codexSubscriptionFetch", () => {
     const res = await codexRequestStorage.run(ctx(), () =>
       fetchImpl("https://chatgpt.com/backend-api/responses", {
         method: "POST",
-        body: JSON.stringify({ model: "gpt-5.5", stream: true, input: [] }),
+        body: JSON.stringify({ model: "gpt-5.6-sol", stream: true, input: [] }),
       }),
     );
     expect(res.status).toBe(500);
@@ -232,7 +232,7 @@ describe("codexSubscriptionFetch", () => {
     const res = await codexRequestStorage.run(ctx(), () =>
       fetchImpl("https://chatgpt.com/backend-api/responses", {
         method: "POST",
-        body: JSON.stringify({ model: "gpt-5.5", stream: true, input: [] }),
+        body: JSON.stringify({ model: "gpt-5.6-sol", stream: true, input: [] }),
       }),
     );
     expect(call).toBe(2); // 401 → refresh → retry

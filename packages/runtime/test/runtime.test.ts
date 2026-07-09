@@ -103,7 +103,7 @@ describe("runtime event normalization", () => {
   test("keeps Azure api-version query for deployment-style base URLs", () => {
     const query = azureOpenAIDefaultQuery(
       { azureOpenaiApiVersion: "2025-04-01-preview" },
-      "https://example.openai.azure.com/openai/deployments/gpt-5.5",
+      "https://example.openai.azure.com/openai/deployments/gpt-5.6-sol",
     );
 
     expect(query).toEqual({ "api-version": "2025-04-01-preview" });

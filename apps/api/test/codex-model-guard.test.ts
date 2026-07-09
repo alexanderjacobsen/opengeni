@@ -7,18 +7,18 @@ describe("assertConfiguredModel — codex subscription models", () => {
   test("rejects a codex model when the feature is disabled", () => {
     let thrown: unknown;
     try {
-      assertConfiguredModel(testSettings({ codexSubscriptionEnabled: false }), "codex/gpt-5.5");
+      assertConfiguredModel(testSettings({ codexSubscriptionEnabled: false }), "codex/gpt-5.6-sol");
     } catch (error) {
       thrown = error;
     }
     expect(thrown).toBeInstanceOf(HTTPException);
     expect((thrown as HTTPException).status).toBe(422);
-    expect((thrown as HTTPException).message).toBe("model is not available: codex/gpt-5.5");
+    expect((thrown as HTTPException).message).toBe("model is not available: codex/gpt-5.6-sol");
   });
 
   test("accepts a codex model at the edge when the feature is enabled", () => {
     expect(() =>
-      assertConfiguredModel(testSettings({ codexSubscriptionEnabled: true }), "codex/gpt-5.5"),
+      assertConfiguredModel(testSettings({ codexSubscriptionEnabled: true }), "codex/gpt-5.6-sol"),
     ).not.toThrow();
   });
 

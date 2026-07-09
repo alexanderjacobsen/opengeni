@@ -155,10 +155,10 @@ describe("contracts", () => {
   test("accepts model and reasoning effort on create session", () => {
     const payload = CreateSessionRequest.parse({
       initialMessage: "inspect repo",
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       reasoningEffort: "xhigh",
     });
-    expect(payload.model).toBe("gpt-5.5");
+    expect(payload.model).toBe("gpt-5.6-sol");
     expect(payload.reasoningEffort).toBe("xhigh");
   });
 
@@ -208,8 +208,8 @@ describe("contracts", () => {
   test("accepts client config payloads", () => {
     const payload = ClientConfig.parse({
       deploymentRevision: "test-sha",
-      defaultModel: "gpt-5.5",
-      allowedModels: ["gpt-5.5"],
+      defaultModel: "gpt-5.6-sol",
+      allowedModels: ["gpt-5.6-sol"],
       defaultReasoningEffort: "high",
       allowedReasoningEfforts: ["low", "medium", "high"],
       mcpServers: [{ id: "opengeni", name: "OpenGeni" }],
@@ -230,8 +230,8 @@ describe("contracts", () => {
   test("round-trips the provider-grouped models list on client config", () => {
     const models = [
       {
-        id: "gpt-5.5",
-        label: "gpt-5.5",
+        id: "gpt-5.6-sol",
+        label: "gpt-5.6-sol",
         provider: "openai",
         providerLabel: "OpenAI",
         api: "responses" as const,
@@ -248,8 +248,8 @@ describe("contracts", () => {
     ];
     const payload = ClientConfig.parse({
       deploymentRevision: "test-sha",
-      defaultModel: "gpt-5.5",
-      allowedModels: ["gpt-5.5", "accounts/fireworks/models/glm-5p2"],
+      defaultModel: "gpt-5.6-sol",
+      allowedModels: ["gpt-5.6-sol", "accounts/fireworks/models/glm-5p2"],
       models,
       defaultReasoningEffort: "high",
       allowedReasoningEfforts: ["low", "medium", "high"],
@@ -372,7 +372,7 @@ describe("contracts", () => {
         text: "use this too",
         resources: [{ kind: "file", fileId }],
         tools: [{ kind: "mcp", id: "docs" }],
-        model: "gpt-5.5",
+        model: "gpt-5.6-sol",
         reasoningEffort: "xhigh",
       },
     });
@@ -380,7 +380,7 @@ describe("contracts", () => {
     if (payload.type !== "user.message") throw new Error("expected user.message");
     expect(payload.payload.resources).toEqual([{ kind: "file", fileId }]);
     expect(payload.payload.tools).toEqual([{ kind: "mcp", id: "docs" }]);
-    expect(payload.payload.model).toBe("gpt-5.5");
+    expect(payload.payload.model).toBe("gpt-5.6-sol");
     expect(payload.payload.reasoningEffort).toBe("xhigh");
   });
 

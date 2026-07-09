@@ -21,7 +21,7 @@ import {
 // The synthetic codex-subscription provider the worker overlay
 // (settingsWithCodexCredential → withCodexProvider) injects into runSettings for
 // a workspace with an ACTIVE Codex subscription. Mirrors capabilities.ts.
-const CODEX_TURN_MODEL = `${CODEX_MODEL_ID_PREFIX}gpt-5.5`;
+const CODEX_TURN_MODEL = `${CODEX_MODEL_ID_PREFIX}gpt-5.6-sol`;
 function codexProviderJson(): string {
   return JSON.stringify([
     {
@@ -30,7 +30,7 @@ function codexProviderJson(): string {
       label: "Codex (ChatGPT subscription)",
       api: "responses",
       baseUrl: CODEX_PROVIDER_BASE_URL,
-      models: [{ id: CODEX_TURN_MODEL, label: "gpt-5.5", reasoningEffort: true }],
+      models: [{ id: CODEX_TURN_MODEL, label: "gpt-5.6-sol", reasoningEffort: true }],
     },
   ]);
 }
@@ -44,8 +44,8 @@ function multiProviderSettings(overrides: Parameters<typeof testSettings>[0] = {
   return testSettings({
     sandboxBackend: "none",
     openaiProvider: "openai",
-    openaiModel: "gpt-5.5",
-    openaiAllowedModels: "gpt-5.5,gpt-5.4",
+    openaiModel: "gpt-5.6-sol",
+    openaiAllowedModels: "gpt-5.6-sol,gpt-5.4",
     modelProvidersJson: JSON.stringify([
       {
         id: "fireworks",
@@ -97,7 +97,7 @@ describe("buildModelInstance — chat vs responses Model selection per provider 
       builtin: true,
       compactionMode: "server",
     };
-    const model = buildModelInstance(provider, client, "gpt-5.5");
+    const model = buildModelInstance(provider, client, "gpt-5.6-sol");
     expect(model).toBeInstanceOf(OpenAIResponsesModel);
     expect(model).not.toBeInstanceOf(OpenAIChatCompletionsModel);
   });
@@ -138,7 +138,7 @@ describe("resolveTurnModel", () => {
   });
 
   test("resolves the built-in model to the responses provider + an OpenAIResponsesModel", () => {
-    const resolved = resolveTurnModel(multiProviderSettings(), "gpt-5.5");
+    const resolved = resolveTurnModel(multiProviderSettings(), "gpt-5.6-sol");
     expect(resolved).not.toBeNull();
     expect(resolved!.provider.id).toBe("openai");
     expect(resolved!.provider.api).toBe("responses");
@@ -186,7 +186,7 @@ describe("multi-provider gating in buildOpenGeniAgent", () => {
 
   test("the built-in responses turn keeps web_search, encrypted reasoning, and server store on", () => {
     const settings = multiProviderSettings();
-    const resolved = resolveTurnModel(settings, "gpt-5.5")!;
+    const resolved = resolveTurnModel(settings, "gpt-5.6-sol")!;
     const agent = buildOpenGeniAgent(settings, [], {
       model: resolved.model,
       compactionMode: resolved.provider.compactionMode,
@@ -204,7 +204,7 @@ describe("multi-provider gating in buildOpenGeniAgent", () => {
 
   test("an accepted responses transport carries the stable session prompt_cache_key", () => {
     const settings = multiProviderSettings();
-    const resolved = resolveTurnModel(settings, "gpt-5.5")!;
+    const resolved = resolveTurnModel(settings, "gpt-5.6-sol")!;
     const agent = buildOpenGeniAgent(settings, [], {
       model: resolved.model,
       compactionMode: resolved.provider.compactionMode,
@@ -247,7 +247,7 @@ describe("multi-provider gating in buildOpenGeniAgent", () => {
     const fireworks = resolveModelProvider(settings, FIREWORKS_MODEL);
     expect(fireworks?.provider.compactionMode).toBe("client");
     expect(fireworks?.provider.api).toBe("chat");
-    const builtin = resolveModelProvider(settings, "gpt-5.5");
+    const builtin = resolveModelProvider(settings, "gpt-5.6-sol");
     expect(builtin?.provider.compactionMode).toBe("server");
     expect(builtin?.provider.api).toBe("responses");
   });
@@ -277,14 +277,14 @@ describe("MultiProviderModelProvider — routes a model NAME to its provider (th
     const provider = new MultiProviderModelProvider(settings);
     const glm = await provider.getModel(FIREWORKS_MODEL);
     expect(glm).toBeInstanceOf(OpenAIChatCompletionsModel);
-    const builtin = await provider.getModel("gpt-5.5");
+    const builtin = await provider.getModel("gpt-5.6-sol");
     expect(builtin).toBeInstanceOf(OpenAIResponsesModel);
   });
 
   test("a codex/<slug> id with NO codex provider in settings throws the actionable error (NOT an Azure fallback)", async () => {
     // The staging failure: codex_subscription_credentials empty → the worker
     // overlay never injects the codex provider → resolveTurnModel returns null
-    // for "codex/gpt-5.5". The router must NOT fall through to the built-in
+    // for "codex/gpt-5.6-sol". The router must NOT fall through to the built-in
     // (Azure) client (which 404'd with "DeploymentNotFound"); it must throw a
     // user-actionable error telling the user to connect their subscription.
     const settings = multiProviderSettings({
@@ -295,12 +295,12 @@ describe("MultiProviderModelProvider — routes a model NAME to its provider (th
     const provider = new MultiProviderModelProvider(settings);
     let thrown: unknown;
     try {
-      await provider.getModel("codex/gpt-5.5");
+      await provider.getModel("codex/gpt-5.6-sol");
     } catch (error) {
       thrown = error;
     }
     expect(thrown).toBeInstanceOf(CodexSubscriptionUnavailableError);
-    expect((thrown as Error).message).toContain("codex/gpt-5.5");
+    expect((thrown as Error).message).toContain("codex/gpt-5.6-sol");
     expect((thrown as Error).message).toContain("Codex subscription");
     expect((thrown as Error).message).toContain("Settings");
     // No status/code → agentRunFailurePayload surfaces it as a non-retryable
@@ -315,7 +315,7 @@ describe("MultiProviderModelProvider — routes a model NAME to its provider (th
     // with Azure DeploymentNotFound. Model resolution is backend-agnostic — it
     // runs in the worker through the one shared MultiProviderModelProvider(runSettings)
     // path — so a `selfhosted` backend with the codex provider injected must
-    // resolve codex/gpt-5.5 to the codex-subscription client (baseUrl =
+    // resolve codex/gpt-5.6-sol to the codex-subscription client (baseUrl =
     // chatgpt.com/backend-api, fetch: codexSubscriptionFetch), NOT the Azure
     // built-in. runSettings.openaiModel is the codex id (the worker overwrites
     // it per-turn) — exactly the input that used to trigger the built-in shadow.
@@ -359,7 +359,7 @@ describe("MultiProviderModelProvider — routes a model NAME to its provider (th
 
   test("fail-loud floor: a codex/ id that resolves to a NON-codex provider is refused (never shipped to Azure)", async () => {
     // Defense in depth (the getModel kind-guard): even if a future settings path
-    // re-introduced a shadow binding codex/gpt-5.5 to the built-in (Azure)
+    // re-introduced a shadow binding codex/gpt-5.6-sol to the built-in (Azure)
     // provider, the router must refuse it rather than ship the id as an Azure
     // deployment name. Construct exactly that pathological resolution by putting
     // the codex id in the built-in allow-list WITHOUT the codex provider, then
@@ -397,7 +397,7 @@ describe("MultiProviderModelProvider — routes a model NAME to its provider (th
       label: "Codex (ChatGPT subscription)",
       api: "responses" as const,
       baseUrl: "https://chatgpt.com/backend-api",
-      models: [{ id: "codex/gpt-5.5", label: "gpt-5.5", reasoningEffort: true }],
+      models: [{ id: "codex/gpt-5.6-sol", label: "gpt-5.6-sol", reasoningEffort: true }],
     };
     // The codex turn's OWN settings (codex provider injected).
     const codexSettings = multiProviderSettings({
@@ -417,14 +417,14 @@ describe("MultiProviderModelProvider — routes a model NAME to its provider (th
     // …then let the foreign turn overwrite the global default provider mid-run.
     configureOpenAI(nonCodexSettings);
     // The run-scoped provider resolves codex/* from its own settings — no throw.
-    const model = await runScopedProvider.getModel("codex/gpt-5.5");
+    const model = await runScopedProvider.getModel("codex/gpt-5.6-sol");
     expect(model).toBeInstanceOf(OpenAIResponsesModel);
     // Proof the clobber matters: a provider built from the FOREIGN turn's
     // (non-codex) settings — i.e. what the process-global default now points at —
     // would throw on the very same name. The run-scoped provider's immunity is
     // exactly what the fix buys.
     const clobberedProvider = new MultiProviderModelProvider(nonCodexSettings);
-    await expect(clobberedProvider.getModel("codex/gpt-5.5")).rejects.toBeInstanceOf(
+    await expect(clobberedProvider.getModel("codex/gpt-5.6-sol")).rejects.toBeInstanceOf(
       CodexSubscriptionUnavailableError,
     );
   });
@@ -489,7 +489,7 @@ describe("registry model shadowing is closed — the built-in never claims a nam
       azureOpenaiBaseUrl: "https://example.openai.azure.com/openai/v1",
       azureOpenaiApiKey: "az-test-key",
       openaiModel: "scripted-1",
-      openaiAllowedModels: "gpt-5.5,gpt-5.4",
+      openaiAllowedModels: "gpt-5.6-sol,gpt-5.4",
       modelProvidersJson: JSON.stringify([
         {
           id: "scripted",
@@ -504,23 +504,23 @@ describe("registry model shadowing is closed — the built-in never claims a nam
   });
 
   test("a BARE id a registry merely redeclares (e.g. the built-in default) still resolves to the built-in — precedence preserved", () => {
-    // The registry below redeclares "gpt-5.5"; the built-in must still win it
+    // The registry below redeclares "gpt-5.6-sol"; the built-in must still win it
     // (only namespaced `<provider>/<model>` ids are ceded to the registry).
     const settings = multiProviderSettings({
       openaiProvider: "azure",
       azureOpenaiBaseUrl: "https://example.openai.azure.com/openai/v1",
       azureOpenaiApiKey: "az-test-key",
-      openaiModel: "gpt-5.5",
+      openaiModel: "gpt-5.6-sol",
       modelProvidersJson: JSON.stringify([
         {
           id: "shadow",
           baseUrl: "https://api.shadow.test/v1",
           apiKey: "shadow-key",
-          models: [{ id: "gpt-5.5", label: "Shadowed" }, { id: "shadow/only" }],
+          models: [{ id: "gpt-5.6-sol", label: "Shadowed" }, { id: "shadow/only" }],
         },
       ]),
     });
-    const resolved = resolveTurnModel(settings, "gpt-5.5")!;
+    const resolved = resolveTurnModel(settings, "gpt-5.6-sol")!;
     expect(resolved.provider.builtin).toBe(true);
     expect(resolved.provider.id).toBe("azure");
   });

@@ -43,7 +43,7 @@ const codexRegistry = JSON.stringify([
     label: "Codex (ChatGPT subscription)",
     api: "responses",
     baseUrl: "https://chatgpt.com/backend-api",
-    models: [{ id: "codex/gpt-5.5", label: "gpt-5.5", reasoningEffort: true }],
+    models: [{ id: "codex/gpt-5.6-sol", label: "gpt-5.6-sol", reasoningEffort: true }],
   },
 ]);
 
@@ -190,16 +190,16 @@ describe("configuredModels", () => {
     const settings = withEnv(
       {
         OPENGENI_OPENAI_API_KEY: "sk-test",
-        OPENGENI_OPENAI_MODEL: "gpt-5.5",
+        OPENGENI_OPENAI_MODEL: "gpt-5.6-sol",
         OPENGENI_OPENAI_ALLOWED_MODELS: "gpt-5.4,gpt-5.4-mini",
       },
       () => getSettings(),
     );
     const models = configuredModels(settings);
-    expect(models.map((model) => model.id)).toEqual(["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]);
+    expect(models.map((model) => model.id)).toEqual(["gpt-5.6-sol", "gpt-5.4", "gpt-5.4-mini"]);
     expect(models[0]).toMatchObject({
-      id: "gpt-5.5",
-      label: "gpt-5.5",
+      id: "gpt-5.6-sol",
+      label: "gpt-5.6-sol",
       providerId: "openai",
       providerLabel: "OpenAI",
       api: "responses",
@@ -213,7 +213,7 @@ describe("configuredModels", () => {
     const settings = withEnv(
       {
         OPENGENI_OPENAI_API_KEY: "sk-test",
-        OPENGENI_OPENAI_MODEL: "gpt-5.5",
+        OPENGENI_OPENAI_MODEL: "gpt-5.6-sol",
         OPENGENI_OPENAI_ALLOWED_MODELS: "gpt-5.4",
         OPENGENI_MODEL_PROVIDERS_JSON: fireworksRegistry,
       },
@@ -221,7 +221,7 @@ describe("configuredModels", () => {
     );
     const models = configuredModels(settings);
     expect(models.map((model) => model.id)).toEqual([
-      "gpt-5.5",
+      "gpt-5.6-sol",
       "gpt-5.4",
       "accounts/fireworks/models/glm-5p2",
     ]);
@@ -266,7 +266,7 @@ describe("configuredModels", () => {
 
   test("the built-in never claims a codex/ id even when it is the turn's openaiModel — codex provider wins, no Azure shadow", () => {
     // The staging defect: the worker overwrites settings.openaiModel with the
-    // turn's model ("codex/gpt-5.5") and injects the codex provider. Without the
+    // turn's model ("codex/gpt-5.6-sol") and injects the codex provider. Without the
     // namespaced-id filter the built-in (Azure) allow-list claimed the id FIRST
     // and the first-wins de-dup dropped the real codex entry → Azure 404. Mirror
     // the worker's per-turn runSettings overlay by spread-overriding a validated
@@ -277,20 +277,20 @@ describe("configuredModels", () => {
         OPENGENI_OPENAI_PROVIDER: "azure",
         OPENGENI_AZURE_OPENAI_BASE_URL: "https://res.openai.azure.com/openai/v1",
         OPENGENI_AZURE_OPENAI_API_KEY: "az-key",
-        OPENGENI_OPENAI_MODEL: "gpt-5.5",
+        OPENGENI_OPENAI_MODEL: "gpt-5.6-sol",
       },
       () => getSettings(),
     );
     const runSettings = {
       ...base,
-      openaiModel: "codex/gpt-5.5",
+      openaiModel: "codex/gpt-5.6-sol",
       modelProvidersJson: codexRegistry,
     };
     const models = configuredModels(runSettings);
-    const codexEntries = models.filter((model) => model.id === "codex/gpt-5.5");
+    const codexEntries = models.filter((model) => model.id === "codex/gpt-5.6-sol");
     expect(codexEntries).toHaveLength(1);
     expect(codexEntries[0]!.providerId).toBe("codex-subscription");
-    const resolved = resolveModelProvider(runSettings, "codex/gpt-5.5");
+    const resolved = resolveModelProvider(runSettings, "codex/gpt-5.6-sol");
     expect(resolved).toBeDefined();
     expect(resolved!.provider.kind).toBe("codex-subscription");
     expect(resolved!.provider.builtin).toBe(false);
@@ -303,13 +303,13 @@ describe("configuredModels", () => {
         OPENGENI_OPENAI_PROVIDER: "azure",
         OPENGENI_AZURE_OPENAI_BASE_URL: "https://res.openai.azure.com/openai/v1",
         OPENGENI_AZURE_OPENAI_API_KEY: "az-key",
-        OPENGENI_OPENAI_MODEL: "gpt-5.5",
+        OPENGENI_OPENAI_MODEL: "gpt-5.6-sol",
       },
       () => getSettings(),
     );
-    const runSettings = { ...base, openaiModel: "codex/gpt-5.5" };
-    expect(configuredModels(runSettings).some((model) => model.id === "codex/gpt-5.5")).toBe(false);
-    expect(resolveModelProvider(runSettings, "codex/gpt-5.5")).toBeUndefined();
+    const runSettings = { ...base, openaiModel: "codex/gpt-5.6-sol" };
+    expect(configuredModels(runSettings).some((model) => model.id === "codex/gpt-5.6-sol")).toBe(false);
+    expect(resolveModelProvider(runSettings, "codex/gpt-5.6-sol")).toBeUndefined();
   });
 
   test("a namespaced registry id (Fireworks) as the turn's openaiModel resolves to its registry provider, not the Azure built-in", () => {
@@ -321,7 +321,7 @@ describe("configuredModels", () => {
         OPENGENI_OPENAI_PROVIDER: "azure",
         OPENGENI_AZURE_OPENAI_BASE_URL: "https://res.openai.azure.com/openai/v1",
         OPENGENI_AZURE_OPENAI_API_KEY: "az-key",
-        OPENGENI_OPENAI_MODEL: "gpt-5.5",
+        OPENGENI_OPENAI_MODEL: "gpt-5.6-sol",
         OPENGENI_MODEL_PROVIDERS_JSON: fireworksRegistry,
       },
       () => getSettings(),
@@ -341,7 +341,7 @@ describe("configuredModels", () => {
     const settings = withEnv(
       {
         OPENGENI_OPENAI_API_KEY: "sk-test",
-        OPENGENI_OPENAI_MODEL: "gpt-5.5",
+        OPENGENI_OPENAI_MODEL: "gpt-5.6-sol",
         OPENGENI_OPENAI_ALLOWED_MODELS: "gpt-5.4",
         OPENGENI_MODEL_PROVIDERS_JSON: JSON.stringify([
           {
@@ -349,17 +349,17 @@ describe("configuredModels", () => {
             baseUrl: "https://api.shadow.test/v1",
             apiKey: "shadow-key",
             // Redeclares the built-in default model id; built-in entry must win.
-            models: [{ id: "gpt-5.5", label: "Shadowed" }, { id: "shadow/only" }],
+            models: [{ id: "gpt-5.6-sol", label: "Shadowed" }, { id: "shadow/only" }],
           },
         ]),
       },
       () => getSettings(),
     );
     const models = configuredModels(settings);
-    expect(models.map((model) => model.id)).toEqual(["gpt-5.5", "gpt-5.4", "shadow/only"]);
-    const gpt = models.find((model) => model.id === "gpt-5.5")!;
+    expect(models.map((model) => model.id)).toEqual(["gpt-5.6-sol", "gpt-5.4", "shadow/only"]);
+    const gpt = models.find((model) => model.id === "gpt-5.6-sol")!;
     expect(gpt.providerId).toBe("openai");
-    expect(gpt.label).toBe("gpt-5.5");
+    expect(gpt.label).toBe("gpt-5.6-sol");
   });
 });
 
@@ -369,25 +369,25 @@ describe("configuredAllowedModels", () => {
       {
         OPENGENI_OPENAI_API_KEY: "sk-test",
         OPENGENI_OPENAI_MODEL: "custom-model",
-        OPENGENI_OPENAI_ALLOWED_MODELS: "gpt-5.5,gpt-5.4",
+        OPENGENI_OPENAI_ALLOWED_MODELS: "gpt-5.6-sol,gpt-5.4",
       },
       () => getSettings(),
     );
-    expect(configuredAllowedModels(settings)).toEqual(["custom-model", "gpt-5.5", "gpt-5.4"]);
+    expect(configuredAllowedModels(settings)).toEqual(["custom-model", "gpt-5.6-sol", "gpt-5.4"]);
   });
 
   test("appends registry ids after the built-in allow-list", () => {
     const settings = withEnv(
       {
         OPENGENI_OPENAI_API_KEY: "sk-test",
-        OPENGENI_OPENAI_MODEL: "gpt-5.5",
+        OPENGENI_OPENAI_MODEL: "gpt-5.6-sol",
         OPENGENI_OPENAI_ALLOWED_MODELS: "gpt-5.4",
         OPENGENI_MODEL_PROVIDERS_JSON: fireworksRegistry,
       },
       () => getSettings(),
     );
     expect(configuredAllowedModels(settings)).toEqual([
-      "gpt-5.5",
+      "gpt-5.6-sol",
       "gpt-5.4",
       "accounts/fireworks/models/glm-5p2",
     ]);
@@ -399,17 +399,17 @@ describe("resolveModelProvider", () => {
     const settings = withEnv(
       {
         OPENGENI_OPENAI_API_KEY: "sk-test",
-        OPENGENI_OPENAI_MODEL: "gpt-5.5",
+        OPENGENI_OPENAI_MODEL: "gpt-5.6-sol",
         OPENGENI_MODEL_PROVIDERS_JSON: fireworksRegistry,
       },
       () => getSettings(),
     );
-    const resolved = resolveModelProvider(settings, "gpt-5.5");
+    const resolved = resolveModelProvider(settings, "gpt-5.6-sol");
     expect(resolved).toBeDefined();
     expect(resolved!.provider.id).toBe("openai");
     expect(resolved!.provider.builtin).toBe(true);
     expect(resolved!.provider.api).toBe("responses");
-    expect(resolved!.model.id).toBe("gpt-5.5");
+    expect(resolved!.model.id).toBe("gpt-5.6-sol");
   });
 
   test("resolves a registry model to its registry provider", () => {
@@ -495,7 +495,7 @@ describe("configuredModelPricing", () => {
       outputMicrosPerMillionTokens: 222_000,
     });
     // an untouched default stays intact.
-    expect(pricing["gpt-5.5"]).toEqual(defaultModelPricing["gpt-5.5"]!);
+    expect(pricing["gpt-5.6-sol"]).toEqual(defaultModelPricing["gpt-5.6-sol"]!);
   });
 });
 

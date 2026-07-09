@@ -134,7 +134,7 @@ async function main(): Promise<void> {
     `  ok=${models.ok} status=${models.status} slugs=[${models.slugs.slice(0, 14).join(", ")}]`,
   );
 
-  const model = models.slugs.find((s) => /^gpt-5/.test(s)) ?? models.slugs[0] ?? "gpt-5.5";
+  const model = models.slugs.find((s) => /^gpt-5/.test(s)) ?? models.slugs[0] ?? "gpt-5.6-sol";
   console.log(`\n[2/3] streamed /responses on "${model}"`);
   const ok = await streamOneTurn(auth, model);
 

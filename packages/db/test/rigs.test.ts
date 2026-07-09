@@ -57,7 +57,7 @@ async function insertSessionForRig(
 ): Promise<string> {
   const [row] = await shared!.admin<{ id: string }[]>`
     insert into sessions (account_id, workspace_id, initial_message, model, sandbox_backend, sandbox_group_id, rig_id)
-    values (${ws.accountId}, ${ws.workspaceId}, 'hello', 'gpt-5.5', 'none', gen_random_uuid(), ${rigId})
+    values (${ws.accountId}, ${ws.workspaceId}, 'hello', 'gpt-5.6-sol', 'none', gen_random_uuid(), ${rigId})
     returning id`;
   return row!.id;
 }

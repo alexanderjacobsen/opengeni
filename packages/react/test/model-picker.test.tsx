@@ -29,8 +29,8 @@ afterEach(async () => {
 
 const MODELS: ClientModel[] = [
   {
-    id: "gpt-5.5",
-    label: "gpt-5.5",
+    id: "gpt-5.6-sol",
+    label: "gpt-5.6-sol",
     provider: "openai",
     providerLabel: "OpenAI",
     api: "responses",
@@ -91,7 +91,7 @@ describe("ModelPicker", () => {
     expect(groups.map((group) => group.label)).toEqual(["OpenAI", "Fireworks AI"]);
     // OpenAI group holds its two models; Fireworks group holds GLM 5.2.
     expect([...groups[0]!.querySelectorAll("option")].map((option) => option.textContent)).toEqual([
-      "gpt-5.5",
+      "gpt-5.6-sol",
       "gpt-5.4",
     ]);
     expect([...groups[1]!.querySelectorAll("option")].map((option) => option.value)).toEqual([
@@ -109,7 +109,7 @@ describe("ModelPicker", () => {
   test("calls onChange with the chosen model id", async () => {
     const chosen: string[] = [];
     const container = await mount(
-      <ModelPicker models={MODELS} value="gpt-5.5" onChange={(id) => chosen.push(id)} />,
+      <ModelPicker models={MODELS} value="gpt-5.6-sol" onChange={(id) => chosen.push(id)} />,
     );
     const select = picker(container)!;
     await act(async () => {
@@ -136,12 +136,12 @@ describe("ChatComposer model picker", () => {
       <ChatComposer
         composer={makeComposer()}
         models={MODELS}
-        selectedModel="gpt-5.5"
+        selectedModel="gpt-5.6-sol"
         onSelectModel={() => {}}
       />,
     );
     expect(picker(container)).toBeTruthy();
-    expect(picker(container)!.value).toBe("gpt-5.5");
+    expect(picker(container)!.value).toBe("gpt-5.6-sol");
   });
 
   test("threads the selection out through onSelectModel", async () => {
@@ -150,7 +150,7 @@ describe("ChatComposer model picker", () => {
       <ChatComposer
         composer={makeComposer()}
         models={MODELS}
-        selectedModel="gpt-5.5"
+        selectedModel="gpt-5.6-sol"
         onSelectModel={(id) => chosen.push(id)}
       />,
     );

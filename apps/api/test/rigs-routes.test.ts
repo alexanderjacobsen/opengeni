@@ -209,7 +209,7 @@ describe("rig route permission matrix", () => {
 
     const [session] = await shared!.admin<{ id: string }[]>`
       insert into sessions (account_id, workspace_id, initial_message, model, sandbox_backend, sandbox_group_id, rig_id)
-      values (${ws.accountId}, ${ws.workspaceId}, 'hi', 'gpt-5.5', 'none', gen_random_uuid(), ${rig.id})
+      values (${ws.accountId}, ${ws.workspaceId}, 'hi', 'gpt-5.6-sol', 'none', gen_random_uuid(), ${rig.id})
       returning id`;
 
     const blocked = await app().request(`${base}/${rig.id}`, { method: "DELETE", headers: manage });

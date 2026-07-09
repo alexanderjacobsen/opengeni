@@ -157,7 +157,7 @@ describe("documents", () => {
     const config = documentOpenAIEmbeddingConfig({
       openaiProvider: "azure",
       azureOpenaiEndpoint: "https://example.openai.azure.com",
-      azureOpenaiDeployment: "gpt-5.5",
+      azureOpenaiDeployment: "gpt-5.6-sol",
       azureOpenaiApiKey: "azure-key",
       azureOpenaiApiVersion: "2025-04-01-preview",
       openaiApiKey: undefined,
@@ -166,7 +166,7 @@ describe("documents", () => {
 
     expect(config).toMatchObject({
       apiKey: "azure-key",
-      baseURL: "https://example.openai.azure.com/openai/deployments/gpt-5.5",
+      baseURL: "https://example.openai.azure.com/openai/deployments/gpt-5.6-sol",
       defaultQuery: { "api-version": "2025-04-01-preview" },
     });
   });

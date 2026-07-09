@@ -1575,7 +1575,7 @@ describe("API component integration", () => {
           type: "user.message",
           payload: {
             text: "use a stronger model",
-            model: "gpt-5.5",
+            model: "gpt-5.6-sol",
             reasoningEffort: "xhigh",
           },
         }),
@@ -1587,12 +1587,12 @@ describe("API component integration", () => {
     const event = (await accepted.json()) as SessionEvent;
     expect(event.payload).toEqual({
       text: "use a stronger model",
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       reasoningEffort: "xhigh",
     });
     const turns = await listSessionTurns(dbClient.db, workspaceId, session.id);
     const turn = turns.find((item) => item.triggerEventId === event.id);
-    expect(turn?.model).toBe("gpt-5.5");
+    expect(turn?.model).toBe("gpt-5.6-sol");
     expect(turn?.reasoningEffort).toBe("xhigh");
   });
 

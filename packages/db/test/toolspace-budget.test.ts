@@ -58,7 +58,7 @@ async function freshTurn(): Promise<{ workspaceId: string; sessionId: string; tu
     initialMessage: "hello",
     resources: [],
     metadata: {},
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     sandboxBackend: "none",
   });
   const [turn] = await admin<{ id: string }[]>`
@@ -67,7 +67,7 @@ async function freshTurn(): Promise<{ workspaceId: string; sessionId: string; tu
        status, position, prompt, model, reasoning_effort, sandbox_backend)
     values
       (${account!.id}, ${workspace!.id}, ${session.id}, gen_random_uuid(), 'wf-1',
-       'running', 0, 'hello', 'gpt-5.5', 'medium', 'none')
+       'running', 0, 'hello', 'gpt-5.6-sol', 'medium', 'none')
     returning id`;
   return { workspaceId: workspace!.id, sessionId: session.id, turnId: turn!.id };
 }

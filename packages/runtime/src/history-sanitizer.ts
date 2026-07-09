@@ -503,7 +503,7 @@ export function neutralizeToolSearchItemsInSerializedRunState(serialized: string
  * call carrying `action:{type:"screenshot"}` AND `actions:[{type:"screenshot"}]`).
  *
  * Which singular do we keep? LIVE-PROVEN against the deployed Azure deployment
- * (gpt-5.5-2026-04-24): for gpt-5.5 the SDK serializes the GA computer tool as
+ * (gpt-5.6-sol-2026-04-24): for gpt-5.6-sol the SDK serializes the GA computer tool as
  * `{type:"computer"}` (not the legacy `computer_use_preview`), and that GA tool
  * accepts ONLY the batched plural `actions`. Probing all three shapes:
  *   - `action`-only  -> 400 "exactly one of action or actions" (STILL rejected)
@@ -551,7 +551,7 @@ export function normalizeComputerCallActions<T extends HistoryItem>(items: reado
  * payload from the item: when `actions` is present it emits BOTH
  * `{action: ..., actions: [...]}`, and when only `action` is present it emits
  * `action`-only. It can NEVER emit actions-only. Probed live against the
- * deployed Azure gpt-5.5-2026-04-24 GA computer tool (`{type:"computer"}`):
+ * deployed Azure gpt-5.6-sol-2026-04-24 GA computer tool (`{type:"computer"}`):
  *   - `action`-only  -> 400 "Computer call input must include exactly one of
  *                       `action` or `actions`." (rejected)
  *   - both           -> 400 same message (rejected)

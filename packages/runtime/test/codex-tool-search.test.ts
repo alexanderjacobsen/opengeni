@@ -205,7 +205,7 @@ describe("clone survival (the SandboxAgent path — the REAL staging path)", () 
   function buildSandboxAgent(): SandboxAgent<any, any> {
     return new SandboxAgent({
       name: "test-agent",
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       tools: POOL.map((t) => ({ ...t })) as never,
     } as never);
   }

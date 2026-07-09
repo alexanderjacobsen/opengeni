@@ -446,7 +446,7 @@ export function buildOpenAIClientFromSettings(
           ? { Authorization: `Bearer ${settings.azureOpenaiAdToken}` }
           : undefined,
       // Rewrite every outbound /responses computer_call to the ACTIONS-ONLY shape
-      // the GA Azure computer tool (gpt-5.5) accepts. This is the lowest reachable
+      // the GA Azure computer tool accepts. This is the lowest reachable
       // seam — below the SDK responses converter, which always re-synthesizes BOTH
       // `action` and `actions` (rejected 400 "exactly one of action or actions").
       // See computerCallNormalizingFetch / rewriteComputerCallsToActionsOnly.
@@ -1591,9 +1591,9 @@ function neutralizeStructuredToolTransport(
  *
  * We rebuild the base set explicitly (`filesystem()`, `shell()`, the same
  * factories the SDK default uses) and add `compaction()` ONLY on the server
- * path, with an explicit `StaticCompactionPolicy(threshold)` so gpt-5.5 — which
- * is absent from the SDK's hardcoded context-window map and would otherwise hit
- * the wrong 240k fallback — gets the correct threshold. The SDK has no
+ * path, with an explicit `StaticCompactionPolicy(threshold)` so newer GPT-5.x
+ * models absent from the SDK's hardcoded context-window map do not hit the wrong
+ * 240k fallback. The SDK has no
  * window-registration API, so an explicit threshold is the only way to fix it.
  *
  * The resolved compaction mode and the effective context window are now passed
@@ -2697,7 +2697,7 @@ export const stripProviderItemIdsFilter: CallModelInputFilter = ({ modelData }) 
  * `action` and `actions` down to EXACTLY ONE (keeps `actions`, drops `action`).
  * The Azure computer-use endpoint rejects a request whose computer_call has
  * both with `400 Computer call input must include exactly one of `action` or
- * `actions``; and (live-proven against gpt-5.5's GA computer tool) it also
+ * `actions``; and (live-proven against gpt-5.6-sol's GA computer tool) it also
  * rejects the `action`-only form, accepting ONLY the batched plural `actions`.
  * The SDK 0.11.6 schema allows both, so a freshly-emitted
  * screenshot call carries the redundant pair. This filter runs before EVERY

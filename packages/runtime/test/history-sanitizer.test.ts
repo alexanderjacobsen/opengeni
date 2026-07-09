@@ -180,7 +180,7 @@ describe("normalizeComputerCallActions", () => {
   test("normalizes a computer_call carrying BOTH action and actions to exactly one (keeps actions)", () => {
     // The live Azure 400: a freshly-emitted screenshot computer_call carries
     // both the legacy singular `action` and the GA batched `actions`. The GA
-    // computer tool (how gpt-5.5 serializes it) accepts ONLY the plural
+    // computer tool (how gpt-5.6-sol serializes it) accepts ONLY the plural
     // `actions`; the `action`-only form is rejected too. So we keep `actions`.
     const conflicted = {
       type: "computer_call",
@@ -245,7 +245,7 @@ describe("normalizeComputerCallActions", () => {
 describe("rewriteComputerCallsToActionsOnly", () => {
   test("collapses a both-fields computer_call to actions-only", () => {
     const body = {
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       input: [
         { type: "message", role: "user", content: [{ type: "input_text", text: "screenshot" }] },
         {

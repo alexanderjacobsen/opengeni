@@ -6,7 +6,7 @@ const identity = (s: string): string => s;
 describe("normalizeCodexRequestBody", () => {
   test("forces store:false + stream:true and strips max token fields", () => {
     const body = normalizeCodexRequestBody(
-      { model: "gpt-5.5", stream: false, max_output_tokens: 1000, max_completion_tokens: 2000 },
+      { model: "gpt-5.6-sol", stream: false, max_output_tokens: 1000, max_completion_tokens: 2000 },
       identity,
     );
     expect(body.store).toBe(false);
@@ -94,7 +94,7 @@ describe("normalizeCodexRequestBody", () => {
   test("allowlists top-level fields: strips everything the strict backend rejects", () => {
     const body = normalizeCodexRequestBody(
       {
-        model: "gpt-5.5",
+        model: "gpt-5.6-sol",
         instructions: "be helpful",
         input: [{ type: "message", role: "user", content: [] }],
         tools: [{ type: "function", name: "f" }],
@@ -175,7 +175,7 @@ describe("normalizeCodexRequestBody", () => {
   test("applies the model resolver to body.model", () => {
     const body = normalizeCodexRequestBody(
       { model: "gpt-5.2-codex-high" },
-      buildModelResolver(["gpt-5.2-codex", "gpt-5.5"], "gpt-5.5"),
+      buildModelResolver(["gpt-5.2-codex", "gpt-5.6-sol"], "gpt-5.6-sol"),
     );
     expect(body.model).toBe("gpt-5.2-codex");
   });
@@ -183,29 +183,29 @@ describe("normalizeCodexRequestBody", () => {
 
 describe("buildModelResolver", () => {
   const resolve = buildModelResolver(
-    ["gpt-5.5", "gpt-5.4", "gpt-5.2-codex", "gpt-5.4-mini"],
-    "gpt-5.5",
+    ["gpt-5.6-sol", "gpt-5.4", "gpt-5.2-codex", "gpt-5.4-mini"],
+    "gpt-5.6-sol",
   );
 
   test("longest-prefix match wins", () => {
     expect(resolve("gpt-5.2-codex-xhigh")).toBe("gpt-5.2-codex");
     expect(resolve("gpt-5.4-mini")).toBe("gpt-5.4-mini"); // longer prefix beats gpt-5.4
-    expect(resolve("gpt-5.5")).toBe("gpt-5.5");
+    expect(resolve("gpt-5.6-sol")).toBe("gpt-5.6-sol");
   });
 
   test("strips one leading namespace/ segment", () => {
-    expect(resolve("openai/gpt-5.5")).toBe("gpt-5.5");
+    expect(resolve("openai/gpt-5.6-sol")).toBe("gpt-5.6-sol");
   });
 
   test("unknown slug -> fallback", () => {
-    expect(resolve("o3-pro")).toBe("gpt-5.5");
+    expect(resolve("o3-pro")).toBe("gpt-5.6-sol");
   });
 });
 
 describe("normalizeCodexRequestBody: tool_search replay shapes", () => {
   test("coerces a stringified tool_search_call.arguments to an object (backend 400s a string, verified live)", () => {
     const body: Record<string, unknown> = {
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       input: [
         {
           type: "tool_search_call",
@@ -233,7 +233,7 @@ describe("normalizeCodexRequestBody: tool_search replay shapes", () => {
 
   test("leaves an object tool_search_call.arguments untouched; unparseable string falls back to {}", () => {
     const body: Record<string, unknown> = {
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       input: [
         { type: "tool_search_call", call_id: "c1", arguments: { query: "x" } },
         { type: "tool_search_call", call_id: "c2", arguments: "not json {" },
@@ -247,7 +247,7 @@ describe("normalizeCodexRequestBody: tool_search replay shapes", () => {
 
   test("tools[] entries with defer_loading and the tool_search tool type pass the normalizer untouched", () => {
     const body: Record<string, unknown> = {
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       tools: [
         {
           type: "function",

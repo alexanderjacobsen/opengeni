@@ -17,13 +17,13 @@ describe("composeSendInput", () => {
   test("merges static extras under the text", () => {
     expect(
       composeSendInput("hello", "ce-1", {
-        model: "gpt-5.5",
+        model: "gpt-5.6-sol",
         tools: [{ kind: "mcp", id: "opengeni" }],
       }),
     ).toEqual({
       text: "hello",
       clientEventId: "ce-1",
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       tools: [{ kind: "mcp", id: "opengeni" }],
     });
   });
@@ -32,9 +32,9 @@ describe("composeSendInput", () => {
     // Mirrors the ChatComposer + <ModelPicker> wiring: the host holds the
     // selected model in state and threads it via a sendExtras closure, so the
     // input composed at send time carries whichever model is selected then.
-    let selectedModel = "gpt-5.5";
+    let selectedModel = "gpt-5.6-sol";
     const sendExtras = () => ({ model: selectedModel });
-    expect(composeSendInput("hi", "ce-a", sendExtras).model).toBe("gpt-5.5");
+    expect(composeSendInput("hi", "ce-a", sendExtras).model).toBe("gpt-5.6-sol");
     // Operator switches the picker to GLM 5.2 before the next send.
     selectedModel = "accounts/fireworks/models/glm-5p2";
     expect(composeSendInput("hi again", "ce-b", sendExtras).model).toBe(

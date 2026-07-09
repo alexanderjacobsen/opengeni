@@ -12,7 +12,7 @@ import { createValidatedScheduledTask } from "@opengeni/core";
 // if (and only if) the guard let the request through.
 const SENTINEL = "reached-db-past-the-model-guard";
 
-const settings = testSettings(); // allow-list: scripted-model, gpt-5.5, gpt-5.4, gpt-5.4-mini
+const settings = testSettings(); // allow-list: scripted-model + GPT-5.6 family
 
 function throwingDb(): never {
   throw new Error(SENTINEL);
@@ -72,7 +72,7 @@ describe("scheduled-task model allow-list guard", () => {
   test("an allowed model passes the guard (fails only later, at the db)", async () => {
     let thrown: unknown;
     try {
-      await createWith("gpt-5.5");
+      await createWith("gpt-5.6-sol");
     } catch (error) {
       thrown = error;
     }

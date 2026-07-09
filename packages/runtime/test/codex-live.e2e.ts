@@ -69,7 +69,7 @@ describe("codex subscription live E2E (requires a valid ~/.codex/auth.json)", ()
     };
     const settings = testSettings({ codexSubscriptionEnabled: true });
     const client = buildProviderClient(provider, settings);
-    const model = buildModelInstance(provider, client, "codex/gpt-5.5"); // namespaced; fetch strips the prefix
+    const model = buildModelInstance(provider, client, "codex/gpt-5.6-sol"); // namespaced; fetch strips the prefix
     const agent = new Agent({
       name: "CodexLiveCheck",
       instructions: "You are a helpful assistant.",
@@ -80,7 +80,7 @@ describe("codex subscription live E2E (requires a valid ~/.codex/auth.json)", ()
       clientVersion: CODEX_CLIENT_VERSION,
       getToken: async () => auth.token,
       refresh: async () => auth.token,
-      resolveModel: buildModelResolver(CODEX_FALLBACK_MODEL_SLUGS, "gpt-5.5"),
+      resolveModel: buildModelResolver(CODEX_FALLBACK_MODEL_SLUGS, "gpt-5.6-sol"),
     };
 
     const result = await codexRequestStorage.run(ctx, () =>

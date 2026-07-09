@@ -370,7 +370,7 @@ describe("model call usage observability", () => {
       turnId: "turn-1",
       provider: "openai",
       providerApi: "responses",
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       sourceKey: "resp-1",
       usage: {
         responseId: "resp-1",
@@ -387,7 +387,7 @@ describe("model call usage observability", () => {
     expect(infos[0]).toMatchObject({
       provider: "openai",
       providerApi: "responses",
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       sourceKey: "resp-1",
       inputTokens: 1200,
       outputTokens: 100,
@@ -400,7 +400,7 @@ describe("model call usage observability", () => {
         payload: expect.objectContaining({
           provider: "openai",
           providerApi: "responses",
-          model: "gpt-5.5",
+          model: "gpt-5.6-sol",
           sourceKey: "resp-1",
           inputTokens: 1200,
           outputTokens: 100,

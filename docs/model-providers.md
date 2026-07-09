@@ -245,8 +245,8 @@ deployed UI shows the host-exposed model list and remembers the selection per se
 ```bash
 # Built-in provider stays OpenAI (or Azure) as today.
 OPENGENI_OPENAI_PROVIDER=openai
-OPENGENI_OPENAI_MODEL=gpt-5.5
-OPENGENI_OPENAI_ALLOWED_MODELS=gpt-5.5,gpt-5.4
+OPENGENI_OPENAI_MODEL=gpt-5.6-sol
+OPENGENI_OPENAI_ALLOWED_MODELS=gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna
 
 # Add Fireworks as an extra provider exposing GLM 5.2.
 OPENGENI_FIREWORKS_API_KEY=fw_...
@@ -269,7 +269,7 @@ OPENGENI_MODEL_PROVIDERS_JSON='[
   }
 ]'
 ```
-Clients then see `gpt-5.5`, `gpt-5.4`, and `GLM 5.2` in the picker and can select any of them.
+Clients then see `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, and `GLM 5.2` in the picker and can select any of them.
 
 ## Verification
 

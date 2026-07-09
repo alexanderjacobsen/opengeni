@@ -51,18 +51,18 @@ describe("provider-aware capability selection", () => {
     expect(types).not.toContain("compaction");
   });
 
-  test("server-path compaction policy emits the correct gpt-5.5 threshold, not the 240k fallback", () => {
+  test("server-path compaction policy emits the correct gpt-5.6-sol threshold, not the 240k fallback", () => {
     const settings = testSettings({
       openaiProvider: "openai",
       contextCompactionMode: "server",
-      openaiModel: "gpt-5.5",
+      openaiModel: "gpt-5.6-sol",
     });
     const caps = buildAgentCapabilities(settings, []);
     const compactionCap = caps.find((cap) => (cap as { type?: unknown }).type === "compaction") as
       | { samplingParams: (p: Record<string, unknown>) => Record<string, unknown> }
       | undefined;
     expect(compactionCap).toBeDefined();
-    const params = compactionCap!.samplingParams({ model: "gpt-5.5" });
+    const params = compactionCap!.samplingParams({ model: "gpt-5.6-sol" });
     const contextManagement = params.context_management as Array<{
       type: string;
       compact_threshold: number;

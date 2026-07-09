@@ -150,7 +150,7 @@ async function main(): Promise<void> {
     `  ok=${models.ok} status=${models.status} slugs=${models.slugs.slice(0, 12).join(", ")}${models.slugs.length > 12 ? " …" : ""}`,
   );
 
-  const model = models.slugs[0] ?? "gpt-5.5";
+  const model = models.slugs[0] ?? "gpt-5.6-sol";
   console.log(`\n[2/3] streamed /responses on model "${model}"`);
   await streamOneTurn(auth, model);
 

@@ -896,8 +896,8 @@ describe("composer reasoning-effort picker (full host enum)", () => {
   function clientConfig(patch: Partial<ClientConfig> = {}): ClientConfig {
     return {
       deploymentRevision: "rev-1",
-      defaultModel: "gpt-5.5",
-      allowedModels: ["gpt-5.5"],
+      defaultModel: "gpt-5.6-sol",
+      allowedModels: ["gpt-5.6-sol"],
       models: [],
       defaultReasoningEffort: "none",
       allowedReasoningEfforts: ["none", "minimal", "low", "medium", "high", "xhigh"],
@@ -1126,7 +1126,7 @@ describe("scheduled task form helpers", () => {
             { kind: "mcp", id: "opengeni" },
           ],
           metadata: { owner: "ops" },
-          model: "gpt-5.5",
+          model: "gpt-5.6-sol",
           reasoningEffort: "high",
           sandboxBackend: "docker",
         },
@@ -1140,7 +1140,7 @@ describe("scheduled task form helpers", () => {
       resources,
       tools: [{ kind: "mcp", id: "docs" }],
       metadata: { owner: "ops" },
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       reasoningEffort: "high",
       sandboxBackend: "docker",
     });
@@ -1161,7 +1161,7 @@ describe("scheduled task form helpers", () => {
             },
           ],
           metadata: { owner: "ops" },
-          model: "gpt-5.5",
+          model: "gpt-5.6-sol",
           reasoningEffort: "high",
           sandboxBackend: "docker",
         },
@@ -1182,7 +1182,7 @@ describe("scheduled task form helpers", () => {
     expect(agentConfigFromFormState(form, task)).toMatchObject({
       resources: selectedResources,
       metadata: { owner: "ops" },
-      model: "gpt-5.5",
+      model: "gpt-5.6-sol",
       reasoningEffort: "high",
       sandboxBackend: "docker",
     });
@@ -1333,7 +1333,7 @@ function scheduledTaskAgentConfig(): ScheduledTask["agentConfig"] {
     resources: [],
     tools: [{ kind: "mcp", id: "opengeni" }],
     metadata: {},
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     reasoningEffort: "high",
   };
 }
@@ -1469,7 +1469,7 @@ describe("entitlement formatting", () => {
   test("booleans read as enabled/disabled and arrays join", () => {
     expect(formatEntitlementValue(true)).toBe("enabled");
     expect(formatEntitlementValue(false)).toBe("disabled");
-    expect(formatEntitlementValue(["gpt-5.5", "o4"])).toBe("gpt-5.5, o4");
+    expect(formatEntitlementValue(["gpt-5.6-sol", "o4"])).toBe("gpt-5.6-sol, o4");
     expect(formatEntitlementValue([])).toBe("none");
     expect(formatEntitlementValue(25)).toBe("25");
   });
@@ -1478,11 +1478,11 @@ describe("entitlement formatting", () => {
     expect(
       entitlementEntries({
         "sessions.max": 10,
-        "models.allowed": ["gpt-5.5"],
+        "models.allowed": ["gpt-5.6-sol"],
         "packs.custom": true,
       }),
     ).toEqual([
-      { name: "models.allowed", value: "gpt-5.5" },
+      { name: "models.allowed", value: "gpt-5.6-sol" },
       { name: "packs.custom", value: "enabled" },
       { name: "sessions.max", value: "10" },
     ]);

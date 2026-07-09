@@ -25,16 +25,11 @@ export const CODEX_PROVIDER_ID = "codex-subscription";
 export const CODEX_PROVIDER_BASE_URL = "https://chatgpt.com/backend-api";
 export const CODEX_MODEL_ID_PREFIX = "codex/";
 
-// Offline fallback catalog. The live catalog from GET /models supersedes this
-// when wired; until then these are the selectable codex models and the
-// longest-prefix resolution targets. Confirmed live (2026-06) against a pro plan:
-// GET /codex/models returned exactly these (plus the internal codex-auto-review).
-export const CODEX_FALLBACK_MODEL_SLUGS = [
-  "gpt-5.5",
-  "gpt-5.4",
-  "gpt-5.4-mini",
-  "gpt-5.3-codex-spark",
-] as const;
+// The only Codex subscription models OpenGeni exposes. The live GET /models
+// catalog is intersected with this list, never allowed to broaden it, so older
+// Codex/GPT models cannot reappear in the picker when the upstream catalog
+// includes them.
+export const CODEX_FALLBACK_MODEL_SLUGS = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] as const;
 
 // Sent as the `version` header and inside the User-Agent. Confirmed live: the
 // backend accepts the current codex CLI version; an older value risks /models

@@ -48,7 +48,7 @@ function filesystemApplyPatchToolType(
     .clone()
     .bind(stubSession)
     .bindRunAs(undefined)
-    .bindModel("gpt-5.5", new OpenAIResponsesModel());
+    .bindModel("gpt-5.6-sol", new OpenAIResponsesModel());
   return bound.tools().find((tool) => tool.name === "apply_patch")?.type;
 }
 

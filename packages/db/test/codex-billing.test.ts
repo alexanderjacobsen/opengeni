@@ -33,7 +33,7 @@ function mockCredentialStatus(status: string | null): () => void {
 
 describe("isCodexBilledModel (pure prefix test)", () => {
   test("true for a codex/<slug> id", () => {
-    expect(isCodexBilledModel("codex/gpt-5.5")).toBe(true);
+    expect(isCodexBilledModel("codex/gpt-5.6-sol")).toBe(true);
   });
   test("false for a normal model id, null, and undefined", () => {
     expect(isCodexBilledModel("gpt-5")).toBe(false);
@@ -96,7 +96,7 @@ describe("isCodexBilledTurn (canonical predicate)", () => {
           db: {} as Database,
           settings,
           workspaceId: "ws_1",
-          model: "codex/gpt-5.5",
+          model: "codex/gpt-5.6-sol",
         }),
       ).toBe(true);
     } finally {
@@ -113,7 +113,7 @@ describe("isCodexBilledTurn (canonical predicate)", () => {
           db: {} as Database,
           settings,
           workspaceId: "ws_1",
-          model: "codex/gpt-5.5",
+          model: "codex/gpt-5.6-sol",
         }),
       ).toBe(false);
     } finally {
@@ -136,7 +136,7 @@ describe("isCodexBilledTurn (canonical predicate)", () => {
         db: poison,
         settings,
         workspaceId: "ws_1",
-        model: "codex/gpt-5.5",
+        model: "codex/gpt-5.6-sol",
       }),
     ).toBe(false);
   });

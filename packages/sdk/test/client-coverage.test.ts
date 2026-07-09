@@ -399,12 +399,12 @@ describe("OpenGeniClient access + workspaces", () => {
   test("getClientConfig fetches the public bootstrap endpoint and returns the provider-grouped models", async () => {
     const config = {
       deploymentRevision: "rev-1",
-      defaultModel: "gpt-5.5",
-      allowedModels: ["gpt-5.5", "accounts/fireworks/models/glm-5p2"],
+      defaultModel: "gpt-5.6-sol",
+      allowedModels: ["gpt-5.6-sol", "accounts/fireworks/models/glm-5p2"],
       models: [
         {
-          id: "gpt-5.5",
-          label: "GPT-5.5",
+          id: "gpt-5.6-sol",
+          label: "GPT-5.6 Sol",
           provider: "openai",
           providerLabel: "OpenAI",
           api: "responses",
@@ -431,9 +431,9 @@ describe("OpenGeniClient access + workspaces", () => {
     expect(requests).toHaveLength(1);
     expect(requests[0]!.method).toBe("GET");
     expect(new URL(requests[0]!.url).pathname).toBe("/v1/config/client");
-    expect(result.defaultModel).toBe("gpt-5.5");
+    expect(result.defaultModel).toBe("gpt-5.6-sol");
     expect(result.models.map((model) => `${model.provider}:${model.id}:${model.api}`)).toEqual([
-      "openai:gpt-5.5:responses",
+      "openai:gpt-5.6-sol:responses",
       "fireworks:accounts/fireworks/models/glm-5p2:chat",
     ]);
   });

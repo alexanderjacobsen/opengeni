@@ -10,7 +10,7 @@
 // from model context), searches by capability, and only the matched tools are
 // disclosed back and become callable.
 //
-// PROVEN LIVE (Phase 0 probe against /codex/responses on gpt-5.5): the backend
+// PROVEN LIVE (Phase 0 probe against /codex/responses on gpt-5.6-sol): the backend
 // HONORS `defer_loading:true` on function tools — 50 fat tools dropped input_tokens
 // 6766 → 108 — AND makes a tool callable purely because a prior `tool_search_output`
 // disclosed it (V3). The model emits `tool_search_call` on our slug.

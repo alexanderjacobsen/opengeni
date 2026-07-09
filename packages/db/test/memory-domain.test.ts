@@ -152,7 +152,7 @@ describe("renderWorkspaceMemoryBlock", () => {
       record({
         id: "44444444-0000-4000-8000-000000000000",
         kind: "decision",
-        text: "Chose Azure gpt-5.5.",
+        text: "Chose Azure gpt-5.6-sol.",
       }),
       record({ id: "55555555-0000-4000-8000-000000000000", kind: "episodic", text: "excluded" }),
     ])!;

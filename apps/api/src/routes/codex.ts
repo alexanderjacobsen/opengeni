@@ -90,10 +90,14 @@ function codexUsageJson(payload: CodexUsagePayload): {
 }
 
 export function codexModelsForPicker(
-  slugs: string[],
+  liveSlugs: readonly string[],
 ): Array<{ id: string; label: string; provider: string; providerLabel: string; api: "responses" }> {
-  const available = new Set(slugs);
-  return CODEX_FALLBACK_MODEL_SLUGS.filter((slug) => available.has(slug)).map((slug) => ({
+  const available = new Set(liveSlugs);
+  const missing = CODEX_FALLBACK_MODEL_SLUGS.filter((slug) => !available.has(slug));
+  if (missing.length > 0) {
+    throw new Error(`Codex catalog is missing required models: ${missing.join(", ")}`);
+  }
+  return CODEX_FALLBACK_MODEL_SLUGS.map((slug) => ({
     id: `${CODEX_MODEL_ID_PREFIX}${slug}`,
     label: slug.replace(/^gpt-/, "GPT-"),
     provider: CODEX_PROVIDER_ID,
@@ -264,7 +268,8 @@ export function registerCodexRoutes(app: Hono, deps: ApiRouteDeps): void {
         }
       : null;
     let valid = false;
-    let models = codexModelsForPicker([...CODEX_FALLBACK_MODEL_SLUGS]); // offline fallback list
+    let models: ReturnType<typeof codexModelsForPicker> = [];
+    let catalogError: string | null = null;
     try {
       const cred = status.credentialId
         ? await loadCodexCredentialForRun(db, settings, workspaceId, status.credentialId)
@@ -276,20 +281,23 @@ export function registerCodexRoutes(app: Hono, deps: ApiRouteDeps): void {
           isFedramp: cred.isFedramp,
           clientVersion: CODEX_CLIENT_VERSION,
         });
-        valid = live.ok;
-        if (live.ok && live.slugs.length > 0) {
-          models = codexModelsForPicker(live.slugs); // prefer the live catalog
+        if (live.ok) {
+          models = codexModelsForPicker(live.slugs);
+          valid = true;
+        } else {
+          catalogError = `Codex models request failed with status ${live.status}`;
         }
       }
-    } catch {
+    } catch (error) {
       valid = false;
+      catalogError = error instanceof Error ? error.message : String(error);
     }
     return c.json({
       connected: status.connected,
       plan: status.planType,
       valid,
       expiresAt: status.expiresAt,
-      lastError: status.lastError,
+      lastError: catalogError ?? status.lastError,
       models, // ClientModel[] the picker surfaces under the "no credits" group
       activeAccount, // the account a session runs on when unpinned (label for the indicator)
       accountCount: accounts.length,

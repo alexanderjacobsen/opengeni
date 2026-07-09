@@ -26,15 +26,14 @@ export const CODEX_PROVIDER_BASE_URL = "https://chatgpt.com/backend-api";
 export const CODEX_MODEL_ID_PREFIX = "codex/";
 
 // The only Codex subscription models OpenGeni exposes. The live GET /models
-// catalog is intersected with this list, never allowed to broaden it, so older
-// Codex/GPT models cannot reappear in the picker when the upstream catalog
-// includes them.
+// catalog must contain every exact slug; older or internal models never broaden
+// this product allowlist.
 export const CODEX_FALLBACK_MODEL_SLUGS = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] as const;
 
-// Sent as the `version` header and inside the User-Agent. Confirmed live: the
-// backend accepts the current codex CLI version; an older value risks /models
-// min_client_version filtering. Keep in step with the codex CLI releases.
-export const CODEX_CLIENT_VERSION = "0.142.4";
+// Sent as the `version` header and inside the User-Agent. Staging-proven on
+// 2026-07-09: 0.142.4 filtered every GPT-5.6 slug out of GET /models, while the
+// official Codex 0.144.0 release returned all three exact slugs above.
+export const CODEX_CLIENT_VERSION = "0.144.0";
 
 export const CODEX_REFRESH_WINDOW_MS = 5 * 60 * 1000; // proactive refresh when within 5 min of exp (spec §1.1)
 export const CODEX_REFRESH_FALLBACK_MS = 8 * 24 * 60 * 60 * 1000; // 8 days when exp is unparseable

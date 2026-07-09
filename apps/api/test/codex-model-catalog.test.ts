@@ -2,24 +2,30 @@ import { describe, expect, test } from "bun:test";
 import { codexModelsForPicker } from "../src/routes/codex";
 
 describe("Codex model catalog", () => {
-  test("exposes only GPT-5.6 Sol, Terra, and Luna from a broader live catalog", () => {
+  const expected = ["codex/gpt-5.6-sol", "codex/gpt-5.6-terra", "codex/gpt-5.6-luna"];
+
+  test("keeps exactly the three exact GPT-5.6 slugs from a broader live catalog", () => {
     const models = codexModelsForPicker([
-      "gpt-5.4",
       "gpt-5.6-luna",
-      "gpt-5.3-codex",
+      "gpt-5.5",
       "gpt-5.6-sol",
-      "o3-pro",
+      "gpt-5.4",
       "gpt-5.6-terra",
+      "gpt-5.4-mini",
+      "gpt-5.3-codex-spark",
+      "codex-auto-review",
     ]);
 
-    expect(models.map((model) => model.id)).toEqual([
-      "codex/gpt-5.6-sol",
-      "codex/gpt-5.6-terra",
-      "codex/gpt-5.6-luna",
-    ]);
+    expect(models.map((model) => model.id)).toEqual(expected);
   });
 
-  test("does not fall back to older Codex models when GPT-5.6 is absent", () => {
-    expect(codexModelsForPicker(["gpt-5.3-codex", "gpt-5.2-codex"])).toEqual([]);
+  test("an unrelated catalog fails closed instead of exposing older models", () => {
+    expect(() =>
+      codexModelsForPicker(["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "codex-auto-review"]),
+    ).toThrow("Codex catalog is missing required models");
+  });
+
+  test("an empty live catalog fails closed", () => {
+    expect(() => codexModelsForPicker([])).toThrow("Codex catalog is missing required models");
   });
 });

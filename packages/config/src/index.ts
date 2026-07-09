@@ -252,8 +252,8 @@ const SettingsSchema = z.object({
   openaiProvider: z.enum(["openai", "azure"]).default("openai"),
   openaiApiKey: z.string().optional(),
   openaiBaseUrl: z.string().optional(),
-  openaiModel: z.string().default("gpt-5.6"),
-  openaiAllowedModels: z.string().default("gpt-5.6,gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna"),
+  openaiModel: z.string().default("gpt-5.6-sol"),
+  openaiAllowedModels: z.string().default("gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna"),
   modelPricingJson: z.string().default("{}"),
   // Extra (non-built-in) model providers, declared by the host as a JSON
   // provider registry. Each entry carries its own base URL, API key, wire API
@@ -805,12 +805,6 @@ export interface ConfiguredModel {
 }
 
 export const defaultModelPricing: Record<string, ModelPricing> = {
-  "gpt-5.6": {
-    inputMicrosPerMillionTokens: 5_000_000,
-    cachedInputMicrosPerMillionTokens: 500_000,
-    outputMicrosPerMillionTokens: 30_000_000,
-    marginBps: 2_500,
-  },
   "gpt-5.6-sol": {
     inputMicrosPerMillionTokens: 5_000_000,
     cachedInputMicrosPerMillionTokens: 500_000,
@@ -1321,7 +1315,7 @@ export function configuredModels(settings: Settings): ConfiguredModel[] {
   // contains "/") that a registry actually owns is never a valid Azure/OpenAI
   // deployment name, and a `codex/`-prefixed id never is either — exclude both
   // from the built-in list. A BARE id a registry merely redeclares (e.g.
-  // "gpt-5.6") is left in place so the built-in still wins it via the first-wins
+  // "gpt-5.6-sol") is left in place so the built-in still wins it via the first-wins
   // de-dup below (preserving the documented built-in-precedence contract). When
   // a codex/ id has NO codex provider injected (no active subscription) it then
   // resolves to nothing and getModel fails loud with

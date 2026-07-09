@@ -71,15 +71,11 @@ export function testSettings(overrides: Partial<Settings> = {}): Settings {
     openaiApiKey: "test-openai-key",
     openaiBaseUrl: undefined,
     openaiModel: "scripted-model",
-    openaiAllowedModels: "scripted-model,gpt-5.6,gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna",
+    openaiAllowedModels: "scripted-model,gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna",
     modelPricingJson: JSON.stringify({
       "scripted-model": {
         inputMicrosPerMillionTokens: 0,
         outputMicrosPerMillionTokens: 0,
-      },
-      "gpt-5.6": {
-        inputMicrosPerMillionTokens: 1,
-        outputMicrosPerMillionTokens: 1,
       },
       "gpt-5.6-sol": {
         inputMicrosPerMillionTokens: 1,

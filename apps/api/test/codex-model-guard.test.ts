@@ -32,6 +32,6 @@ describe("assertConfiguredModel — codex subscription models", () => {
   });
 
   test("a normal deployment-allowed model is unaffected", () => {
-    expect(() => assertConfiguredModel(testSettings(), "gpt-5.6")).not.toThrow();
+    expect(() => assertConfiguredModel(testSettings(), "gpt-5.6-sol")).not.toThrow();
   });
 });

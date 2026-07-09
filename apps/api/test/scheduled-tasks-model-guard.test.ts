@@ -72,7 +72,7 @@ describe("scheduled-task model allow-list guard", () => {
   test("an allowed model passes the guard (fails only later, at the db)", async () => {
     let thrown: unknown;
     try {
-      await createWith("gpt-5.6");
+      await createWith("gpt-5.6-sol");
     } catch (error) {
       thrown = error;
     }

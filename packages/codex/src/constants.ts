@@ -29,11 +29,7 @@ export const CODEX_MODEL_ID_PREFIX = "codex/";
 // catalog is intersected with this list, never allowed to broaden it, so older
 // Codex/GPT models cannot reappear in the picker when the upstream catalog
 // includes them.
-export const CODEX_FALLBACK_MODEL_SLUGS = [
-  "gpt-5.6-sol",
-  "gpt-5.6-terra",
-  "gpt-5.6-luna",
-] as const;
+export const CODEX_FALLBACK_MODEL_SLUGS = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] as const;
 
 // Sent as the `version` header and inside the User-Agent. Confirmed live: the
 // backend accepts the current codex CLI version; an older value risks /models

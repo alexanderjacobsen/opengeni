@@ -834,7 +834,10 @@ describe("useAvailableModels", () => {
     expect(calls).toBe(1);
     expect(hook.result.current.loading).toBe(false);
     expect(hook.result.current.defaultModel).toBe("gpt-5.6-sol");
-    expect(hook.result.current.models.map((model) => model.label)).toEqual(["gpt-5.6-sol", "GLM 5.2"]);
+    expect(hook.result.current.models.map((model) => model.label)).toEqual([
+      "gpt-5.6-sol",
+      "GLM 5.2",
+    ]);
     expect(hook.result.current.models.map((model) => model.providerLabel)).toEqual([
       "OpenAI",
       "Fireworks AI",

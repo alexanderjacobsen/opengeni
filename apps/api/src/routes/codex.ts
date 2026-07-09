@@ -93,14 +93,13 @@ export function codexModelsForPicker(
   slugs: string[],
 ): Array<{ id: string; label: string; provider: string; providerLabel: string; api: "responses" }> {
   const available = new Set(slugs);
-  return CODEX_FALLBACK_MODEL_SLUGS.filter((slug) => available.has(slug))
-    .map((slug) => ({
-      id: `${CODEX_MODEL_ID_PREFIX}${slug}`,
-      label: slug.replace(/^gpt-/, "GPT-"),
-      provider: CODEX_PROVIDER_ID,
-      providerLabel: CODEX_PROVIDER_LABEL,
-      api: "responses" as const,
-    }));
+  return CODEX_FALLBACK_MODEL_SLUGS.filter((slug) => available.has(slug)).map((slug) => ({
+    id: `${CODEX_MODEL_ID_PREFIX}${slug}`,
+    label: slug.replace(/^gpt-/, "GPT-"),
+    provider: CODEX_PROVIDER_ID,
+    providerLabel: CODEX_PROVIDER_LABEL,
+    api: "responses" as const,
+  }));
 }
 import { createSignedState, readSignedState } from "@opengeni/github";
 import type { ApiRouteDeps } from "@opengeni/core";

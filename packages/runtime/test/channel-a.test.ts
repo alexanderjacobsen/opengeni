@@ -561,10 +561,21 @@ describe("P4.4 SandboxChannelAService — terminal cwd frames", () => {
         };
       },
     });
-    const session = new SelfhostedSession({ workspaceId: WS, agentId: AGENT, controlRpc: mock, relay: RELAY, workingDir: "/home/u/proj" });
+    const session = new SelfhostedSession({
+      workspaceId: WS,
+      agentId: AGENT,
+      controlRpc: mock,
+      relay: RELAY,
+      workingDir: "/home/u/proj",
+    });
     const svc = new SandboxChannelAService({ session });
 
-    const out = await svc.terminalExec({ command: "ls", cwd: "/workspace", timeoutMs: 10000, emitStream: false });
+    const out = await svc.terminalExec({
+      command: "ls",
+      cwd: "/workspace",
+      timeoutMs: 10000,
+      emitStream: false,
+    });
 
     expect(out.exitCode).toBe(0);
     expect(out.stdout).toContain("README.md");
@@ -586,10 +597,21 @@ describe("P4.4 SandboxChannelAService — terminal cwd frames", () => {
         };
       },
     });
-    const session = new SelfhostedSession({ workspaceId: WS, agentId: AGENT, controlRpc: mock, relay: RELAY, workingDir: "/home/u/proj" });
+    const session = new SelfhostedSession({
+      workspaceId: WS,
+      agentId: AGENT,
+      controlRpc: mock,
+      relay: RELAY,
+      workingDir: "/home/u/proj",
+    });
     const svc = new SandboxChannelAService({ session });
 
-    const out = await svc.terminalExec({ command: "pwd && ls -la", cwd: "/workspace/sub", timeoutMs: 10000, emitStream: false });
+    const out = await svc.terminalExec({
+      command: "pwd && ls -la",
+      cwd: "/workspace/sub",
+      timeoutMs: 10000,
+      emitStream: false,
+    });
 
     expect(out.exitCode).toBe(0);
     expect(out.stdout).toContain("/home/u/proj/sub");
@@ -611,10 +633,19 @@ describe("P4.4 SandboxChannelAService — terminal cwd frames", () => {
         };
       },
     });
-    const session = new SelfhostedSession({ workspaceId: WS, agentId: AGENT, controlRpc: mock, relay: RELAY, workingDir: "/home/u/proj" });
+    const session = new SelfhostedSession({
+      workspaceId: WS,
+      agentId: AGENT,
+      controlRpc: mock,
+      relay: RELAY,
+      workingDir: "/home/u/proj",
+    });
     const svc = new SandboxChannelAService({ session });
 
-    const opened = await svc.ptyOpen({ cols: 80, rows: 24, cwd: "/workspace/sub" }, "pty-selfhosted");
+    const opened = await svc.ptyOpen(
+      { cols: 80, rows: 24, cwd: "/workspace/sub" },
+      "pty-selfhosted",
+    );
 
     expect(opened.response.ptyId).toBe("pty-selfhosted");
     expect(opened.response.supportsInput).toBe(false);
@@ -627,7 +658,12 @@ describe("P4.4 SandboxChannelAService — terminal cwd frames", () => {
       supportsPty: () => true,
       exec: async (args) => {
         seen.push({ cmd: args.cmd, workdir: args.workdir, tty: args.tty });
-        return { stdout: "", stderr: "", exitCode: args.tty ? null : 0, sessionId: args.tty ? 12 : undefined };
+        return {
+          stdout: "",
+          stderr: "",
+          exitCode: args.tty ? null : 0,
+          sessionId: args.tty ? 12 : undefined,
+        };
       },
       writeStdin: async () => "",
     };
@@ -636,7 +672,12 @@ describe("P4.4 SandboxChannelAService — terminal cwd frames", () => {
     await svc.terminalExec({ command: "pwd", cwd: "", timeoutMs: 10000, emitStream: false });
     await svc.terminalExec({ command: "pwd", cwd: "sub", timeoutMs: 10000, emitStream: false });
     await svc.ptyOpen({ cols: 80, rows: 24, cwd: "sub" }, "pty-provisioned");
-    await svc.terminalExec({ command: "pwd", cwd: "/workspace/sub", timeoutMs: 10000, emitStream: false });
+    await svc.terminalExec({
+      command: "pwd",
+      cwd: "/workspace/sub",
+      timeoutMs: 10000,
+      emitStream: false,
+    });
 
     expect(seen).toEqual([
       { cmd: "pwd", workdir: "/workspace", tty: undefined },

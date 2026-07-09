@@ -148,7 +148,11 @@ async function resolveAccessContext(c: Context, deps: AccessDeps): Promise<Acces
   return null;
 }
 
-async function apiKeyAccessContext(c: Context, deps: AccessDeps, mode: "configured" | "managed"): Promise<AccessContext | null> {
+async function apiKeyAccessContext(
+  c: Context,
+  deps: AccessDeps,
+  mode: "configured" | "managed",
+): Promise<AccessContext | null> {
   const bearer = bearerToken(c);
   if (!bearer) {
     return null;
@@ -159,25 +163,33 @@ async function apiKeyAccessContext(c: Context, deps: AccessDeps, mode: "configur
   }
   const subjectId = `api_key:${apiKey.id}`;
   const accountPermissions = apiKey.workspaceId
-    ? apiKey.permissions.filter((permission) => permission === "billing:read" || permission === "billing:manage")
+    ? apiKey.permissions.filter(
+        (permission) => permission === "billing:read" || permission === "billing:manage",
+      )
     : apiKey.permissions;
   return {
     mode,
     subjectId,
     subjectLabel: apiKey.name,
-    accountGrants: [{
-      accountId: apiKey.accountId,
-      subjectId,
-      subjectLabel: apiKey.name,
-      permissions: accountPermissions,
-    }],
-    workspaceGrants: apiKey.workspaceId ? [{
-      workspaceId: apiKey.workspaceId,
-      accountId: apiKey.accountId,
-      subjectId,
-      subjectLabel: apiKey.name,
-      permissions: apiKey.permissions,
-    }] : [],
+    accountGrants: [
+      {
+        accountId: apiKey.accountId,
+        subjectId,
+        subjectLabel: apiKey.name,
+        permissions: accountPermissions,
+      },
+    ],
+    workspaceGrants: apiKey.workspaceId
+      ? [
+          {
+            workspaceId: apiKey.workspaceId,
+            accountId: apiKey.accountId,
+            subjectId,
+            subjectLabel: apiKey.name,
+            permissions: apiKey.permissions,
+          },
+        ]
+      : [],
     defaultAccountId: apiKey.accountId,
     defaultWorkspaceId: apiKey.workspaceId,
   } satisfies AccessContext;

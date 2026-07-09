@@ -88,7 +88,9 @@ function isAuthorized(c: Context, expected: string | undefined): boolean {
     return true;
   }
   const authorization = c.req.header("authorization");
-  const bearer = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : undefined;
+  const bearer = authorization?.startsWith("Bearer ")
+    ? authorization.slice("Bearer ".length)
+    : undefined;
   return constantTimeEqual(bearer, expected);
 }
 

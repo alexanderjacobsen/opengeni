@@ -308,7 +308,9 @@ describe("configuredModels", () => {
       () => getSettings(),
     );
     const runSettings = { ...base, openaiModel: "codex/gpt-5.6-sol" };
-    expect(configuredModels(runSettings).some((model) => model.id === "codex/gpt-5.6-sol")).toBe(false);
+    expect(configuredModels(runSettings).some((model) => model.id === "codex/gpt-5.6-sol")).toBe(
+      false,
+    );
     expect(resolveModelProvider(runSettings, "codex/gpt-5.6-sol")).toBeUndefined();
   });
 

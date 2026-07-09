@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildModelResolver, normalizeCodexRequestBody } from "../src";
+import { buildModelResolver, CODEX_FALLBACK_MODEL_SLUGS, normalizeCodexRequestBody } from "../src";
 
 const identity = (s: string): string => s;
 
@@ -199,6 +199,17 @@ describe("buildModelResolver", () => {
 
   test("unknown slug -> fallback", () => {
     expect(resolve("o3-pro")).toBe("gpt-5.6-sol");
+  });
+
+  test("all exposed Codex GPT-5.6 ids reach the exact upstream slug unchanged", () => {
+    const resolveExact = buildModelResolver(
+      CODEX_FALLBACK_MODEL_SLUGS,
+      CODEX_FALLBACK_MODEL_SLUGS[0],
+    );
+
+    for (const slug of CODEX_FALLBACK_MODEL_SLUGS) {
+      expect(resolveExact(`codex/${slug}`)).toBe(slug);
+    }
   });
 });
 

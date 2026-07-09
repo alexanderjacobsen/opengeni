@@ -22,7 +22,7 @@ describe("withCodexProvider", () => {
     expect(codex?.api).toBe("responses");
     expect(codex?.baseUrl).toBe("https://chatgpt.com/backend-api");
     expect(codex?.models.every((m) => m.id.startsWith("codex/"))).toBe(true);
-    expect(codex?.models.some((m) => m.id === "codex/gpt-5.3-codex")).toBe(true);
+    expect(codex?.models.some((m) => m.id === "codex/gpt-5.6-sol")).toBe(true);
   });
 
   test("preserves existing registry providers", () => {

@@ -315,6 +315,7 @@ export function CapabilitiesRoute({
         const response = await client.startConnectionOAuth(workspaceId, {
           ...(plan.mcpUrl ? { mcpUrl: plan.mcpUrl } : {}),
           ...(plan.providerDomain ? { providerDomain: plan.providerDomain } : {}),
+          ...(action.oauthClient ? { oauthClient: action.oauthClient } : {}),
           returnPath,
         });
         if (!response.authorizationUrl) {

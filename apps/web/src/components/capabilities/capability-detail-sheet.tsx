@@ -27,7 +27,15 @@ import type { CapabilityCatalogItem } from "@/types";
 
 export type ConnectAction =
   | { type: "enable"; item: CapabilityCatalogItem }
-  | { type: "oauth"; item: CapabilityCatalogItem }
+  | {
+      type: "oauth";
+      item: CapabilityCatalogItem;
+      oauthClient?: {
+        clientId: string;
+        clientSecret?: string;
+        tokenEndpointAuthMethod?: "none" | "client_secret_post" | "client_secret_basic";
+      };
+    }
   | { type: "api_key"; item: CapabilityCatalogItem; headers: Record<string, string> }
   // connectionId is the existing row to reuse, or null when the row was deleted
   // (reconnect then mints a fresh connection and re-enables with its ref).
@@ -242,20 +250,29 @@ function DetailBody({
               onSubmit={(next) => onAction({ type: "api_key", item, headers: next })}
             />
           ) : plan.mode === "oauth" ? (
-            <div className="space-y-2">
-              <Button
-                type="button"
-                className="w-full"
-                disabled={busy}
-                onClick={() => onAction({ type: "oauth", item })}
-              >
-                {busy ? <Loader2Icon className="animate-spin" /> : <PlugIcon />}
-                Connect {item.name}
-              </Button>
-              <p className="text-center text-xs text-fg-subtle">
-                You'll authorize {item.name} in a new step, then return here.
-              </p>
-            </div>
+            plan.providerDomain === "slack.com" ? (
+              <OAuthClientForm
+                itemName={item.name}
+                keyPageUrl={keyPageUrl}
+                busy={busy}
+                onSubmit={(oauthClient) => onAction({ type: "oauth", item, oauthClient })}
+              />
+            ) : (
+              <div className="space-y-2">
+                <Button
+                  type="button"
+                  className="w-full"
+                  disabled={busy}
+                  onClick={() => onAction({ type: "oauth", item })}
+                >
+                  {busy ? <Loader2Icon className="animate-spin" /> : <PlugIcon />}
+                  Connect {item.name}
+                </Button>
+                <p className="text-center text-xs text-fg-subtle">
+                  You'll authorize {item.name} in a new step, then return here.
+                </p>
+              </div>
+            )
           ) : (
             <Button
               type="button"
@@ -275,6 +292,87 @@ function DetailBody({
         </div>
       </div>
     </div>
+  );
+}
+
+function OAuthClientForm({
+  itemName,
+  keyPageUrl,
+  busy,
+  onSubmit,
+}: {
+  itemName: string;
+  keyPageUrl: string | null;
+  busy: boolean;
+  onSubmit: (oauthClient: {
+    clientId: string;
+    clientSecret: string;
+    tokenEndpointAuthMethod: "client_secret_post";
+  }) => void;
+}) {
+  const [clientId, setClientId] = useState("");
+  const [clientSecret, setClientSecret] = useState("");
+  const ready = clientId.trim().length > 0 && clientSecret.trim().length > 0;
+
+  return (
+    <form
+      className="space-y-3"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (!ready || busy) return;
+        onSubmit({
+          clientId: clientId.trim(),
+          clientSecret: clientSecret.trim(),
+          tokenEndpointAuthMethod: "client_secret_post",
+        });
+      }}
+    >
+      <Notice tone="muted">
+        {itemName} requires a Slack app OAuth client. Paste the client ID and client secret from
+        Slack, then you’ll authorize access in Slack.
+      </Notice>
+      <div className="space-y-1.5">
+        <Label htmlFor="oauth-client-id" className="text-xs text-fg-muted">
+          Client ID
+        </Label>
+        <Input
+          id="oauth-client-id"
+          type="text"
+          autoComplete="off"
+          value={clientId}
+          onChange={(event) => setClientId(event.target.value)}
+          placeholder="Paste your Slack client ID"
+        />
+      </div>
+      <div className="space-y-1.5">
+        <Label htmlFor="oauth-client-secret" className="text-xs text-fg-muted">
+          Client secret
+        </Label>
+        <Input
+          id="oauth-client-secret"
+          type="password"
+          autoComplete="off"
+          value={clientSecret}
+          onChange={(event) => setClientSecret(event.target.value)}
+          placeholder="Paste your Slack client secret"
+        />
+      </div>
+      {keyPageUrl ? (
+        <a
+          href={keyPageUrl}
+          target="_blank"
+          rel="noreferrer noopener"
+          className="inline-flex items-center gap-1 text-xs font-medium text-brand hover:underline"
+        >
+          Open Slack app settings
+          <ExternalLinkIcon className="size-3" />
+        </a>
+      ) : null}
+      <Button type="submit" className="w-full" disabled={busy || !ready}>
+        {busy ? <Loader2Icon className="animate-spin" /> : <PlugIcon />}
+        Connect {itemName}
+      </Button>
+    </form>
   );
 }
 

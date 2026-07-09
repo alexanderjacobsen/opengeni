@@ -2735,6 +2735,15 @@ export const OAuthStartRequest = z
     requestedScopes: z.array(z.string().min(1)).default([]),
     returnPath: z.string().min(1).optional(),
     connectionId: z.string().uuid().optional(),
+    oauthClient: z
+      .object({
+        clientId: z.string().min(1),
+        clientSecret: z.string().min(1).optional(),
+        tokenEndpointAuthMethod: z
+          .enum(["none", "client_secret_post", "client_secret_basic"])
+          .optional(),
+      })
+      .optional(),
   })
   .refine((value) => Boolean(value.mcpUrl ?? value.resource), {
     message: "mcpUrl is required",

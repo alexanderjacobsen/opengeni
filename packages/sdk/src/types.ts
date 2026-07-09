@@ -337,6 +337,13 @@ export type OAuthStartRequest = {
   requestedScopes?: string[] | undefined;
   returnPath?: string | undefined;
   connectionId?: string | undefined;
+  oauthClient?:
+    | {
+        clientId: string;
+        clientSecret?: string | undefined;
+        tokenEndpointAuthMethod?: "none" | "client_secret_post" | "client_secret_basic" | undefined;
+      }
+    | undefined;
 };
 
 export type OAuthStartResponse = {

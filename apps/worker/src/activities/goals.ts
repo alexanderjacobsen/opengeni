@@ -9,6 +9,7 @@ import {
   enqueueSessionTurn,
   evaluateGoalContinuation,
   getBillingBalance,
+  getLatestStartedSessionTurn,
   getSessionEvent,
   getSessionGoal,
   isCodexBilledTurn,
@@ -37,10 +38,23 @@ export function createGoalActivities(services: () => Promise<ActivityServices>) 
     if (!existingGoal || existingGoal.status !== "active") {
       return { action: "none" };
     }
-    // Loaded before the budget check so the codex-billed predicate can read the
-    // continuation turn's model (session.model). Kept below the goal-less fast
-    // path above so a non-goal session still skips this read entirely.
+    // Loaded before the budget check so the codex-billed predicate and the
+    // synthesized turn use the SAME effective policy. An explicit per-turn
+    // model can differ from the persisted session default; follow-up goal work
+    // must preserve the newest policy that actually emitted `turn.started`.
+    // Admission-rejected turns have no such event and cannot poison it.
+    // Kept below the goal-less fast path so a non-goal session still skips the
+    // reads entirely.
     const session = await requireSession(db, input.workspaceId, input.sessionId);
+    const latestStartedTurn = await getLatestStartedSessionTurn(
+      db,
+      input.workspaceId,
+      input.sessionId,
+    );
+    const continuationModel = latestStartedTurn?.model ?? session.model;
+    const continuationReasoningEffort =
+      latestStartedTurn?.reasoningEffort ??
+      reasoningEffortForMetadata(session.metadata, settings.openaiReasoningEffort);
     // A codex-model goal continuation is paid by the user's ChatGPT/Codex plan,
     // so it must not be budget-paused for zero OpenGeni credits. This file uses
     // BASE settings (no codex overlay); the predicate does its own credential read.
@@ -48,7 +62,7 @@ export function createGoalActivities(services: () => Promise<ActivityServices>) 
       db,
       settings,
       workspaceId: input.workspaceId,
-      model: session.model,
+      model: continuationModel,
     });
     // Budget exhaustion pauses the goal visibly instead of failing the
     // session. Computed up front and applied inside the locked decision so a
@@ -130,8 +144,8 @@ export function createGoalActivities(services: () => Promise<ActivityServices>) 
       // Continuations keep the session tool surface and force the first-party
       // server so the goal_complete/goal_pause escape hatches stay reachable.
       tools: withFirstPartyTools(settings, session.tools),
-      model: session.model,
-      reasoningEffort: reasoningEffortForMetadata(session.metadata, settings.openaiReasoningEffort),
+      model: continuationModel,
+      reasoningEffort: continuationReasoningEffort,
       sandboxBackend: session.sandboxBackend,
       metadata: { goalId: decision.goal.id, autoContinuation: decision.autoContinuation },
     });

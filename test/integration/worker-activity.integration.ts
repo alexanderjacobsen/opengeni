@@ -4006,12 +4006,73 @@ describe("worker activities integration", () => {
     });
   });
 
-  // Parent wakeup: a spawned worker reaching a terminal-for-now state must
-  // wake its manager (parent) session exactly once so the manager can resume,
-  // read the worker's output, and continue — no busy-polling, no stall.
+  test("child completion does not enqueue parent chat work when parent wakes are disabled", async () => {
+    const grant = await testGrant(dbClient.db);
+    const manager = await makeManagerIdle(grant);
+    const worker = await createOwnedSession(dbClient.db, grant, {
+      initialMessage: "do the work",
+      resources: [],
+      metadata: {},
+      model: "scripted-model",
+      sandboxBackend: "none",
+      parentSessionId: manager.id,
+    });
+    await appendOwnedEvents(dbClient.db, grant, worker.id, [
+      { type: "turn.completed", payload: { output: "durable child evidence" } },
+    ]);
+    await setSessionStatus(dbClient.db, grant.workspaceId, worker.id, "running", null);
+
+    const managerBefore = await getSession(dbClient.db, grant.workspaceId, manager.id);
+    const managerEventsBefore = await listSessionEvents(
+      dbClient.db,
+      grant.workspaceId,
+      manager.id,
+      0,
+      50,
+    );
+    const managerTurnsBefore = await listSessionTurns(
+      dbClient.db,
+      grant.workspaceId,
+      manager.id,
+      50,
+    );
+    const wakes: Array<{ sessionId: string; workflowId: string }> = [];
+    const activities = createActivities({
+      settings: testSettings({
+        databaseUrl: services.databaseUrl,
+        natsUrl: services.natsUrl,
+        childCompletionParentWakeEnabled: false,
+      }),
+      db: dbClient.db,
+      bus,
+      wakeSessionWorkflow: async ({ sessionId, workflowId }) => {
+        wakes.push({ sessionId, workflowId });
+      },
+    });
+
+    await activities.markSessionIdle({ workspaceId: grant.workspaceId, sessionId: worker.id });
+
+    expect((await getSession(dbClient.db, grant.workspaceId, worker.id))?.status).toBe("idle");
+    const workerEvents = await listSessionEvents(dbClient.db, grant.workspaceId, worker.id, 0, 50);
+    expect(workerEvents.some((event) => event.type === "turn.completed")).toBe(true);
+    expect(await getSession(dbClient.db, grant.workspaceId, manager.id)).toEqual(managerBefore);
+    expect(await listSessionEvents(dbClient.db, grant.workspaceId, manager.id, 0, 50)).toEqual(
+      managerEventsBefore,
+    );
+    expect(await listSessionTurns(dbClient.db, grant.workspaceId, manager.id, 50)).toEqual(
+      managerTurnsBefore,
+    );
+    expect(wakes).toEqual([]);
+  });
+
+  // Compatibility coverage for the explicitly enabled legacy parent-wake path.
   function wakeActivities(wakes: Array<{ sessionId: string; workflowId: string }>) {
     return createActivities({
-      settings: testSettings({ databaseUrl: services.databaseUrl, natsUrl: services.natsUrl }),
+      settings: testSettings({
+        databaseUrl: services.databaseUrl,
+        natsUrl: services.natsUrl,
+        childCompletionParentWakeEnabled: true,
+      }),
       db: dbClient.db,
       bus,
       wakeSessionWorkflow: async ({ sessionId, workflowId }) => {
@@ -4276,7 +4337,11 @@ describe("worker activities integration", () => {
     ]);
     const wakes: Array<{ sessionId: string; workflowId: string }> = [];
     const activities = createActivities({
-      settings: testSettings({ databaseUrl: services.databaseUrl, natsUrl: services.natsUrl }),
+      settings: testSettings({
+        databaseUrl: services.databaseUrl,
+        natsUrl: services.natsUrl,
+        childCompletionParentWakeEnabled: true,
+      }),
       db: dbClient.db,
       bus,
       runtime: createProductionAgentRuntime({

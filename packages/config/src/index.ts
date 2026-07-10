@@ -181,6 +181,10 @@ const SettingsSchema = z.object({
   // it then acts as a hard ceiling that per-goal overrides can only lower.
   goalMaxAutoContinuations: z.coerce.number().int().positive().optional(),
   goalNoProgressLimit: z.coerce.number().int().positive().default(3),
+  // Temporary safety valve: spawned child sessions still run and retain their
+  // own durable events/goals, but terminal child episodes do not inject a
+  // synthetic user.message + turn into the parent unless explicitly enabled.
+  childCompletionParentWakeEnabled: EnvBoolean.default(false),
   // Per-segment ceiling on agent loop turns (model calls) within a single
   // session turn. Effectively unbounded by default for the same reason as
   // above; the graceful max-turns valve (idle + goal continuation, never a
@@ -1018,6 +1022,7 @@ export function getSettings(): Settings {
     integrationsOauthClientsJson: optional("OPENGENI_INTEGRATIONS_OAUTH_CLIENTS_JSON"),
     goalMaxAutoContinuations: optional("OPENGENI_GOAL_MAX_AUTO_CONTINUATIONS"),
     goalNoProgressLimit: optional("OPENGENI_GOAL_NO_PROGRESS_LIMIT"),
+    childCompletionParentWakeEnabled: optional("OPENGENI_CHILD_COMPLETION_PARENT_WAKE_ENABLED"),
     agentMaxModelCallsPerTurn: optional("OPENGENI_AGENT_MAX_MODEL_CALLS_PER_TURN"),
     sessionHistorySource: optional("OPENGENI_SESSION_HISTORY_SOURCE"),
     contextCompactionMode: optional("OPENGENI_CONTEXT_COMPACTION_MODE"),

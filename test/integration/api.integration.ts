@@ -856,6 +856,164 @@ describe("API component integration", () => {
     );
   });
 
+  test("zero-credit attachment staging survives tenant checks, duplicate finalize, and a rejected turn", async () => {
+    const delegationSecret = "test-zero-credit-file-staging-secret";
+    const app = createApp({
+      settings: {
+        ...objectStorageSettings(services.databaseUrl, services.objectStorageEndpoint!),
+        productAccessMode: "managed",
+        usageLimitsMode: "managed",
+        delegationSecret,
+        betterAuthSecret: "test-better-auth-secret-32-bytes",
+        publicBaseUrl: "http://127.0.0.1:3000",
+      },
+      db: dbClient.db,
+      bus: new MemoryEventBus(),
+      workflowClient: new FakeWorkflowClient(),
+    });
+    const owner = await bootstrapWorkspace(dbClient.db, {
+      accountExternalSource: "test:zero-credit-file-owner",
+      accountExternalId: crypto.randomUUID(),
+      accountName: "Zero credit file owner",
+      workspaceExternalSource: "test:zero-credit-file-owner",
+      workspaceExternalId: crypto.randomUUID(),
+      workspaceName: "Zero credit file workspace",
+      subjectId: `test:zero-credit-file-owner:${crypto.randomUUID()}`,
+      accountPermissions: allAccountPermissions,
+      workspacePermissions: allWorkspacePermissions,
+    });
+    const otherTenant = await bootstrapWorkspace(dbClient.db, {
+      accountExternalSource: "test:zero-credit-file-other",
+      accountExternalId: crypto.randomUUID(),
+      accountName: "Other file account",
+      workspaceExternalSource: "test:zero-credit-file-other",
+      workspaceExternalId: crypto.randomUUID(),
+      workspaceName: "Other file workspace",
+      subjectId: `test:zero-credit-file-other:${crypto.randomUUID()}`,
+      accountPermissions: allAccountPermissions,
+      workspacePermissions: allWorkspacePermissions,
+    });
+    const ownerWorkspaceId = owner.defaultWorkspaceId!;
+    const otherWorkspaceId = otherTenant.defaultWorkspaceId!;
+    const ownerHeaders = {
+      authorization: `Bearer ${await signDelegatedAccessToken(delegationSecret, {
+        accountId: owner.defaultAccountId!,
+        workspaceId: ownerWorkspaceId,
+        subjectId: owner.subjectId,
+        permissions: [...allAccountPermissions, ...allWorkspacePermissions],
+        exp: Math.floor(Date.now() / 1000) + 60,
+      })}`,
+    };
+    const otherHeaders = {
+      authorization: `Bearer ${await signDelegatedAccessToken(delegationSecret, {
+        accountId: otherTenant.defaultAccountId!,
+        workspaceId: otherWorkspaceId,
+        subjectId: otherTenant.subjectId,
+        permissions: [...allAccountPermissions, ...allWorkspacePermissions],
+        exp: Math.floor(Date.now() / 1000) + 60,
+      })}`,
+    };
+    const image = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+
+    // Storage staging is not an inference purchase: no credit entry exists for
+    // this account, but prepare must issue a scoped signed PUT.
+    const begin = await app.request(workspacePath(ownerWorkspaceId, "/files/uploads"), {
+      method: "POST",
+      headers: { "content-type": "application/json", ...ownerHeaders },
+      body: JSON.stringify({
+        filename: "a very long screenshot name with spaces and _ punctuation.png",
+        contentType: "image/png",
+        sizeBytes: image.byteLength,
+      }),
+    });
+    expect(begin.status).toBe(201);
+    const upload = (await begin.json()) as {
+      fileId: string;
+      uploadId: string;
+      putUrl: string;
+      requiredHeaders: Record<string, string>;
+    };
+
+    // The upload id and asset are invisible outside their RLS workspace.
+    const wrongTenantComplete = await app.request(
+      workspacePath(otherWorkspaceId, `/files/uploads/${upload.uploadId}/complete`),
+      { method: "POST", headers: otherHeaders },
+    );
+    expect(wrongTenantComplete.status).toBe(404);
+    const wrongTenantRead = await app.request(
+      workspacePath(otherWorkspaceId, `/files/${upload.fileId}`),
+      { headers: otherHeaders },
+    );
+    expect(wrongTenantRead.status).toBe(404);
+
+    const put = await fetch(upload.putUrl, {
+      method: "PUT",
+      body: image,
+      headers: upload.requiredHeaders,
+    });
+    expect(put.ok).toBe(true);
+
+    // Two tabs (or a lost response retry) must converge on the one ready asset.
+    const complete = () =>
+      app.request(workspacePath(ownerWorkspaceId, `/files/uploads/${upload.uploadId}/complete`), {
+        method: "POST",
+        headers: ownerHeaders,
+      });
+    const [firstComplete, secondComplete] = await Promise.all([complete(), complete()]);
+    expect(firstComplete.status).toBe(200);
+    expect(secondComplete.status).toBe(200);
+    const firstFile = ((await firstComplete.json()) as { file: { id: string; status: string } })
+      .file;
+    const secondFile = ((await secondComplete.json()) as { file: { id: string; status: string } })
+      .file;
+    expect(firstFile).toEqual({ id: upload.fileId, status: "ready" });
+    expect(secondFile).toEqual(firstFile);
+
+    // A later model-turn admission still fails at zero balance, but cannot
+    // delete or orphan the already-finalized attachment reference.
+    const rejectedTurn = await app.request(workspacePath(ownerWorkspaceId, "/sessions"), {
+      method: "POST",
+      headers: { "content-type": "application/json", ...ownerHeaders },
+      body: JSON.stringify({
+        initialMessage: "inspect this screenshot",
+        resources: [{ kind: "file", fileId: upload.fileId }],
+      }),
+    });
+    expect(rejectedTurn.status).toBe(402);
+    expect(await rejectedTurn.text()).toContain("insufficient OpenGeni credits");
+    const preserved = await app.request(
+      workspacePath(ownerWorkspaceId, `/files/${upload.fileId}`),
+      {
+        headers: ownerHeaders,
+      },
+    );
+    expect(preserved.status).toBe(200);
+    expect((await preserved.json()) as { status: string }).toMatchObject({ status: "ready" });
+
+    // Retrying after funds arrive attaches the same durable file rather than
+    // creating another object or requiring a re-upload.
+    await applyCreditLedgerEntry(dbClient.db, {
+      accountId: owner.defaultAccountId!,
+      type: "credit_topup",
+      amountMicros: 1_000_000,
+      sourceType: "test",
+      sourceId: "zero-credit-file-retry",
+      idempotencyKey: `test:zero-credit-file-retry:${owner.defaultAccountId!}`,
+    });
+    const retriedTurn = await app.request(workspacePath(ownerWorkspaceId, "/sessions"), {
+      method: "POST",
+      headers: { "content-type": "application/json", ...ownerHeaders },
+      body: JSON.stringify({
+        initialMessage: "inspect this screenshot",
+        resources: [{ kind: "file", fileId: upload.fileId }],
+      }),
+    });
+    expect(retriedTurn.status).toBe(202);
+    expect((await retriedTurn.json()) as { resources: unknown[] }).toMatchObject({
+      resources: [{ kind: "file", fileId: upload.fileId }],
+    });
+  });
+
   test("managed credit gate blocks document indexing before enqueueing work", async () => {
     const delegationSecret = "test-managed-document-credit-secret";
     const app = createApp({

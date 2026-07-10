@@ -16,12 +16,15 @@ activity (`runAgentTurn`; the activity is also registered under its former name
 the old name in new code). Inside that activity the OpenAI Agents SDK loop makes
 as many model calls and tool calls as the work needs.
 
-Synthesized follow-up work (goal continuations and child-completion wakes sent
-to a parent manager) inherits the model and reasoning effort from the newest
-turn with a durable `turn.started` event. The session default is used only when
-no turn has actually started. This keeps routing and billing ownership aligned
-after an explicit per-turn switch and excludes turns rejected during admission,
-whose `started_at` claim timestamp alone is not proof that their policy ran.
+Synthesized goal continuations inherit the model and reasoning effort from the
+newest turn with a durable `turn.started` event. The session default is used
+only when no turn has actually started. This keeps routing and billing
+ownership aligned after an explicit per-turn switch and excludes turns rejected
+during admission, whose `started_at` claim timestamp alone is not proof that
+their policy ran. Child-completion parent wakes are temporarily disabled by
+default (`OPENGENI_CHILD_COMPLETION_PARENT_WAKE_ENABLED=false`): spawned child
+sessions retain their own durable events and goal evidence without injecting a
+synthetic `user.message` or queued turn into the parent chat.
 
 **Runs have no length limits, by design.** What the SDK calls "turns" are model
 calls; `OPENGENI_AGENT_MAX_MODEL_CALLS_PER_TURN` exists but defaults to

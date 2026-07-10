@@ -50,6 +50,13 @@ export async function notifyParentOfChildTerminal(
   // per work batch and is stable across retries of that same idle transition.
   episodeKey?: string | null,
 ): Promise<void> {
+  // Temporarily disabled by default: child completion remains durable on the
+  // child session, but must not manufacture parent chat input/turn work. Keep
+  // this check before every DB read, event publish, and workflow signal so the
+  // disabled path cannot mutate or wake the parent.
+  if (!svc.settings.childCompletionParentWakeEnabled) {
+    return;
+  }
   try {
     const child = await getSession(svc.db, workspaceId, childSessionId);
     if (!child || !child.parentSessionId) {

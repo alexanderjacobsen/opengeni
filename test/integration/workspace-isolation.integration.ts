@@ -6,6 +6,7 @@ import {
   createDb,
   createFileUpload,
   createSessionGoal,
+  grantWorkspaceAccess,
 } from "@opengeni/db";
 import { createApp, type SessionWorkflowClient } from "../../apps/api/src/app";
 import {
@@ -62,6 +63,34 @@ describe("workspace isolation matrix", () => {
     expect(
       ((await listA.json()) as Array<{ id: string }>).some((item) => item.id === session.id),
     ).toBe(true);
+
+    const secondSubject = `test:isolation:A:member:${crypto.randomUUID()}`;
+    await grantWorkspaceAccess(dbClient.db, {
+      accountId: a.accountId,
+      workspaceId: a.workspaceId,
+      subjectId: secondSubject,
+      subjectLabel: "Isolation A member",
+      permissions: ["sessions:read"],
+    });
+    const authASecond = await authHeader({ ...a, subjectId: secondSubject }, ["sessions:read"]);
+    const pinnedByA = await app.request(
+      workspacePath(a.workspaceId, `/sessions/${session.id}/pin`),
+      {
+        method: "PUT",
+        body: JSON.stringify({ pinned: true, expectedVersion: 0 }),
+        headers: { ...authA, "content-type": "application/json" },
+      },
+    );
+    expect(pinnedByA.status).toBe(200);
+    expect(await pinnedByA.json()).toMatchObject({ pinned: true, pinVersion: 1 });
+    const listASecond = await app.request(workspacePath(a.workspaceId, "/sessions?view=page"), {
+      headers: authASecond,
+    });
+    expect(listASecond.status).toBe(200);
+    expect(await listASecond.json()).toMatchObject({
+      pinned: [],
+      sessions: [{ id: session.id, pinned: false, pinVersion: 0 }],
+    });
     await expectStatus(app, authA, workspacePath(b.workspaceId, "/sessions"), 403);
     const listB = await app.request(workspacePath(b.workspaceId, "/sessions"), { headers: authB });
     expect(listB.status).toBe(200);

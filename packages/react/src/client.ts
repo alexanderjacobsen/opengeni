@@ -15,6 +15,7 @@ export type SessionClientLike = Pick<
   | "updateSession"
   | "updateSessionPin"
   | "listSessions"
+  | "listSessionPage"
   | "sendMessage"
   | "steerMessage"
   | "interrupt"

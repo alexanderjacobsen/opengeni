@@ -46,7 +46,6 @@ import {
   insertPtySession,
   listSessionEvents,
   listSessionIdsInGroup,
-  listSessions,
   listSessionsForSubject,
   listSessionTurns,
   recordStreamAcknowledgment,
@@ -122,39 +121,24 @@ export function registerSessionRoutes(app: Hono, deps: ApiRouteDeps): void {
   app.get("/v1/workspaces/:workspaceId/sessions", async (c) => {
     const workspaceId = c.req.param("workspaceId");
     const grant = await requireAccessGrant(c, deps, workspaceId, "sessions:read");
-    const parentSessionId = c.req.query("parentSessionId");
-    // "null" = roots only; a uuid = children of that session; anything else is
-    // a client error (an unvalidated value would surface as a Postgres uuid
-    // cast failure -> 500).
-    if (
-      parentSessionId !== undefined &&
-      parentSessionId !== "null" &&
-      !z.string().uuid().safeParse(parentSessionId).success
-    ) {
-      throw new HTTPException(400, {
-        message: 'parentSessionId must be a session id or the literal "null"',
-      });
+    const pageView = c.req.query("view") === "page";
+    const query = sessionListQuery(c.req.query(), pageView);
+    const page = await listSessionsForSubject(db, workspaceId, {
+      subjectId: grant.subjectId,
+      limit: boundedLimit(query.limit),
+      ...(query.cursor ? { cursor: query.cursor } : {}),
+      ...(query.search ? { search: query.search } : {}),
+      ...(query.parentSessionId !== undefined ? { parentSessionId: query.parentSessionId } : {}),
+    });
+    if (pageView) {
+      return c.json(page);
     }
-    const rawCursor = c.req.query("cursor");
-    const cursor = rawCursor ? decodeSessionListCursor(rawCursor) : undefined;
-    if (rawCursor && !cursor) {
-      throw new HTTPException(400, { message: "cursor is invalid" });
-    }
-    const search = c.req.query("search")?.trim();
-    if (search && search.length > 200) {
-      throw new HTTPException(400, { message: "search must be at most 200 characters" });
-    }
-    return c.json(
-      await listSessionsForSubject(db, workspaceId, {
-        subjectId: grant.subjectId,
-        limit: boundedLimit(c.req.query("limit")),
-        ...(cursor ? { cursor } : {}),
-        ...(search ? { search } : {}),
-        ...(parentSessionId !== undefined
-          ? { parentSessionId: parentSessionId === "null" ? null : parentSessionId }
-          : {}),
-      }),
-    );
+    // Same-major compatibility: listSessions() has historically returned an
+    // array. Preserve that wire shape while adding personal pin metadata/order;
+    // cursor consumers opt into the additive page view. A query flag rather
+    // than a /sessions/page path is deliberate: an older API safely ignores it
+    // and returns its historical array instead of treating "page" as a UUID.
+    return c.json([...page.pinned, ...page.sessions]);
   });
 
   app.get("/v1/workspaces/:workspaceId/sessions/:sessionId", async (c) => {
@@ -1495,6 +1479,50 @@ function eventListLimit(raw: string | undefined, max = 2000): number {
     return 500;
   }
   return Math.min(max, Math.max(1, Math.floor(limit)));
+}
+
+function sessionListQuery(
+  query: Record<string, string>,
+  allowCursor = true,
+): {
+  limit: string | undefined;
+  parentSessionId: string | null | undefined;
+  cursor: ReturnType<typeof decodeSessionListCursor> | undefined;
+  search: string | undefined;
+} {
+  const parentSessionId = query.parentSessionId;
+  // "null" = roots only; a uuid = children of that session; anything else is
+  // a client error (an unvalidated value would surface as a Postgres uuid cast
+  // failure -> 500 rather than an honest 400).
+  if (
+    parentSessionId !== undefined &&
+    parentSessionId !== "null" &&
+    !z.string().uuid().safeParse(parentSessionId).success
+  ) {
+    throw new HTTPException(400, {
+      message: 'parentSessionId must be a session id or the literal "null"',
+    });
+  }
+  const rawCursor = allowCursor ? query.cursor : undefined;
+  const cursor = rawCursor ? decodeSessionListCursor(rawCursor) : undefined;
+  if (rawCursor && !cursor) {
+    throw new HTTPException(400, { message: "cursor is invalid" });
+  }
+  const search = query.search?.trim();
+  if (search && search.length > 200) {
+    throw new HTTPException(400, { message: "search must be at most 200 characters" });
+  }
+  return {
+    limit: query.limit,
+    parentSessionId:
+      parentSessionId === undefined
+        ? undefined
+        : parentSessionId === "null"
+          ? null
+          : parentSessionId,
+    cursor,
+    search: search || undefined,
+  };
 }
 
 function compactEvents(raw: string | undefined): boolean {

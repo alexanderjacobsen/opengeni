@@ -148,6 +148,123 @@ describe("API component integration", () => {
     ).toBe(true);
   });
 
+  test("keeps legacy session lists compatible while pin pages are stable, idempotent, and OCC-fenced", async () => {
+    workflow = new FakeWorkflowClient();
+    const app = createApp({
+      settings: testSettings({ databaseUrl: services.databaseUrl }),
+      db: dbClient.db,
+      bus: new MemoryEventBus(),
+      workflowClient: workflow,
+    });
+    const workspaceId = await defaultWorkspaceId(app);
+    const create = async (initialMessage: string) => {
+      const response = await app.request(workspacePath(workspaceId, "/sessions"), {
+        method: "POST",
+        body: JSON.stringify({ initialMessage, model: "scripted-model" }),
+        headers: { "content-type": "application/json" },
+      });
+      expect(response.status).toBe(202);
+      return (await response.json()) as {
+        id: string;
+        updatedAt: string;
+        pinned: boolean;
+        pinVersion: number;
+      };
+    };
+    const pinnedTarget = await create("find pinned alpha");
+    await create("ordinary beta");
+    await create("ordinary gamma");
+
+    const setPin = (body: { pinned: boolean; expectedVersion?: number }) =>
+      app.request(workspacePath(workspaceId, `/sessions/${pinnedTarget.id}/pin`), {
+        method: "PUT",
+        body: JSON.stringify(body),
+        headers: { "content-type": "application/json" },
+      });
+
+    const first = await setPin({ pinned: true, expectedVersion: 0 });
+    expect(first.status).toBe(200);
+    expect(await first.json()).toMatchObject({
+      id: pinnedTarget.id,
+      pinned: true,
+      pinVersion: 1,
+      updatedAt: pinnedTarget.updatedAt,
+    });
+    // A timed-out client may retry the same desired state with its stale
+    // version. That is idempotent success, not an OCC conflict.
+    const retry = await setPin({ pinned: true, expectedVersion: 0 });
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toMatchObject({ pinned: true, pinVersion: 1 });
+
+    const conflict = await setPin({ pinned: false, expectedVersion: 0 });
+    expect(conflict.status).toBe(409);
+    expect(await conflict.json()).toMatchObject({
+      current: { pinned: true, pinVersion: 1 },
+    });
+
+    // The historical endpoint remains an array for same-major SDK clients, but
+    // carries pin metadata and puts the caller's pins before ordinary rows.
+    const legacy = await app.request(workspacePath(workspaceId, "/sessions?limit=1"));
+    expect(legacy.status).toBe(200);
+    const legacyRows = (await legacy.json()) as Array<{
+      id: string;
+      pinned: boolean;
+      pinVersion: number;
+    }>;
+    expect(Array.isArray(legacyRows)).toBe(true);
+    expect(legacyRows[0]).toMatchObject({ id: pinnedTarget.id, pinned: true, pinVersion: 1 });
+
+    const firstPageResponse = await app.request(
+      workspacePath(workspaceId, "/sessions?view=page&limit=1"),
+    );
+    expect(firstPageResponse.status).toBe(200);
+    const firstPage = (await firstPageResponse.json()) as {
+      pinned: Array<{ id: string }>;
+      sessions: Array<{ id: string }>;
+      nextCursor: string | null;
+    };
+    expect(firstPage.pinned.map((row) => row.id)).toEqual([pinnedTarget.id]);
+    expect(firstPage.sessions).toHaveLength(1);
+    expect(firstPage.nextCursor).toBeTruthy();
+    expect(firstPage.sessions.map((row) => row.id)).not.toContain(pinnedTarget.id);
+
+    const secondPageResponse = await app.request(
+      workspacePath(
+        workspaceId,
+        `/sessions?view=page&limit=1&cursor=${encodeURIComponent(firstPage.nextCursor!)}`,
+      ),
+    );
+    expect(secondPageResponse.status).toBe(200);
+    const secondPage = (await secondPageResponse.json()) as typeof firstPage;
+    expect(secondPage.pinned.map((row) => row.id)).toEqual([pinnedTarget.id]);
+    expect(secondPage.sessions).toHaveLength(1);
+    expect(secondPage.sessions[0]!.id).not.toBe(firstPage.sessions[0]!.id);
+    expect(secondPage.sessions[0]!.id).not.toBe(pinnedTarget.id);
+
+    const filtered = await app.request(
+      workspacePath(workspaceId, "/sessions?view=page&search=pinned%20alpha"),
+    );
+    expect(filtered.status).toBe(200);
+    expect(await filtered.json()).toMatchObject({
+      pinned: [{ id: pinnedTarget.id }],
+      sessions: [],
+    });
+    expect(
+      (await app.request(workspacePath(workspaceId, "/sessions?view=page&cursor=not-a-cursor")))
+        .status,
+    ).toBe(400);
+
+    const unpinned = await setPin({ pinned: false, expectedVersion: 1 });
+    expect(unpinned.status).toBe(200);
+    expect(await unpinned.json()).toMatchObject({
+      id: pinnedTarget.id,
+      pinned: false,
+      pinnedAt: null,
+      pinVersion: 2,
+      updatedAt: pinnedTarget.updatedAt,
+    });
+  });
+
   test("create-with-instructions persists and reads back the field without leaking a timeline event", async () => {
     workflow = new FakeWorkflowClient();
     const app = createApp({

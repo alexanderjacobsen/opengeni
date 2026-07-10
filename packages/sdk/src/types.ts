@@ -400,11 +400,11 @@ export type Session = {
   /** Multi-account Codex (P1): the account the most recent turn ran on (the "Running on:" indicator). */
   codexLastCredentialId?: string | null;
   /** Personal (authenticated subject) workspace pin state, never workspace-global. */
-  pinned: boolean;
+  pinned?: boolean;
   /** Stable pin ordering key; null when this subject has not pinned the session. */
-  pinnedAt: string | null;
+  pinnedAt?: string | null;
   /** Optimistic pin-state revision; zero represents an absent pin relation. */
-  pinVersion: number;
+  pinVersion?: number;
   createdAt: string;
   updatedAt: string;
 };

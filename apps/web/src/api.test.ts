@@ -114,18 +114,14 @@ describe("createOpenGeniClient", () => {
     const requests: Array<{ input: Parameters<typeof fetch>[0]; init?: RequestInit }> = [];
     globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       requests.push({ input, init });
-      return Response.json({ pinned: [], sessions: [], nextCursor: null });
+      return Response.json([]);
     }) as unknown as typeof fetch;
     configureClientAuth({ mode: "deploymentKey", headerName: "x-opengeni-access-key" });
     setStoredAccessKey("secret-key");
 
     try {
       const client = createOpenGeniClient();
-      await expect(client.listSessions("workspace-id", { limit: 25 })).resolves.toEqual({
-        pinned: [],
-        sessions: [],
-        nextCursor: null,
-      });
+      await expect(client.listSessions("workspace-id", { limit: 25 })).resolves.toEqual([]);
     } finally {
       globalThis.fetch = originalFetch;
       clearStoredAccessKey();

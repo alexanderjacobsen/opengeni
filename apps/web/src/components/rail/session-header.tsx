@@ -11,7 +11,7 @@ import { SessionStatus as SessionStatusBadge } from "@opengeni/react";
 import type { SessionEventsConnectionState } from "@opengeni/react";
 import type { SessionSummary } from "@opengeni/sdk";
 import { LockIcon, PanelRightIcon, PencilIcon, PinIcon } from "lucide-react";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 
 import { ConnectionPill } from "@/components/common";
 import { SpawnedByBreadcrumb } from "@/components/session/subagents";
@@ -88,16 +88,7 @@ export function SessionHeader({
       </div>
       <div className="flex shrink-0 items-center gap-2">
         {agentsSlot}
-        <Button
-          type="button"
-          variant={session.pinned ? "secondary" : "ghost"}
-          size="icon-sm"
-          aria-label={session.pinned ? "Unpin session" : "Pin session"}
-          aria-pressed={session.pinned}
-          onClick={() => void onPin(session, !session.pinned)}
-        >
-          <PinIcon className={session.pinned ? "size-4 fill-current" : "size-4"} />
-        </Button>
+        <SessionPinButton session={session} onPin={onPin} />
         <ConnectionPill state={connectionState} />
         <SessionStatusBadge status={status} />
         {keyAuthRequired ? (
@@ -122,6 +113,34 @@ export function SessionHeader({
         </Button>
       </div>
     </header>
+  );
+}
+
+function SessionPinButton({
+  session,
+  onPin,
+}: {
+  session: Session;
+  onPin: (session: Session, pinned: boolean) => Promise<Session | null>;
+}) {
+  const [busy, setBusy] = useState(false);
+  return (
+    <Button
+      type="button"
+      variant={session.pinned ? "secondary" : "ghost"}
+      size="icon-sm"
+      aria-label={session.pinned ? "Unpin session" : "Pin session"}
+      aria-pressed={Boolean(session.pinned)}
+      aria-busy={busy}
+      disabled={busy}
+      className="pointer-coarse:size-11"
+      onClick={() => {
+        setBusy(true);
+        void onPin(session, !Boolean(session.pinned)).finally(() => setBusy(false));
+      }}
+    >
+      <PinIcon className={session.pinned ? "size-4 fill-current" : "size-4"} />
+    </Button>
   );
 }
 

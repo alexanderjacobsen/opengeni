@@ -12,6 +12,7 @@ import {
   PencilIcon,
   PinIcon,
   PlusIcon,
+  SearchIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -32,6 +33,7 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useAppContext } from "@/context";
 import { SESSION_TITLE_MAX_LENGTH, useInlineRename } from "@/lib/session-rename";
+import { applySessionPinProjection, subscribeToSessionPinChanges } from "@/lib/session-pins";
 import {
   buildRailForest,
   groupSessionsForRail,
@@ -44,34 +46,76 @@ import type { Session } from "@/types";
 
 type RenameFn = (workspaceId: string, sessionId: string, title: string) => Promise<Session | null>;
 type PinFn = (session: Session, pinned: boolean) => Promise<Session | null>;
+type PinOverride = { session: Session; operation: number };
 
 export function SessionList() {
   const rail = useRail();
   const context = useAppContext();
   // Poll so running sessions surface and move to the top without a manual
   // refresh; the previous index relied on a one-shot load.
-  const { sessions, pinned, loading, error, refresh } = useWorkspaceSessions({
+  const [searchDraft, setSearchDraft] = useState("");
+  const [search, setSearch] = useState("");
+  useEffect(() => {
+    const timer = window.setTimeout(() => setSearch(searchDraft.trim()), 200);
+    return () => window.clearTimeout(timer);
+  }, [searchDraft]);
+  const { sessions, pinned, nextCursor, loading, error, refresh } = useWorkspaceSessions({
     limit: 50,
+    search,
     pollIntervalMs: 15_000,
   });
+  // Ordinary rows page independently of the complete pinned section. The
+  // polled hook owns page one; additional pages are appended and deduplicated.
+  // A filter change starts a fresh cursor chain rather than mixing snapshots.
+  const [extraSessions, setExtraSessions] = useState<Session[]>([]);
+  const [extraNextCursor, setExtraNextCursor] = useState<string | null | undefined>(undefined);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [loadMoreError, setLoadMoreError] = useState(false);
+  useEffect(() => {
+    setExtraSessions([]);
+    setExtraNextCursor(undefined);
+    setLoadMoreError(false);
+  }, [search, rail.workspaceId]);
+  const continuationCursor = extraNextCursor === undefined ? nextCursor : extraNextCursor;
   // Short-lived optimistic projections only. The page returned by the server
   // remains canonical; after each mutation we replace the projection with that
   // returned row and refresh once to reconcile tabs/devices/offline recovery.
-  const [pinOverrides, setPinOverrides] = useState<ReadonlyMap<string, Session>>(() => new Map());
+  const [pinOverrides, setPinOverrides] = useState<ReadonlyMap<string, PinOverride>>(
+    () => new Map(),
+  );
+  const pinOperation = useRef(0);
+  const pinning = useRef(new Set<string>());
   const allSessions = useMemo(() => {
     const source = new Map<string, Session>();
-    for (const session of [...pinned, ...sessions]) source.set(session.id, session);
-    for (const [id, override] of pinOverrides) source.set(id, override);
+    // Precedence is extra page < current first page < current pinned section;
+    // a row that became pinned since it was loaded as an old ordinary page must
+    // never be overwritten by that stale extra-page projection.
+    for (const session of [...extraSessions, ...sessions, ...pinned]) {
+      source.set(session.id, session);
+    }
+    for (const [id, override] of pinOverrides) source.set(id, override.session);
     return [...source.values()];
-  }, [pinned, sessions, pinOverrides]);
+  }, [pinned, sessions, extraSessions, pinOverrides]);
   const pinnedSessions = useMemo(
-    () => allSessions.filter((session) => session.pinned),
+    () => allSessions.filter((session) => Boolean(session.pinned)),
     [allSessions],
   );
   const ordinarySessions = useMemo(
     () => allSessions.filter((session) => !session.pinned),
     [allSessions],
   );
+
+  // The route header and rail intentionally keep separate projections. Merge
+  // the canonical pin fields from each successful page poll into the open
+  // session so a pin changed on another device cannot leave those affordances
+  // disagreeing. Preserve the route/SSE-owned lifecycle and content fields.
+  useEffect(() => {
+    const open = context.session;
+    if (!open || open.workspaceId !== rail.workspaceId) return;
+    const projected = allSessions.find((candidate) => candidate.id === open.id);
+    if (!projected) return;
+    context.setSession((current) => applySessionPinProjection(current, projected));
+  }, [allSessions, context.session?.id, context.setSession, rail.workspaceId]);
 
   const activeSessionId = useRouterState({
     select: (state): string | null => {
@@ -155,30 +199,93 @@ export function SessionList() {
 
   const onPin = useCallback<PinFn>(
     async (target, nextPinned) => {
+      if (pinning.current.has(target.id)) {
+        return target;
+      }
+      pinning.current.add(target.id);
+      const operation = ++pinOperation.current;
       const optimistic: Session = {
         ...target,
         pinned: nextPinned,
         pinnedAt: nextPinned ? new Date().toISOString() : null,
-        pinVersion: target.pinVersion + 1,
+        pinVersion: (target.pinVersion ?? 0) + 1,
       };
-      setPinOverrides((current) => new Map(current).set(target.id, optimistic));
-      const updated = await context.updateSessionPin(
-        target.workspaceId,
-        target.id,
-        nextPinned,
-        target.pinVersion,
+      setPinOverrides((current) =>
+        new Map(current).set(target.id, { session: optimistic, operation }),
       );
-      setPinOverrides((current) => {
-        const next = new Map(current);
-        if (updated) next.set(target.id, updated);
-        else next.delete(target.id);
-        return next;
-      });
-      void refresh();
-      return updated;
+      try {
+        const updated = await context.updateSessionPin(
+          target.workspaceId,
+          target.id,
+          nextPinned,
+          target.pinVersion ?? 0,
+        );
+        if (updated) {
+          setPinOverrides((current) => {
+            if (current.get(target.id)?.operation !== operation) return current;
+            return new Map(current).set(target.id, { session: updated, operation });
+          });
+        }
+        await refresh();
+        return updated;
+      } finally {
+        pinning.current.delete(target.id);
+        setPinOverrides((current) => {
+          if (current.get(target.id)?.operation !== operation) return current;
+          const next = new Map(current);
+          next.delete(target.id);
+          return next;
+        });
+      }
     },
     [context, refresh],
   );
+
+  const loadMore = useCallback(async () => {
+    if (!continuationCursor || loadingMore) return;
+    setLoadingMore(true);
+    setLoadMoreError(false);
+    try {
+      const page = await context.client.listSessionPage(rail.workspaceId, {
+        limit: 50,
+        cursor: continuationCursor,
+        ...(search ? { search } : {}),
+      });
+      setExtraSessions((current) => {
+        const rows = new Map(current.map((session) => [session.id, session]));
+        for (const session of page.sessions) rows.set(session.id, session);
+        return [...rows.values()];
+      });
+      setExtraNextCursor(page.nextCursor);
+    } catch {
+      // Keep already loaded rows and make this bounded page explicitly
+      // retryable; a silent no-op would look like pagination had ended.
+      setLoadMoreError(true);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [context.client, continuationCursor, loadingMore, rail.workspaceId, search]);
+
+  // Cross-tab invalidation and lifecycle reconciliation. Cross-device changes
+  // arrive on the 15s poll; returning to a tab or reconnecting refreshes now.
+  useEffect(
+    () => subscribeToSessionPinChanges(rail.workspaceId, () => void refresh()),
+    [rail.workspaceId, refresh],
+  );
+  useEffect(() => {
+    const reconcile = () => void refresh();
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") reconcile();
+    };
+    window.addEventListener("focus", reconcile);
+    window.addEventListener("online", reconcile);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("focus", reconcile);
+      window.removeEventListener("online", reconcile);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [refresh]);
 
   const listRef = useRef<HTMLDivElement>(null);
   const [focusIndex, setFocusIndex] = useState<number>(-1);
@@ -246,6 +353,29 @@ export function SessionList() {
         </Tooltip>
       </div>
 
+      <label className="relative mx-2 mb-1 block shrink-0">
+        <span className="sr-only">Search sessions</span>
+        <SearchIcon
+          aria-hidden="true"
+          className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-fg-subtle"
+        />
+        <input
+          type="search"
+          value={searchDraft}
+          onChange={(event) => setSearchDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Escape" && searchDraft) {
+              event.preventDefault();
+              setSearchDraft("");
+            }
+          }}
+          maxLength={200}
+          placeholder="Search"
+          aria-label="Search sessions"
+          className="h-7 w-full min-w-0 rounded-md border border-border bg-bg/45 pl-7 pr-2 text-xs text-fg outline-none placeholder:text-fg-subtle hover:border-border-strong focus-visible:border-ring focus-visible:ring-1 focus-visible:ring-ring/40 pointer-coarse:h-11 pointer-coarse:text-base"
+        />
+      </label>
+
       <div
         ref={listRef}
         role="list"
@@ -265,6 +395,17 @@ export function SessionList() {
               onClick={() => void refresh()}
             >
               Retry
+            </button>
+          </div>
+        ) : flat.length === 0 && search ? (
+          <div className="px-2 py-4 text-center text-xs text-fg-subtle">
+            <p>No matching sessions.</p>
+            <button
+              type="button"
+              className="mt-2 min-h-8 rounded px-2 underline hover:text-fg pointer-coarse:min-h-11"
+              onClick={() => setSearchDraft("")}
+            >
+              Clear search
             </button>
           </div>
         ) : flat.length === 0 ? (
@@ -314,6 +455,27 @@ export function SessionList() {
                 onPin={onPin}
               />
             ))}
+            {continuationCursor ? (
+              <div className="px-2 py-2 text-center">
+                <button
+                  type="button"
+                  disabled={loadingMore}
+                  onClick={() => void loadMore()}
+                  className="min-h-8 rounded-md px-2 text-xs font-medium text-fg-subtle hover:bg-surface-2 hover:text-fg disabled:opacity-60 pointer-coarse:min-h-11"
+                >
+                  {loadingMore
+                    ? "Loading…"
+                    : loadMoreError
+                      ? "Retry older sessions"
+                      : "Load older sessions"}
+                </button>
+                {loadMoreError ? (
+                  <p role="status" className="mt-1 text-2xs text-status-failed">
+                    Older sessions didn&apos;t load.
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
           </>
         )}
       </div>
@@ -455,7 +617,7 @@ function SessionRow(props: {
   const indentStyle = props.depth > 0 ? { paddingLeft: props.depth * 14 } : undefined;
 
   const rowClassName = cn(
-    "group relative flex h-8 w-full items-center gap-1.5 rounded-md py-1 pl-2.5 pr-1.5 text-left text-sm transition-colors pointer-coarse:h-10",
+    "group relative flex h-8 w-full items-center gap-1.5 rounded-md py-1 pl-2.5 pr-1.5 text-left text-sm transition-colors pointer-coarse:h-11",
     "hover:bg-surface-2",
     props.active ? "bg-surface-3 font-medium text-fg" : "text-fg-muted",
     props.focused && !props.active ? "bg-surface-2/60" : "",
@@ -472,7 +634,7 @@ function SessionRow(props: {
             event.stopPropagation();
             props.onToggleExpand();
           }}
-          className="inline-flex size-4 items-center justify-center rounded text-fg-subtle outline-none hover:text-fg focus-visible:ring-1 focus-visible:ring-ring"
+          className="inline-flex size-4 items-center justify-center rounded text-fg-subtle outline-none hover:text-fg focus-visible:ring-1 focus-visible:ring-ring pointer-coarse:size-11"
         >
           <ChevronRightIcon
             className={cn("size-3 transition-transform", props.expanded && "rotate-90")}
@@ -567,11 +729,14 @@ function SessionRow(props: {
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent className="min-w-40">
-        <ContextMenuItem onSelect={rename.startEditing}>
+        <ContextMenuItem className="pointer-coarse:min-h-11" onSelect={rename.startEditing}>
           <PencilIcon className="size-4" />
           Rename
         </ContextMenuItem>
-        <ContextMenuItem onSelect={() => void props.onPin(props.session, !props.session.pinned)}>
+        <ContextMenuItem
+          className="pointer-coarse:min-h-11"
+          onSelect={() => void props.onPin(props.session, !Boolean(props.session.pinned))}
+        >
           <PinIcon className={props.session.pinned ? "size-4 fill-current" : "size-4"} />
           {props.session.pinned ? "Unpin" : "Pin"}
         </ContextMenuItem>
@@ -616,7 +781,7 @@ function RowActionsMenu({
           size="icon-xs"
           aria-label="Session actions"
           onClick={(event) => event.stopPropagation()}
-          className="shrink-0 text-fg-subtle opacity-0 transition-opacity hover:text-fg focus-visible:opacity-100 group-hover:opacity-100 data-[state=open]:opacity-100"
+          className="shrink-0 text-fg-subtle opacity-0 transition-opacity hover:text-fg focus-visible:opacity-100 group-hover:opacity-100 data-[state=open]:opacity-100 pointer-coarse:size-11 pointer-coarse:opacity-100"
         >
           <EllipsisIcon className="size-3.5" />
         </Button>
@@ -627,6 +792,7 @@ function RowActionsMenu({
         onClick={(event) => event.stopPropagation()}
       >
         <DropdownMenuItem
+          className="pointer-coarse:min-h-11"
           onSelect={onRename}
           // The menu item lives inside the row; stop the synthetic click from
           // bubbling to the row's onSelect (open-session).
@@ -636,7 +802,8 @@ function RowActionsMenu({
           Rename
         </DropdownMenuItem>
         <DropdownMenuItem
-          onSelect={() => void onPin(session, !session.pinned)}
+          className="pointer-coarse:min-h-11"
+          onSelect={() => void onPin(session, !Boolean(session.pinned))}
           onClick={(event) => event.stopPropagation()}
         >
           <PinIcon className={session.pinned ? "size-4 fill-current" : "size-4"} />

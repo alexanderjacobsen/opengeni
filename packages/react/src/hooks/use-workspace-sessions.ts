@@ -33,7 +33,7 @@ export function useWorkspaceSessions(
   const search = options.search;
   const load = useCallback(
     async () =>
-      await client.listSessions(workspaceId, {
+      await client.listSessionPage(workspaceId, {
         ...(limit !== undefined ? { limit } : {}),
         ...(parentSessionId !== undefined ? { parentSessionId } : {}),
         ...(cursor !== undefined ? { cursor } : {}),

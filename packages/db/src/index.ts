@@ -96,7 +96,7 @@ import {
   sql,
   type SQL,
 } from "drizzle-orm";
-import type { PgDatabase } from "drizzle-orm/pg-core";
+import type { PgDatabase, PgTransactionConfig } from "drizzle-orm/pg-core";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import { decryptEnvironmentValue } from "./environment-crypto";
@@ -335,6 +335,7 @@ export async function withRlsContext<T>(
   db: Database,
   context: RlsContext,
   fn: (db: Database) => Promise<T>,
+  transactionConfig?: PgTransactionConfig,
 ): Promise<T> {
   return await db.transaction(async (tx) => {
     const scoped = tx as unknown as Database;
@@ -358,7 +359,7 @@ export async function withRlsContext<T>(
       );
     }
     return await fn(scoped);
-  });
+  }, transactionConfig);
 }
 
 export async function rlsContextForWorkspace(
@@ -382,6 +383,39 @@ export async function withWorkspaceRls<T>(
   fn: (db: Database) => Promise<T>,
 ): Promise<T> {
   return await withRlsContext(db, await rlsContextForWorkspace(db, workspaceId), fn);
+}
+
+/**
+ * Personal workspace data needs both tenant and authenticated-principal GUCs.
+ * `session_pins` uses this helper so FORCE RLS rejects another member's rows
+ * even if a future query accidentally omits its explicit subject predicate.
+ */
+export async function withWorkspaceSubjectRls<T>(
+  db: Database,
+  workspaceId: string,
+  subjectId: string,
+  fn: (db: Database) => Promise<T>,
+  transactionConfig?: PgTransactionConfig,
+): Promise<T> {
+  if (!subjectId.trim()) {
+    throw new Error("withWorkspaceSubjectRls: a non-empty subjectId is required");
+  }
+  const context = await rlsContextForWorkspace(db, workspaceId);
+  return await withRlsContext(
+    db,
+    context,
+    async (scopedDb) => {
+      await scopedDb.execute(sql`select set_config('opengeni.subject_id', ${subjectId}, true)`);
+      const applied = await scopedDb.execute<{ subject_id: string | null }>(
+        sql`select current_setting('opengeni.subject_id', true) as subject_id`,
+      );
+      if ((applied[0]?.subject_id ?? "") !== subjectId) {
+        throw new Error("Authenticated subject RLS context was not applied on the active backend");
+      }
+      return await fn(scopedDb);
+    },
+    transactionConfig,
+  );
 }
 
 export async function withWorkspaceUsageLock<T>(
@@ -10516,7 +10550,12 @@ export function decodeSessionListCursor(value: string): SessionListCursor | null
       id?: unknown;
     };
     const updatedAt = typeof parsed.updatedAt === "string" ? new Date(parsed.updatedAt) : null;
-    if (!updatedAt || Number.isNaN(updatedAt.getTime()) || typeof parsed.id !== "string") {
+    if (
+      !updatedAt ||
+      Number.isNaN(updatedAt.getTime()) ||
+      typeof parsed.id !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(parsed.id)
+    ) {
       return null;
     }
     return { updatedAt, id: parsed.id };
@@ -10536,71 +10575,72 @@ export async function listSessionsForSubject(
   options: ListSessionsForSubjectOptions,
 ): Promise<SessionListResponse> {
   const limit = options.limit ?? 50;
-  return await withWorkspaceRls(
+  return await withWorkspaceSubjectRls(
     db,
     workspaceId,
-    async (scopedDb) =>
-      await scopedDb.transaction(async (tx) => {
-        const filters = [eq(schema.sessions.workspaceId, workspaceId), ...sessionFilters(options)];
-        const pinnedRows = await tx
-          .select({ session: schema.sessions, pin: schema.sessionPins })
-          .from(schema.sessionPins)
-          .innerJoin(schema.sessions, eq(schema.sessions.id, schema.sessionPins.sessionId))
-          .where(
+    options.subjectId,
+    async (tx) => {
+      const filters = [eq(schema.sessions.workspaceId, workspaceId), ...sessionFilters(options)];
+      const pinnedRows = await tx
+        .select({ session: schema.sessions, pin: schema.sessionPins })
+        .from(schema.sessionPins)
+        .innerJoin(schema.sessions, eq(schema.sessions.id, schema.sessionPins.sessionId))
+        .where(
+          and(
+            eq(schema.sessionPins.workspaceId, workspaceId),
+            eq(schema.sessionPins.subjectId, options.subjectId),
+            eq(schema.sessionPins.pinned, true),
+            ...filters,
+          ),
+        )
+        .orderBy(desc(schema.sessionPins.pinnedAt), desc(schema.sessions.id));
+      const cursorFilter = options.cursor
+        ? or(
+            lt(schema.sessions.updatedAt, options.cursor.updatedAt),
             and(
-              eq(schema.sessionPins.workspaceId, workspaceId),
-              eq(schema.sessionPins.subjectId, options.subjectId),
-              eq(schema.sessionPins.pinned, true),
-              ...filters,
+              eq(schema.sessions.updatedAt, options.cursor.updatedAt),
+              lt(schema.sessions.id, options.cursor.id),
             ),
           )
-          .orderBy(desc(schema.sessionPins.pinnedAt), desc(schema.sessions.id));
-        const cursorFilter = options.cursor
-          ? or(
-              lt(schema.sessions.updatedAt, options.cursor.updatedAt),
-              and(
-                eq(schema.sessions.updatedAt, options.cursor.updatedAt),
-                lt(schema.sessions.id, options.cursor.id),
-              ),
-            )
-          : undefined;
-        const ordinaryRows = await tx
-          .select({ session: schema.sessions })
-          .from(schema.sessions)
-          .leftJoin(
-            schema.sessionPins,
-            and(
-              eq(schema.sessionPins.workspaceId, workspaceId),
-              eq(schema.sessionPins.subjectId, options.subjectId),
-              eq(schema.sessionPins.pinned, true),
-              eq(schema.sessionPins.sessionId, schema.sessions.id),
-            ),
-          )
-          .where(
-            and(...filters, isNull(schema.sessionPins.id), ...(cursorFilter ? [cursorFilter] : [])),
-          )
-          .orderBy(desc(schema.sessions.updatedAt), desc(schema.sessions.id))
-          .limit(limit + 1);
-        const pageRows = ordinaryRows.slice(0, limit);
-        const ids = [
-          ...pinnedRows.map((row) => row.session.id),
-          ...pageRows.map((row) => row.session.id),
-        ];
-        const mcpServers = await sessionMcpServerMetadataForSessions(tx, workspaceId, ids);
-        const tail = pageRows.at(-1)?.session;
-        return {
-          pinned: pinnedRows.map((row) =>
-            mapSession(row.session, mcpServers.get(row.session.id) ?? [], mapSessionPin(row.pin)),
+        : undefined;
+      const ordinaryRows = await tx
+        .select({ session: schema.sessions })
+        .from(schema.sessions)
+        .leftJoin(
+          schema.sessionPins,
+          and(
+            eq(schema.sessionPins.workspaceId, workspaceId),
+            eq(schema.sessionPins.subjectId, options.subjectId),
+            eq(schema.sessionPins.pinned, true),
+            eq(schema.sessionPins.sessionId, schema.sessions.id),
           ),
-          sessions: pageRows.map((row) =>
-            mapSession(row.session, mcpServers.get(row.session.id) ?? [], mapSessionPin(null)),
-          ),
-          nextCursor:
-            ordinaryRows.length > limit && tail
-              ? encodeSessionListCursor({ updatedAt: tail.updatedAt, id: tail.id })
-              : null,
-        };
-      }),
+        )
+        .where(
+          and(...filters, isNull(schema.sessionPins.id), ...(cursorFilter ? [cursorFilter] : [])),
+        )
+        .orderBy(desc(schema.sessions.updatedAt), desc(schema.sessions.id))
+        .limit(limit + 1);
+      const pageRows = ordinaryRows.slice(0, limit);
+      const ids = [
+        ...pinnedRows.map((row) => row.session.id),
+        ...pageRows.map((row) => row.session.id),
+      ];
+      const mcpServers = await sessionMcpServerMetadataForSessions(tx, workspaceId, ids);
+      const tail = pageRows.at(-1)?.session;
+      return {
+        pinned: pinnedRows.map((row) =>
+          mapSession(row.session, mcpServers.get(row.session.id) ?? [], mapSessionPin(row.pin)),
+        ),
+        sessions: pageRows.map((row) =>
+          mapSession(row.session, mcpServers.get(row.session.id) ?? [], mapSessionPin(null)),
+        ),
+        nextCursor:
+          ordinaryRows.length > limit && tail
+            ? encodeSessionListCursor({ updatedAt: tail.updatedAt, id: tail.id })
+            : null,
+      };
+    },
+    { isolationLevel: "repeatable read", accessMode: "read only" },
   );
 }
 
@@ -10611,7 +10651,7 @@ export async function getSessionForSubject(
   sessionId: string,
   subjectId: string,
 ): Promise<Session | null> {
-  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+  return await withWorkspaceSubjectRls(db, workspaceId, subjectId, async (scopedDb) => {
     const [row] = await scopedDb
       .select({ session: schema.sessions, pin: schema.sessionPins })
       .from(schema.sessions)
@@ -10648,13 +10688,14 @@ export async function setSessionPin(
     expectedVersion?: number | undefined;
   },
 ): Promise<Session | null> {
-  return await withWorkspaceRls(
+  return await withWorkspaceSubjectRls(
     db,
     input.workspaceId,
+    input.subjectId,
     async (scopedDb) =>
       await scopedDb.transaction(async (tx) => {
         await tx.execute(
-          sql`select pg_advisory_xact_lock(hashtext(${`session-pin:${input.workspaceId}:${input.subjectId}:${input.sessionId}`}))`,
+          sql`select pg_advisory_xact_lock(hashtextextended(${`session-pin:${input.workspaceId}:${input.subjectId}:${input.sessionId}`}, 0))`,
         );
         const [session] = await tx
           .select()
@@ -10679,6 +10720,16 @@ export async function setSessionPin(
           )
           .limit(1);
         const current = mapSessionPin(existing);
+        // Desired-state retries are idempotent even when their OCC revision is
+        // stale. This is essential for a client that timed out after the server
+        // committed: retrying the same pin/unpin must observe success, not a
+        // conflict. OCC only protects a request that would CHANGE current state.
+        if (current.pinned === input.pinned) {
+          const mcpServers = await sessionMcpServerMetadataForSessions(tx, input.workspaceId, [
+            session.id,
+          ]);
+          return mapSession(session, mcpServers.get(session.id) ?? [], mapSessionPin(existing));
+        }
         if (input.expectedVersion !== undefined && input.expectedVersion !== current.pinVersion) {
           throw new SessionPinVersionConflictError(current);
         }
@@ -10691,8 +10742,11 @@ export async function setSessionPin(
               workspaceId: input.workspaceId,
               subjectId: input.subjectId,
               sessionId: input.sessionId,
-              pinned: input.pinned,
-              ...(input.pinned ? { pinnedAt: new Date() } : {}),
+              // The equal-state return above means an absent row can only
+              // transition false -> true here; initial unpin stays row-free at
+              // version zero instead of manufacturing an OCC revision.
+              pinned: true,
+              pinnedAt: new Date(),
             })
             .returning();
           pin = inserted ?? null;

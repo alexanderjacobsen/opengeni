@@ -2,6 +2,8 @@ import { sql } from "drizzle-orm";
 import {
   bigint,
   boolean,
+  check,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -605,10 +607,29 @@ export const sessionPins = pgTable(
     // a stale client that saw pin version 1 cannot silently overwrite a later
     // unpin+re-pin that would otherwise recreate version 1.
     pinned: boolean("pinned").notNull().default(true),
-    pinnedAt: timestamp("pinned_at", { withTimezone: true }),
+    pinnedAt: timestamp("pinned_at", { withTimezone: true }).defaultNow(),
     version: integer("version").notNull().default(1),
   },
   (table) => ({
+    subjectNonempty: check(
+      "session_pins_subject_nonempty",
+      sql`length(btrim(${table.subjectId})) > 0`,
+    ),
+    versionPositive: check("session_pins_version_positive", sql`${table.version} >= 1`),
+    stateConsistent: check(
+      "session_pins_state_consistent",
+      sql`((${table.pinned}) and (${table.pinnedAt}) is not null) or ((not ${table.pinned}) and (${table.pinnedAt}) is null)`,
+    ),
+    workspaceAccount: foreignKey({
+      name: "session_pins_workspace_account_fk",
+      columns: [table.workspaceId, table.accountId],
+      foreignColumns: [workspaces.id, workspaces.accountId],
+    }).onDelete("cascade"),
+    workspaceSession: foreignKey({
+      name: "session_pins_workspace_session_fk",
+      columns: [table.workspaceId, table.sessionId],
+      foreignColumns: [sessions.workspaceId, sessions.id],
+    }).onDelete("cascade"),
     subjectSession: uniqueIndex("session_pins_subject_workspace_session_idx").on(
       table.subjectId,
       table.workspaceId,
@@ -618,8 +639,8 @@ export const sessionPins = pgTable(
       table.workspaceId,
       table.subjectId,
       table.pinned,
-      table.pinnedAt,
-      table.sessionId,
+      table.pinnedAt.desc(),
+      table.sessionId.desc(),
     ),
   }),
 );

@@ -3,6 +3,12 @@
 -- independently organize the same durable session rows. Deleting a session or
 -- workspace cleans pins through FKs; no session activity/history field changes.
 
+-- Composite identity for the pin's workspace/session FK. The session id is
+-- globally unique already; including workspace_id makes tenant integrity
+-- independently enforceable for malformed internal/maintenance writes.
+CREATE UNIQUE INDEX IF NOT EXISTS "sessions_workspace_id_idx"
+  ON "sessions" ("workspace_id", "id");
+
 CREATE TABLE IF NOT EXISTS "session_pins" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
   "account_id" uuid NOT NULL REFERENCES "managed_accounts"("id") ON DELETE CASCADE,
@@ -10,9 +16,22 @@ CREATE TABLE IF NOT EXISTS "session_pins" (
   "subject_id" text NOT NULL,
   "session_id" uuid NOT NULL REFERENCES "sessions"("id") ON DELETE CASCADE,
   "pinned" boolean NOT NULL DEFAULT true,
-  "pinned_at" timestamptz,
+  "pinned_at" timestamptz DEFAULT now(),
   "version" integer NOT NULL DEFAULT 1,
-  CONSTRAINT "session_pins_version_nonnegative" CHECK ("version" >= 1)
+  CONSTRAINT "session_pins_subject_nonempty" CHECK (length(btrim("subject_id")) > 0),
+  CONSTRAINT "session_pins_version_positive" CHECK ("version" >= 1),
+  CONSTRAINT "session_pins_state_consistent" CHECK (
+    ("pinned" AND "pinned_at" IS NOT NULL)
+    OR (NOT "pinned" AND "pinned_at" IS NULL)
+  ),
+  CONSTRAINT "session_pins_workspace_account_fk"
+    FOREIGN KEY ("workspace_id", "account_id")
+    REFERENCES "workspaces"("id", "account_id")
+    ON DELETE CASCADE,
+  CONSTRAINT "session_pins_workspace_session_fk"
+    FOREIGN KEY ("workspace_id", "session_id")
+    REFERENCES "sessions"("workspace_id", "id")
+    ON DELETE CASCADE
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS "session_pins_subject_workspace_session_idx"
@@ -23,6 +42,14 @@ CREATE INDEX IF NOT EXISTS "session_pins_workspace_subject_pinned_idx"
 ALTER TABLE "session_pins" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "session_pins" FORCE ROW LEVEL SECURITY;
 
+CREATE OR REPLACE FUNCTION opengeni_private.current_subject_id()
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT nullif(current_setting('opengeni.subject_id', true), '');
+$$;
+
 DO $$
 BEGIN
   IF EXISTS (
@@ -32,9 +59,16 @@ BEGIN
     DROP POLICY workspace_isolation ON "session_pins";
   END IF;
 END $$;
+
 CREATE POLICY workspace_isolation ON "session_pins"
-  USING (opengeni_private.workspace_rls_visible(account_id, workspace_id))
-  WITH CHECK (opengeni_private.workspace_rls_visible(account_id, workspace_id));
+  USING (
+    opengeni_private.workspace_rls_visible(account_id, workspace_id)
+    AND subject_id = opengeni_private.current_subject_id()
+  )
+  WITH CHECK (
+    opengeni_private.workspace_rls_visible(account_id, workspace_id)
+    AND subject_id = opengeni_private.current_subject_id()
+  );
 
 DO $$
 BEGIN

@@ -2,7 +2,7 @@
 // token / managed session), workspace access, and the cross-route console
 // state (model choice, repo selection, tool toggles). Everything below the
 // workspace shell consumes this through `useAppContext`.
-import type { OpenGeniClient } from "@opengeni/sdk";
+import { OpenGeniApiError, type OpenGeniClient } from "@opengeni/sdk";
 import type { SessionEventsConnectionState } from "@opengeni/react";
 import { Outlet, useNavigate, useRouterState } from "@tanstack/react-router";
 import { TanStackRouterDevtools } from "@tanstack/react-router-devtools";
@@ -37,6 +37,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { sameSessionForContext } from "@/lib/session-context";
+import { notifySessionPinChanged } from "@/lib/session-pins";
 import {
   buildResources,
   buildTools,
@@ -518,14 +519,30 @@ export function RootRouteComponent() {
         ...(expectedVersion !== undefined ? { expectedVersion } : {}),
       });
       setSession((current) => (current?.id === updated.id ? updated : current));
+      notifySessionPinChanged(workspaceId, sessionId);
       return updated;
     } catch (error) {
-      if (optimistic) {
+      if (error instanceof OpenGeniApiError && error.status === 409) {
+        // The server response intentionally returns only non-secret pin
+        // metadata. Re-read the whole member-projected session so the open
+        // header converges to the winning tab/device rather than rolling back
+        // to another stale snapshot.
+        const authoritative = await client.getSession(workspaceId, sessionId).catch(() => null);
+        if (authoritative) {
+          setSession((current) => (current?.id === sessionId ? authoritative : current));
+        }
+        notifySessionPinChanged(workspaceId, sessionId);
+      } else if (optimistic) {
         setSession((current) => (current?.id === sessionId ? before : current));
       }
-      toast.error(`Couldn't ${pinned ? "pin" : "unpin"} session`, {
-        description: error instanceof Error ? error.message : String(error),
-      });
+      toast.error(
+        error instanceof OpenGeniApiError && error.status === 409
+          ? "Session pin changed elsewhere"
+          : `Couldn't ${pinned ? "pin" : "unpin"} session`,
+        {
+          description: error instanceof Error ? error.message : String(error),
+        },
+      );
       return null;
     }
   }

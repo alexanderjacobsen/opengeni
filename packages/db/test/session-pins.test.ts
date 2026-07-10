@@ -4,11 +4,13 @@ import postgres from "postgres";
 import {
   createDb,
   createSession,
+  decodeSessionListCursor,
   getSessionForSubject,
   listSessionsForSubject,
   SessionPinVersionConflictError,
   setSessionPin,
   withWorkspaceRls,
+  withWorkspaceSubjectRls,
   type Database,
   type DbClient,
 } from "../src/index";
@@ -19,6 +21,7 @@ let shared: SharedTestDatabase | null = null;
 let admin: postgres.Sql;
 let client: DbClient;
 let db: Database;
+const requireRealDatabase = process.env.OPENGENI_REQUIRE_REAL_DB === "1";
 
 async function freshWorkspace(): Promise<{ accountId: string; workspaceId: string }> {
   const [account] = await admin<{ id: string }[]>`
@@ -43,6 +46,11 @@ async function session(input: { accountId: string; workspaceId: string; message:
 beforeAll(async () => {
   shared = await acquireSharedTestDatabase("session-pins");
   if (!shared) {
+    if (requireRealDatabase) {
+      throw new Error(
+        "[session-pins] OPENGENI_REQUIRE_REAL_DB=1 but the real PostgreSQL harness is unavailable",
+      );
+    }
     available = false;
     // eslint-disable-next-line no-console
     console.warn("[session-pins] docker unavailable, skipping");
@@ -59,11 +67,48 @@ afterAll(async () => {
 });
 
 describe("session pins (real PostgreSQL + FORCE RLS)", () => {
+  test("runs as the non-superuser app role with FORCE RLS enabled", async () => {
+    if (!available) return;
+    const [role] = await admin<{ rolsuper: boolean; rolbypassrls: boolean }[]>`
+      select rolsuper, rolbypassrls from pg_roles where rolname = 'opengeni_app'`;
+    expect(role).toEqual({ rolsuper: false, rolbypassrls: false });
+    const [table] = await admin<{ relrowsecurity: boolean; relforcerowsecurity: boolean }[]>`
+      select relrowsecurity, relforcerowsecurity
+      from pg_class
+      where oid = 'session_pins'::regclass`;
+    expect(table).toEqual({ relrowsecurity: true, relforcerowsecurity: true });
+    const isolation = await withWorkspaceSubjectRls(
+      db,
+      (await freshWorkspace()).workspaceId,
+      "user:isolation-check",
+      async (scoped) =>
+        await scoped.execute<{ transaction_isolation: string }>(sql`show transaction_isolation`),
+      { isolationLevel: "repeatable read", accessMode: "read only" },
+    );
+    expect(isolation).toEqual([{ transaction_isolation: "repeatable read" }]);
+  });
+
   test("is idempotent, monotonic across unpin/re-pin, and rejects stale versions", async () => {
     if (!available) return;
     const workspace = await freshWorkspace();
     const target = await session({ ...workspace, message: "pin target" });
     const subject = "user:one";
+    const beforeUpdatedAt = target.updatedAt;
+
+    const absentUnpin = await setSessionPin(db, {
+      workspaceId: workspace.workspaceId,
+      subjectId: subject,
+      sessionId: target.id,
+      pinned: false,
+      expectedVersion: 0,
+    });
+    expect(absentUnpin).toMatchObject({ pinned: false, pinnedAt: null, pinVersion: 0 });
+    const [absentCount] = await admin<{ count: number }[]>`
+      select count(*)::int as count from session_pins
+      where workspace_id = ${workspace.workspaceId}
+        and subject_id = ${subject}
+        and session_id = ${target.id}`;
+    expect(absentCount?.count).toBe(0);
 
     const first = await setSessionPin(db, {
       workspaceId: workspace.workspaceId,
@@ -72,6 +117,14 @@ describe("session pins (real PostgreSQL + FORCE RLS)", () => {
       pinned: true,
     });
     expect(first).toMatchObject({ pinned: true, pinVersion: 1 });
+    const staleRetry = await setSessionPin(db, {
+      workspaceId: workspace.workspaceId,
+      subjectId: subject,
+      sessionId: target.id,
+      pinned: true,
+      expectedVersion: 0,
+    });
+    expect(staleRetry).toMatchObject({ pinned: true, pinVersion: 1 });
     const retry = await setSessionPin(db, {
       workspaceId: workspace.workspaceId,
       subjectId: subject,
@@ -89,6 +142,14 @@ describe("session pins (real PostgreSQL + FORCE RLS)", () => {
       expectedVersion: 1,
     });
     expect(unpinned).toMatchObject({ pinned: false, pinnedAt: null, pinVersion: 2 });
+    const staleUnpinRetry = await setSessionPin(db, {
+      workspaceId: workspace.workspaceId,
+      subjectId: subject,
+      sessionId: target.id,
+      pinned: false,
+      expectedVersion: 1,
+    });
+    expect(staleUnpinRetry).toMatchObject({ pinned: false, pinnedAt: null, pinVersion: 2 });
     const repinned = await setSessionPin(db, {
       workspaceId: workspace.workspaceId,
       subjectId: subject,
@@ -110,6 +171,34 @@ describe("session pins (real PostgreSQL + FORCE RLS)", () => {
       name: "SessionPinVersionConflictError",
       current: { pinned: true, pinnedAt: repinned?.pinnedAt ?? null, pinVersion: 3 },
     } satisfies Partial<SessionPinVersionConflictError>);
+
+    const unchanged = await getSessionForSubject(db, workspace.workspaceId, target.id, subject);
+    expect(unchanged?.updatedAt).toBe(beforeUpdatedAt);
+  }, 60_000);
+
+  test("serializes concurrent same-state retries to one monotonic revision", async () => {
+    if (!available) return;
+    const workspace = await freshWorkspace();
+    const target = await session({ ...workspace, message: "concurrent target" });
+    const results = await Promise.all(
+      Array.from({ length: 12 }, () =>
+        setSessionPin(db, {
+          workspaceId: workspace.workspaceId,
+          subjectId: "user:race",
+          sessionId: target.id,
+          pinned: true,
+          expectedVersion: 0,
+        }),
+      ),
+    );
+    expect(results.every((result) => result?.pinned && result.pinVersion === 1)).toBe(true);
+    const [row] = await admin<{ count: number; version: number }[]>`
+      select count(*)::int as count, max(version)::int as version
+      from session_pins
+      where workspace_id = ${workspace.workspaceId}
+        and subject_id = 'user:race'
+        and session_id = ${target.id}`;
+    expect(row).toEqual({ count: 1, version: 1 });
   }, 60_000);
 
   test("isolates member pins, uses stable order, filters pins, and never duplicates normal pages", async () => {
@@ -156,26 +245,24 @@ describe("session pins (real PostgreSQL + FORCE RLS)", () => {
     expect(firstPage.nextCursor).toBeTruthy();
     expect(new Set([...firstPage.pinned, ...firstPage.sessions].map((row) => row.id)).size).toBe(3);
 
+    const decoded = decodeSessionListCursor(firstPage.nextCursor!);
+    expect(decoded).not.toBeNull();
     const secondPage = await listSessionsForSubject(db, workspace.workspaceId, {
       subjectId: "user:one",
       limit: 1,
-      cursor: JSON.parse(Buffer.from(firstPage.nextCursor!, "base64url").toString("utf8")) as never,
-    }).catch(() => null);
-    // Cursors must be decoded by the transport boundary; use the typed DB cursor
-    // directly for this query-level pagination assertion.
-    const newest = firstPage.sessions[0]!;
-    const ordinarySecondPage = await listSessionsForSubject(db, workspace.workspaceId, {
-      subjectId: "user:one",
-      limit: 1,
-      cursor: { updatedAt: new Date(newest.updatedAt), id: newest.id },
+      cursor: decoded!,
     });
-    expect(secondPage).toBeNull();
-    expect(ordinarySecondPage.sessions.map((row) => row.id)).toEqual([older.id]);
-    expect(ordinarySecondPage.sessions.map((row) => row.id)).not.toContain(pinnedFirst.id);
-    expect(ordinarySecondPage.pinned.map((row) => row.id)).toEqual([
-      pinnedSecond.id,
-      pinnedFirst.id,
-    ]);
+    expect(secondPage.sessions.map((row) => row.id)).toEqual([older.id]);
+    expect(secondPage.sessions.map((row) => row.id)).not.toContain(pinnedFirst.id);
+    expect(secondPage.pinned.map((row) => row.id)).toEqual([pinnedSecond.id, pinnedFirst.id]);
+    expect(decodeSessionListCursor("not-a-cursor")).toBeNull();
+    expect(
+      decodeSessionListCursor(
+        Buffer.from(
+          JSON.stringify({ updatedAt: new Date().toISOString(), id: "not-a-uuid" }),
+        ).toString("base64url"),
+      ),
+    ).toBeNull();
 
     const filtered = await listSessionsForSubject(db, workspace.workspaceId, {
       subjectId: "user:one",
@@ -189,6 +276,15 @@ describe("session pins (real PostgreSQL + FORCE RLS)", () => {
     });
     expect(otherMember.pinned).toEqual([]);
     expect(otherMember.sessions.map((row) => row.id)).toContain(pinnedSecond.id);
+
+    const sameWorkspaceOtherSubject = await withWorkspaceSubjectRls(
+      db,
+      workspace.workspaceId,
+      "user:two",
+      async (scoped) =>
+        await scoped.execute(sql`select id from session_pins where subject_id = 'user:one'`),
+    );
+    expect(sameWorkspaceOtherSubject).toEqual([]);
   }, 60_000);
 
   test("returns no cross-workspace target and cascades a deleted session's pins", async () => {
@@ -210,6 +306,17 @@ describe("session pins (real PostgreSQL + FORCE RLS)", () => {
         pinned: true,
       }),
     ).toBeNull();
+    let malformedError: unknown;
+    try {
+      await admin`
+        insert into session_pins
+          (account_id, workspace_id, subject_id, session_id, pinned, pinned_at)
+        values
+          (${foreign.accountId}, ${workspace.workspaceId}, 'malformed:account', ${target.id}, true, now())`;
+    } catch (error) {
+      malformedError = error;
+    }
+    expect(malformedError).toBeDefined();
     await admin`delete from sessions where id = ${target.id}`;
     const pins = await admin<{ count: number }[]>`
       select count(*)::int as count from session_pins where session_id = ${target.id}`;

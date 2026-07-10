@@ -244,15 +244,43 @@ export class OpenGeniClient {
     options: {
       limit?: number;
       parentSessionId?: string | null;
-      cursor?: string;
       search?: string;
     } = {},
-  ): Promise<SessionListResponse> {
-    return await this.requestJson<SessionListResponse>(
+  ): Promise<Session[]> {
+    return await this.requestJson<Session[]>(
       "GET",
       `/v1/workspaces/${workspaceId}/sessions`,
       undefined,
       {
+        ...(options.limit !== undefined ? { limit: String(options.limit) } : {}),
+        ...(options.search?.trim() ? { search: options.search.trim() } : {}),
+        ...(Object.prototype.hasOwnProperty.call(options, "parentSessionId") &&
+        options.parentSessionId !== undefined
+          ? {
+              parentSessionId:
+                options.parentSessionId === null ? "null" : String(options.parentSessionId),
+            }
+          : {}),
+      },
+    );
+  }
+
+  /** Pin-aware ordinary-session page with a stable keyset cursor. */
+  async listSessionPage(
+    workspaceId: string,
+    options: {
+      limit?: number;
+      parentSessionId?: string | null;
+      cursor?: string;
+      search?: string;
+    } = {},
+  ): Promise<SessionListResponse> {
+    const response = await this.requestJson<SessionListResponse | Session[]>(
+      "GET",
+      `/v1/workspaces/${workspaceId}/sessions`,
+      undefined,
+      {
+        view: "page",
         ...(options.limit !== undefined ? { limit: String(options.limit) } : {}),
         ...(options.cursor !== undefined ? { cursor: options.cursor } : {}),
         ...(options.search?.trim() ? { search: options.search.trim() } : {}),
@@ -265,6 +293,16 @@ export class OpenGeniClient {
           : {}),
       },
     );
+    if (Array.isArray(response)) {
+      // Rolling/same-major compatibility: an older API ignores `view=page` and
+      // returns the historical array. That is an honest one-page projection;
+      // never pretend it honored a cursor supplied directly by a caller.
+      if (options.cursor) {
+        throw new Error("The connected OpenGeni API does not support stable session-page cursors");
+      }
+      return { pinned: [], sessions: response, nextCursor: null };
+    }
+    return response;
   }
 
   /** Set this authenticated member's personal workspace pin for a session. */

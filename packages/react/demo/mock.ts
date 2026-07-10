@@ -208,11 +208,17 @@ export class MockOpenGeniClient implements SessionClientLike {
       ...session,
       pinned: request.pinned,
       pinnedAt: request.pinned ? new Date().toISOString() : null,
-      pinVersion: request.pinned ? Math.max(1, session.pinVersion + 1) : 0,
+      pinVersion: request.pinned ? Math.max(1, (session.pinVersion ?? 0) + 1) : 0,
     };
   }
 
-  async listSessions(): Promise<SessionListResponse> {
+  async listSessions(): Promise<Session[]> {
+    return FLEET.map((spec) =>
+      this.fabricateSession(spec.id, spec.status, spec.title, spec.agoMinutes),
+    );
+  }
+
+  async listSessionPage(): Promise<SessionListResponse> {
     return {
       pinned: [],
       sessions: FLEET.map((spec) =>

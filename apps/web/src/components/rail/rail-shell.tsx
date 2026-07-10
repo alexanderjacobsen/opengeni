@@ -287,6 +287,7 @@ function CanvasTopStrip({ hamburgerRef }: { hamburgerRef: RefObject<HTMLButtonEl
       size="icon-sm"
       aria-label="Open navigation"
       onClick={() => rail.setDrawerOpen(true)}
+      className="pointer-coarse:size-11"
     >
       <MenuIcon className="size-4" />
     </Button>

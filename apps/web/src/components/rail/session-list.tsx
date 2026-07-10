@@ -90,6 +90,7 @@ export function SessionList() {
   const loadingMore = loadingMoreGeneration === pageGeneration;
   const loadMoreAttempt = useRef(0);
   const loadMoreError = activeContinuation.failed;
+  const [announcement, setAnnouncement] = useState("");
   // Short-lived optimistic projections only. The page returned by the server
   // remains canonical; after each mutation we replace the projection with that
   // returned row and refresh once to reconcile tabs/devices/offline recovery.
@@ -240,6 +241,12 @@ export function SessionList() {
           });
         }
         await refresh();
+        const label = target.title?.trim() || target.initialMessage?.trim() || "Untitled session";
+        setAnnouncement(
+          updated
+            ? `${nextPinned ? "Pinned" : "Unpinned"} ${label}.`
+            : `${label} was not ${nextPinned ? "pinned" : "unpinned"}. Server state refreshed.`,
+        );
         return updated;
       } finally {
         pinning.current.delete(target.id);
@@ -278,6 +285,11 @@ export function SessionList() {
       setContinuation((current) =>
         mergeSessionContinuation(current, pageGeneration, requestGeneration, page),
       );
+      setAnnouncement(
+        page.sessions.length === 0
+          ? "No more older sessions."
+          : `Loaded ${page.sessions.length} older session${page.sessions.length === 1 ? "" : "s"}.`,
+      );
     } catch {
       if (
         paginationIdentity.current.generation !== requestGeneration ||
@@ -291,6 +303,7 @@ export function SessionList() {
         ...activeSessionContinuation(current, requestGeneration),
         failed: true,
       }));
+      setAnnouncement("Older sessions did not load. Retry is available.");
     } finally {
       if (
         paginationIdentity.current.generation === requestGeneration &&
@@ -323,14 +336,18 @@ export function SessionList() {
   }, [refresh]);
 
   const listRef = useRef<HTMLDivElement>(null);
-  const [focusIndex, setFocusIndex] = useState<number>(-1);
+  const [focusedSessionId, setFocusedSessionId] = useState<string | null>(null);
+  const focusIndex = useMemo(() => {
+    const preferredId = focusedSessionId ?? activeSessionId;
+    const preferred = preferredId ? flat.findIndex((session) => session.id === preferredId) : -1;
+    return preferred >= 0 ? preferred : flat.length > 0 ? 0 : -1;
+  }, [activeSessionId, flat, focusedSessionId]);
 
   // Keep the keyboard focus index pinned to the active session when the route
   // changes (so ArrowDown continues from where the user is).
   useEffect(() => {
-    const index = flat.findIndex((session) => session.id === activeSessionId);
-    if (index >= 0) {
-      setFocusIndex(index);
+    if (activeSessionId && flat.some((session) => session.id === activeSessionId)) {
+      setFocusedSessionId(activeSessionId);
     }
   }, [activeSessionId, flat]);
 
@@ -339,21 +356,30 @@ export function SessionList() {
       if (flat.length === 0) {
         return;
       }
+      const target = event.target as HTMLElement | null;
+      if (!target?.hasAttribute("data-session-focus")) {
+        return;
+      }
+      let nextIndex: number | null = null;
       if (event.key === "ArrowDown") {
         event.preventDefault();
-        setFocusIndex((current) => Math.min(flat.length - 1, current + 1));
+        nextIndex = Math.min(flat.length - 1, focusIndex + 1);
       } else if (event.key === "ArrowUp") {
         event.preventDefault();
-        setFocusIndex((current) => Math.max(0, current <= 0 ? 0 : current - 1));
-      } else if (event.key === "Enter" && focusIndex >= 0 && focusIndex < flat.length) {
+        nextIndex = Math.max(0, focusIndex - 1);
+      } else if (event.key === "Home") {
         event.preventDefault();
-        const session = flat[focusIndex];
-        if (session) {
-          rail.openSession(session.id);
-        }
+        nextIndex = 0;
+      } else if (event.key === "End") {
+        event.preventDefault();
+        nextIndex = flat.length - 1;
+      }
+      const next = nextIndex === null ? null : flat[nextIndex];
+      if (next) {
+        setFocusedSessionId(next.id);
       }
     },
-    [flat, focusIndex, rail],
+    [flat, focusIndex],
   );
 
   // Scroll the keyboard-focused row into view.
@@ -361,9 +387,23 @@ export function SessionList() {
     if (focusIndex < 0 || !listRef.current) {
       return;
     }
-    const row = listRef.current.querySelector<HTMLElement>(`[data-session-index="${focusIndex}"]`);
+    const row = listRef.current.querySelector<HTMLElement>(
+      `[data-session-index="${focusIndex}"][data-session-focus]`,
+    );
     row?.scrollIntoView({ block: "nearest" });
+    // Arrow/Home/End navigation must move real DOM focus, not just paint a
+    // visual highlight. Do not steal focus when a route/poll changes while the
+    // user is typing elsewhere.
+    if (listRef.current.contains(document.activeElement) && row !== document.activeElement) {
+      row?.focus();
+    }
   }, [focusIndex]);
+
+  useEffect(() => {
+    if (loading || !search) return;
+    const count = pinnedSessions.length + ordinarySessions.length;
+    setAnnouncement(`${count} matching session${count === 1 ? "" : "s"}.`);
+  }, [loading, ordinarySessions.length, pinnedSessions.length, search]);
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
@@ -415,14 +455,16 @@ export function SessionList() {
         ref={listRef}
         role="list"
         aria-label="Sessions"
-        tabIndex={0}
         onKeyDown={onKeyDown}
-        className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto px-2 pb-2 outline-none focus-visible:ring-1 focus-visible:ring-ring/40"
+        className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto px-2 pb-2"
       >
+        <p className="sr-only" aria-live="polite" aria-atomic="true">
+          {announcement}
+        </p>
         {loading && allSessions.length === 0 ? (
           <SessionListSkeleton />
         ) : error && allSessions.length === 0 ? (
-          <div className="px-2 py-3 text-xs text-fg-subtle">
+          <div role="alert" className="px-2 py-3 text-xs text-fg-subtle">
             Session history is unavailable.{" "}
             <button
               type="button"
@@ -454,6 +496,7 @@ export function SessionList() {
                 flat={flat}
                 activeSessionId={activeSessionId}
                 focusIndex={focusIndex}
+                onFocusSession={setFocusedSessionId}
                 expanded={expanded}
                 onToggleExpand={toggleExpand}
                 onSelect={rail.openSession}
@@ -468,6 +511,7 @@ export function SessionList() {
                 flat={flat}
                 activeSessionId={activeSessionId}
                 focusIndex={focusIndex}
+                onFocusSession={setFocusedSessionId}
                 expanded={expanded}
                 onToggleExpand={toggleExpand}
                 onSelect={rail.openSession}
@@ -483,6 +527,7 @@ export function SessionList() {
                 flat={flat}
                 activeSessionId={activeSessionId}
                 focusIndex={focusIndex}
+                onFocusSession={setFocusedSessionId}
                 expanded={expanded}
                 onToggleExpand={toggleExpand}
                 onSelect={rail.openSession}
@@ -524,6 +569,7 @@ function SessionGroup(props: {
   flat: Session[];
   activeSessionId: string | null;
   focusIndex: number;
+  onFocusSession: (sessionId: string) => void;
   expanded: ReadonlySet<string>;
   onToggleExpand: (sessionId: string) => void;
   onSelect: (sessionId: string) => void;
@@ -531,7 +577,7 @@ function SessionGroup(props: {
   onPin: PinFn;
 }) {
   return (
-    <div className="mb-1.5 min-w-0">
+    <div role="group" aria-label={props.label} className="mb-1.5 min-w-0">
       <p className="px-2 pb-0.5 pt-2 text-2xs font-medium uppercase tracking-wider text-fg-subtle">
         {props.label}
       </p>
@@ -544,6 +590,7 @@ function SessionGroup(props: {
             flat={props.flat}
             activeSessionId={props.activeSessionId}
             focusIndex={props.focusIndex}
+            onFocusSession={props.onFocusSession}
             expanded={props.expanded}
             onToggleExpand={props.onToggleExpand}
             onSelect={props.onSelect}
@@ -571,6 +618,7 @@ function SessionTreeRow(props: {
   flat: Session[];
   activeSessionId: string | null;
   focusIndex: number;
+  onFocusSession: (sessionId: string) => void;
   expanded: ReadonlySet<string>;
   onToggleExpand: (sessionId: string) => void;
   onSelect: (sessionId: string) => void;
@@ -599,6 +647,7 @@ function SessionTreeRow(props: {
         onToggleExpand={() => props.onToggleExpand(node.session.id)}
         active={node.session.id === props.activeSessionId || representsHiddenActive}
         focused={index >= 0 && index === props.focusIndex}
+        onFocus={() => props.onFocusSession(node.session.id)}
         onSelect={props.onSelect}
         onRename={props.onRename}
         onPin={props.onPin}
@@ -612,6 +661,7 @@ function SessionTreeRow(props: {
               flat={props.flat}
               activeSessionId={props.activeSessionId}
               focusIndex={props.focusIndex}
+              onFocusSession={props.onFocusSession}
               expanded={props.expanded}
               onToggleExpand={props.onToggleExpand}
               onSelect={props.onSelect}
@@ -637,6 +687,7 @@ function SessionRow(props: {
   onToggleExpand: () => void;
   active: boolean;
   focused: boolean;
+  onFocus: () => void;
   onSelect: (sessionId: string) => void;
   onRename: RenameFn;
   onPin: PinFn;
@@ -685,12 +736,16 @@ function SessionRow(props: {
   // listitem so the surrounding list semantics and the active accent bar hold.
   if (rename.editing) {
     return (
-      <div role="listitem" data-session-index={props.index} className={rowClassName}>
+      <div role="listitem" className={rowClassName}>
         <ActiveAccent active={props.active} />
         {lead}
         <RailStatusDot status={props.session.status} />
         <input
           ref={rename.inputRef}
+          data-session-index={props.index}
+          data-session-focus
+          tabIndex={props.focused ? 0 : -1}
+          onFocus={props.onFocus}
           value={rename.draft}
           onChange={(event) => rename.setDraft(event.target.value)}
           onBlur={() => void rename.commit()}
@@ -717,45 +772,47 @@ function SessionRow(props: {
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
-        <div
-          role="listitem"
-          data-session-index={props.index}
-          onClick={() => props.onSelect(props.session.id)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              props.onSelect(props.session.id);
-            }
-          }}
-          tabIndex={-1}
-          title={title}
-          className={cn(rowClassName, "cursor-pointer")}
-        >
+        <div role="listitem" title={title} className={rowClassName}>
           <ActiveAccent active={props.active} />
           {lead}
-          <RailStatusDot status={props.session.status} />
-          {/* min-w-0 + truncate: the title must always ellipsis, never butt the
-              rail border. */}
-          <span className="min-w-0 flex-1 truncate pr-1">{title}</span>
-          {/* A collapsed parent with a live child shows a quiet pulsing dot so
-              the activity isn't hidden with the subtree; the count badge sits
-              beside it. Both stay visible on hover (the time yields instead). */}
-          {hasChildren ? (
-            <span className="flex shrink-0 items-center gap-1 text-2xs tabular-nums text-fg-subtle">
-              {!props.expanded && props.hasActiveDescendant ? (
-                <span className="relative inline-flex size-1.5 rounded-full bg-status-running">
-                  <span className="absolute inset-0 animate-og-pulse rounded-full bg-status-running" />
-                </span>
-              ) : null}
-              {props.childCount}
+          <button
+            type="button"
+            data-session-index={props.index}
+            data-session-focus
+            tabIndex={props.focused ? 0 : -1}
+            aria-current={props.active ? "page" : undefined}
+            aria-label={`Open ${title}. ${props.session.status}${
+              props.session.pinned ? ". Pinned" : ""
+            }${hasChildren ? `. ${props.childCount} spawned sessions` : ""}`}
+            onFocus={props.onFocus}
+            onClick={() => props.onSelect(props.session.id)}
+            className="flex min-w-0 flex-1 items-center gap-1.5 rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-offset-1 focus-visible:ring-offset-surface"
+          >
+            <RailStatusDot status={props.session.status} />
+            <span className="sr-only">{props.session.status}. </span>
+            {/* min-w-0 + truncate: the title must always ellipsis, never butt the
+                rail border. */}
+            <span className="min-w-0 flex-1 truncate pr-1">{title}</span>
+            {/* A collapsed parent with a live child shows a quiet pulsing dot so
+                the activity isn't hidden with the subtree; the count badge sits
+                beside it. Both stay visible on hover (the time yields instead). */}
+            {hasChildren ? (
+              <span className="flex shrink-0 items-center gap-1 text-2xs tabular-nums text-fg-subtle">
+                {!props.expanded && props.hasActiveDescendant ? (
+                  <span className="relative inline-flex size-1.5 rounded-full bg-status-running">
+                    <span className="absolute inset-0 animate-og-pulse rounded-full bg-status-running" />
+                  </span>
+                ) : null}
+                <span aria-label={`${props.childCount} spawned sessions`}>{props.childCount}</span>
+              </span>
+            ) : null}
+            {/* Relative time is visible at rest (the list is grouped by recency),
+                and steps aside on hover/focus so the rename overflow can slot in.
+                On coarse pointers there is no hover, so the time stays visible. */}
+            <span className="shrink-0 text-2xs tabular-nums text-fg-subtle transition-opacity group-hover:opacity-0 group-focus-within:opacity-0 pointer-coarse:group-hover:opacity-100">
+              {relativeTimeLabel(props.session.updatedAt)}
             </span>
-          ) : null}
-          {/* Relative time is visible at rest (the list is grouped by recency),
-              and steps aside on hover/focus so the rename overflow can slot in.
-              On coarse pointers there is no hover, so the time stays visible. */}
-          <span className="shrink-0 text-2xs tabular-nums text-fg-subtle transition-opacity group-hover:opacity-0 group-focus-within:opacity-0 pointer-coarse:group-hover:opacity-100">
-            {relativeTimeLabel(props.session.updatedAt)}
-          </span>
+          </button>
           <RowActionsMenu
             session={props.session}
             onRename={rename.startEditing}
@@ -814,7 +871,9 @@ function RowActionsMenu({
           type="button"
           variant="ghost"
           size="icon-xs"
-          aria-label="Session actions"
+          aria-label={`Actions for ${
+            session.title?.trim() || session.initialMessage?.trim() || "Untitled session"
+          }`}
           onClick={(event) => event.stopPropagation()}
           className="shrink-0 text-fg-subtle opacity-0 transition-opacity hover:text-fg focus-visible:opacity-100 group-hover:opacity-100 data-[state=open]:opacity-100 pointer-coarse:size-11 pointer-coarse:opacity-100"
         >

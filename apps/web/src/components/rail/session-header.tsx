@@ -11,7 +11,7 @@ import { SessionStatus as SessionStatusBadge } from "@opengeni/react";
 import type { SessionEventsConnectionState } from "@opengeni/react";
 import type { SessionSummary } from "@opengeni/sdk";
 import { LockIcon, PanelRightIcon, PencilIcon, PinIcon } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { useId, useState, type ReactNode } from "react";
 
 import { ConnectionPill } from "@/components/common";
 import { SpawnedByBreadcrumb } from "@/components/session/subagents";
@@ -64,18 +64,20 @@ export function SessionHeader({
     // bar was the light-theme fix — a near-white header on a near-white canvas
     // needs its own surface + a crisp divider to look intentional (and it lifts
     // the dark bar a touch above the canvas too).
-    <header className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-surface/80 px-3.5 backdrop-blur supports-[backdrop-filter]:bg-surface/65 sm:px-5">
+    <header className="flex h-14 min-w-0 shrink-0 items-center gap-1.5 overflow-hidden border-b border-border bg-surface/80 px-2 backdrop-blur supports-[backdrop-filter]:bg-surface/65 sm:gap-3 sm:px-5">
       {leading}
-      <div className="flex min-w-0 flex-1 flex-col justify-center gap-0.5">
+      <div className="flex min-w-0 flex-1 flex-col justify-center gap-0.5 overflow-hidden">
         {/* Child sessions link back to the manager that spawned them. */}
-        <SpawnedByBreadcrumb workspaceId={session.workspaceId} parent={parent} />
+        <div className="hidden min-w-0 sm:block">
+          <SpawnedByBreadcrumb workspaceId={session.workspaceId} parent={parent} />
+        </div>
         <SessionTitleEditor session={session} onRename={onRename} />
         {/* One quiet metadata voice: no label-colon grammar, no separator
             soup — the model·effort token (the model earns a touch more weight,
             the effort stays quiet), then the sandbox pill (its own shape, no
             interposed dot), then the codex indicator. */}
-        <div className="flex min-w-0 items-center gap-2 text-2xs leading-4 text-fg-subtle">
-          <span className="shrink-0 font-medium text-fg-muted">
+        <div className="hidden min-w-0 items-center gap-2 overflow-hidden text-2xs leading-4 text-fg-subtle sm:flex">
+          <span className="min-w-0 shrink truncate font-medium text-fg-muted">
             {session.model}
             <span className="font-normal text-fg-subtle">
               {" "}
@@ -86,11 +88,16 @@ export function SessionHeader({
           {codexSlot}
         </div>
       </div>
-      <div className="flex shrink-0 items-center gap-2">
-        {agentsSlot}
+      <div className="flex shrink-0 items-center gap-1 sm:gap-2">
+        <div className="hidden xl:contents">{agentsSlot}</div>
         <SessionPinButton session={session} onPin={onPin} />
-        <ConnectionPill state={connectionState} />
-        <SessionStatusBadge status={status} />
+        <div className="hidden items-center gap-2 md:flex">
+          <ConnectionPill state={connectionState} />
+          <SessionStatusBadge status={status} />
+        </div>
+        <span className="sr-only md:hidden">
+          Connection {connectionState}. Session {status}.
+        </span>
         {keyAuthRequired ? (
           <Button
             type="button"
@@ -98,6 +105,7 @@ export function SessionHeader({
             size="icon-sm"
             onClick={onForgetAccessKey}
             aria-label="Clear access key"
+            className="pointer-coarse:size-11"
           >
             <LockIcon className="size-4" />
           </Button>
@@ -108,6 +116,7 @@ export function SessionHeader({
           size="icon-sm"
           onClick={onToggleInspector}
           aria-label={inspectorOpen ? "Hide session panel" : "Show session panel"}
+          className="pointer-coarse:size-11"
         >
           <PanelRightIcon className="size-4" />
         </Button>
@@ -124,23 +133,43 @@ function SessionPinButton({
   onPin: (session: Session, pinned: boolean) => Promise<Session | null>;
 }) {
   const [busy, setBusy] = useState(false);
+  const [announcement, setAnnouncement] = useState("");
+  const announcementId = useId();
   return (
-    <Button
-      type="button"
-      variant={session.pinned ? "secondary" : "ghost"}
-      size="icon-sm"
-      aria-label={session.pinned ? "Unpin session" : "Pin session"}
-      aria-pressed={Boolean(session.pinned)}
-      aria-busy={busy}
-      disabled={busy}
-      className="pointer-coarse:size-11"
-      onClick={() => {
-        setBusy(true);
-        void onPin(session, !Boolean(session.pinned)).finally(() => setBusy(false));
-      }}
-    >
-      <PinIcon className={session.pinned ? "size-4 fill-current" : "size-4"} />
-    </Button>
+    <>
+      <Button
+        type="button"
+        variant={session.pinned ? "secondary" : "ghost"}
+        size="icon-sm"
+        aria-label={session.pinned ? "Unpin session" : "Pin session"}
+        aria-describedby={announcement ? announcementId : undefined}
+        aria-pressed={Boolean(session.pinned)}
+        aria-busy={busy}
+        disabled={busy}
+        className="pointer-coarse:size-11"
+        onClick={() => {
+          const nextPinned = !Boolean(session.pinned);
+          setBusy(true);
+          void onPin(session, nextPinned)
+            .then((updated) => {
+              setAnnouncement(
+                updated
+                  ? `Session ${nextPinned ? "pinned" : "unpinned"}.`
+                  : `Session was not ${nextPinned ? "pinned" : "unpinned"}.`,
+              );
+            })
+            .catch(() => {
+              setAnnouncement(`Session was not ${nextPinned ? "pinned" : "unpinned"}.`);
+            })
+            .finally(() => setBusy(false));
+        }}
+      >
+        <PinIcon className={session.pinned ? "size-4 fill-current" : "size-4"} />
+      </Button>
+      <span id={announcementId} className="sr-only" aria-live="polite" aria-atomic="true">
+        {announcement}
+      </span>
+    </>
   );
 }
 
@@ -209,7 +238,7 @@ function SessionTitleEditor(props: {
         size="icon-xs"
         onClick={rename.startEditing}
         aria-label="Rename session"
-        className="shrink-0 text-fg-subtle opacity-0 transition-opacity hover:text-fg focus-visible:opacity-100 group-hover/title:opacity-100 pointer-coarse:opacity-100"
+        className="shrink-0 text-fg-subtle opacity-0 transition-opacity hover:text-fg focus-visible:opacity-100 group-hover/title:opacity-100 pointer-coarse:size-11 pointer-coarse:opacity-100"
       >
         <PencilIcon className="size-3" />
       </Button>

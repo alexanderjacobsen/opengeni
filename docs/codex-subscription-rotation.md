@@ -60,6 +60,14 @@ exhausted, unauthorized, forbidden, or otherwise quarantined may fail over to a
 healthy workspace alternative. `rotation_enabled=false` and
 `drain_then_next` remain explicit sticky product policies.
 
+`codex_subscription_credentials.allocator_enabled` is a separate, additive
+new-allocation gate (default `true`); it is not credential health. Setting it
+false excludes the row from new automatic, pinned, proactive, and reactive
+selection without changing `status`, encrypted credentials, refresh behavior,
+or quota history. An exact same-turn live lease or frozen approval/preemption
+checkpoint may continue on that healthy row; reconnect and token refresh never
+flip allocator eligibility. OPE-24 owns toggle OCC/audit and product controls.
+
 The unique same-turn lease is idempotent. A one-minute heartbeat renews its
 five-minute TTL throughout long tool/model runs; normal completion releases it
 idempotently. A killed worker stops renewing, and expiry lets a successor turn

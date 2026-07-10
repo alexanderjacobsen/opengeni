@@ -144,6 +144,21 @@ describe("migration 0049 (Codex credential leases)", () => {
         lease_rotation_enabled: false,
         rotation_strategy: "most_remaining",
       });
+      const allocatorColumns = await admin<
+        { allocator_enabled: boolean; default_value: string | null }[]
+      >`
+        select c.allocator_enabled,
+               cols.column_default as default_value
+        from codex_subscription_credentials c
+        cross join information_schema.columns cols
+        where c.workspace_id = ${workspaceId}
+          and cols.table_schema = current_schema()
+          and cols.table_name = 'codex_subscription_credentials'
+          and cols.column_name = 'allocator_enabled'
+        order by c.id`;
+      expect(allocatorColumns).toHaveLength(2);
+      expect(allocatorColumns.every((row) => row.allocator_enabled)).toBe(true);
+      expect(allocatorColumns.every((row) => row.default_value === "true")).toBe(true);
       await admin`
         update codex_rotation_settings
         set active_credential_id = ${credentialB},
@@ -159,6 +174,7 @@ describe("migration 0049 (Codex credential leases)", () => {
             accountEmail: null,
             planType: "pro",
             status: "active",
+            allocatorEnabled: true,
             isActive: id === credentialB,
             expiresAt: null,
             lastRefreshAt: null,
@@ -313,6 +329,7 @@ function rollbackSelectionContext(credentialA: string, credentialB: string) {
       accountEmail: null,
       planType: "pro",
       status: "active",
+      allocatorEnabled: true,
       isActive: false,
       expiresAt: null,
       lastRefreshAt: null,

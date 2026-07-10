@@ -239,6 +239,10 @@ export const codexSubscriptionCredentials = pgTable(
     // Workspace-local, server-held fairness cursor. Provider usage headers are
     // capacity hints, never the sole allocator: live lease count is ranked first
     // and this cursor deterministically breaks equal-load/equal-capacity ties.
+    // This flag controls NEW automatic allocations only. Credential health,
+    // refresh, encrypted material, and already-frozen/in-flight turns are
+    // intentionally independent. OPE-24 owns toggle OCC/audit and product UI.
+    allocatorEnabled: boolean("allocator_enabled").notNull().default(true),
     selectionCount: integer("selection_count").notNull().default(0),
     lastSelectedAt: timestamp("last_selected_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),

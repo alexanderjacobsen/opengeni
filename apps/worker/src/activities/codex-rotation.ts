@@ -170,10 +170,12 @@ function droppedConnectorsFor(acct: CodexRotationAccount, usedConnectors: string
 }
 
 /**
- * Eligible = connected/usable (status "active", excludes needs_relogin/error) AND
- * not cooling AND under the near-exhaustion threshold on BOTH windows.
+ * Healthy for an already-frozen/in-flight turn = connected/usable (status
+ * "active", excludes needs_relogin/error), not cooling, and under the
+ * near-exhaustion threshold on BOTH windows. Allocator eligibility is
+ * deliberately separate so disabling NEW work cannot break refresh/resume.
  */
-export function isCodexCredentialEligible(
+export function isCodexCredentialHealthy(
   acct: CodexRotationAccount,
   nearExhaustionPct: number,
   now: Date,
@@ -181,6 +183,15 @@ export function isCodexCredentialEligible(
   return (
     acct.status === "active" && !cooling(acct, now) && bindingUsedPct(acct, now) < nearExhaustionPct
   );
+}
+
+/** New automatic allocation requires both health and explicit allocator eligibility. */
+export function isCodexCredentialEligible(
+  acct: CodexRotationAccount,
+  nearExhaustionPct: number,
+  now: Date,
+): boolean {
+  return acct.allocatorEnabled && isCodexCredentialHealthy(acct, nearExhaustionPct, now);
 }
 
 /**
@@ -457,13 +468,14 @@ export function chooseRotationActive(args: {
     nearExhaustionPct,
     now,
   } = args;
+  const allocatableAccounts = accounts.filter((account) => account.allocatorEnabled);
   const usedConnectors = args.usedConnectors ?? [];
 
-  if (accounts.length === 0) {
+  if (allocatableAccounts.length === 0) {
     return { kind: "none" };
   }
 
-  const eligibles = accounts.filter((acct) =>
+  const eligibles = allocatableAccounts.filter((acct) =>
     isCodexCredentialEligible(acct, nearExhaustionPct, now),
   );
 
@@ -476,7 +488,7 @@ export function chooseRotationActive(args: {
     if (!chosen) {
       return {
         kind: "allCapped",
-        earliestResetAt: earliestReset(accounts, nearExhaustionPct, now),
+        earliestResetAt: earliestReset(allocatableAccounts, nearExhaustionPct, now),
       };
     }
     // P4: surface the dropped-connector note when the chosen account doesn't cover
@@ -500,12 +512,15 @@ export function chooseRotationActive(args: {
       };
     }
     const priorIdx = priorCredentialId
-      ? accounts.findIndex((acct) => acct.id === priorCredentialId)
+      ? allocatableAccounts.findIndex((acct) => acct.id === priorCredentialId)
       : -1;
     const ordered =
       priorIdx >= 0
-        ? [...accounts.slice(priorIdx + 1), ...accounts.slice(0, priorIdx + 1)]
-        : accounts;
+        ? [
+            ...allocatableAccounts.slice(priorIdx + 1),
+            ...allocatableAccounts.slice(0, priorIdx + 1),
+          ]
+        : allocatableAccounts;
     const chosen = ordered.find((acct) => isCodexCredentialEligible(acct, nearExhaustionPct, now));
     return decide(chosen);
   }
@@ -601,6 +616,8 @@ export function selectCodexCredentialLeaseForTurn(args: {
   leasingEnabled: boolean;
   sessionPinnedCredentialId: string | null;
   sessionLastCredentialId: string | null;
+  /** Same-turn checkpoint/frozen account; temporary disable cannot move it. */
+  continuationCredentialId?: string | null;
   nearExhaustionPct: number;
   now: Date;
 }): CodexTurnLeaseSelection {
@@ -616,7 +633,7 @@ export function selectCodexCredentialLeaseForTurn(args: {
   const existing = existingCredentialId
     ? accounts.find((account) => account.id === existingCredentialId)
     : undefined;
-  if (existing && isCodexCredentialEligible(existing, args.nearExhaustionPct, args.now)) {
+  if (existing && isCodexCredentialHealthy(existing, args.nearExhaustionPct, args.now)) {
     return {
       credentialId: existing.id,
       decision: {
@@ -627,7 +644,23 @@ export function selectCodexCredentialLeaseForTurn(args: {
     };
   }
 
-  const connectedIds = new Set(accounts.map((account) => account.id));
+  const continuation = args.continuationCredentialId
+    ? accounts.find((account) => account.id === args.continuationCredentialId)
+    : undefined;
+  if (continuation && isCodexCredentialHealthy(continuation, args.nearExhaustionPct, args.now)) {
+    return {
+      credentialId: continuation.id,
+      decision: {
+        kind: "active",
+        credentialId: continuation.id,
+        moved: continuation.id !== activeCredentialId,
+      },
+    };
+  }
+
+  const connectedIds = new Set(
+    accounts.filter((account) => account.allocatorEnabled).map((account) => account.id),
+  );
   if (!rotationEnabled) {
     const credentialId =
       args.sessionPinnedCredentialId && connectedIds.has(args.sessionPinnedCredentialId)

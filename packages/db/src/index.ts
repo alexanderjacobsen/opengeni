@@ -7216,6 +7216,8 @@ export type CodexAccountStatus = {
   accountEmail: string | null;
   planType: string | null;
   status: string; // active | needs_relogin | error
+  /** New automatic allocations only; health/refresh and existing turns remain independent. */
+  allocatorEnabled: boolean;
   isActive: boolean;
   expiresAt: Date | null;
   lastRefreshAt: Date | null;
@@ -7293,6 +7295,7 @@ type CodexLeaseCandidateRow = {
   account_email: string | null;
   plan_type: string | null;
   status: string;
+  allocator_enabled: boolean;
   expires_at: Date | string | null;
   last_refresh_at: Date | string | null;
   last_error: string | null;
@@ -7325,6 +7328,7 @@ function mapCodexLeaseCandidate(
     accountEmail: row.account_email,
     planType: row.plan_type,
     status: row.status,
+    allocatorEnabled: row.allocator_enabled,
     isActive: row.id === activeCredentialId,
     expiresAt: codexMetadataDate(row.expires_at),
     lastRefreshAt: codexMetadataDate(row.last_refresh_at),
@@ -7367,6 +7371,8 @@ export async function acquireCodexCredentialLease<T>(
     holderId: string;
     /** Pins must not move the workspace-global cursor. */
     advanceActivePointer: boolean;
+    /** Exact frozen credential for this same durable turn, if it is resuming. */
+    continuationCredentialId?: string | null;
     leaseTtlMs?: number;
   },
   select: (context: CodexCredentialLeaseSelectionContext) => CodexCredentialLeaseSelection<T>,
@@ -7394,6 +7400,23 @@ export async function acquireCodexCredentialLease<T>(
       if (!turns[0]) {
         throw new Error(`Session turn not found for Codex lease: ${input.turnId}`);
       }
+      const continuationRows = input.continuationCredentialId
+        ? await tx.execute(
+            sql<{ frozen_codex_credential_id: string | null }>`
+              select frozen_codex_credential_id
+              from agent_run_states
+              where account_id = ${input.accountId}
+                and workspace_id = ${input.workspaceId}
+                and turn_id = ${input.turnId}
+              order by state_version desc
+              limit 1
+            `,
+          )
+        : [];
+      const validatedContinuationCredentialId =
+        continuationRows[0]?.frozen_codex_credential_id === input.continuationCredentialId
+          ? input.continuationCredentialId
+          : null;
 
       // The singleton workspace row is the only serialization point. Never
       // SKIP LOCKED: concurrent replicas wait, then observe the winner's lease.
@@ -7458,6 +7481,7 @@ export async function acquireCodexCredentialLease<T>(
           c.account_email,
           c.plan_type,
           c.status,
+          c.allocator_enabled,
           c.expires_at,
           c.last_refresh_at,
           c.last_error,
@@ -7515,6 +7539,13 @@ export async function acquireCodexCredentialLease<T>(
       const selectedAccount = accounts.find((account) => account.id === selected.credentialId);
       if (!selectedAccount) {
         throw new Error("Codex lease selector returned a credential outside the workspace pool");
+      }
+      if (
+        !selectedAccount.allocatorEnabled &&
+        selectedAccount.id !== existingCredentialId &&
+        selectedAccount.id !== validatedContinuationCredentialId
+      ) {
+        throw new Error("Codex lease selector returned a credential disabled for new allocations");
       }
 
       // Compatible-but-not-cut-over workers may still run the legacy rotation
@@ -7743,6 +7774,7 @@ export async function listCodexAccountStatuses(
         accountEmail: schema.codexSubscriptionCredentials.accountEmail,
         planType: schema.codexSubscriptionCredentials.planType,
         status: schema.codexSubscriptionCredentials.status,
+        allocatorEnabled: schema.codexSubscriptionCredentials.allocatorEnabled,
         expiresAt: schema.codexSubscriptionCredentials.expiresAt,
         lastRefreshAt: schema.codexSubscriptionCredentials.lastRefreshAt,
         lastError: schema.codexSubscriptionCredentials.lastError,
@@ -9281,6 +9313,7 @@ export async function getLatestRunState(
   sessionId: string,
 ): Promise<{
   id: string;
+  turnId: string | null;
   serializedRunState: string;
   pendingApprovals: unknown[];
   // The codex account that froze this state (pin > workspace-active), or null
@@ -9304,6 +9337,7 @@ export async function getLatestRunState(
     return row
       ? {
           id: row.id,
+          turnId: row.turnId ?? null,
           serializedRunState: row.serializedRunState,
           pendingApprovals: row.pendingApprovals,
           frozenCodexCredentialId: row.frozenCodexCredentialId ?? null,

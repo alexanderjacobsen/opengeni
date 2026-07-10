@@ -7,6 +7,7 @@ import {
 import postgres from "postgres";
 import {
   chooseRotationActive,
+  selectCodexCredentialLeaseForTurn,
   type RotationDecision,
 } from "../../../apps/worker/src/activities/codex-rotation";
 import * as schema from "../src/schema";
@@ -298,29 +299,38 @@ describe("OPE-21 atomic Codex credential allocation", () => {
     const alternateCredential = await connectCredential(ws!, "temporary-alternate");
     expect(await setActiveCodexCredential(dbA, ws!.workspaceId, toggledCredential)).toBe(true);
 
-    // Start a real holder before the future OPE-24 status transition. Temporary
+    // Start a real holder before the future OPE-24 allocator transition. Temporary
     // disable is an eligibility-only state: it must not delete credentials or
     // revoke/terminate a turn that already owns a fenced lease.
     const inFlightTurn = await seedTurn(ws!, 1);
     const inFlight = await acquire(dbA, ws!, inFlightTurn);
     expect(inFlight.credentialId).toBe(toggledCredential);
     const [beforeDisable] = await admin<
-      { version: number; has_secret: boolean; holder_id: string; generation: number }[]
+      {
+        status: string;
+        allocator_enabled: boolean;
+        version: number;
+        has_secret: boolean;
+        holder_id: string;
+        generation: number;
+      }[]
     >`
-      select c.version, c.credential_encrypted is not null as has_secret,
+      select c.status, c.allocator_enabled, c.version,
+             c.credential_encrypted is not null as has_secret,
              l.holder_id, l.generation
       from codex_subscription_credentials c
       join codex_credential_leases l
         on l.workspace_id = c.workspace_id and l.credential_id = c.id
       where c.id = ${toggledCredential} and l.turn_id = ${inFlightTurn}`;
     expect(beforeDisable?.has_secret).toBe(true);
+    expect(beforeDisable?.status).toBe("active");
+    expect(beforeDisable?.allocator_enabled).toBe(true);
 
-    // OPE-24 owns the eventual toggle write/API. Exercise the allocator's
-    // existing active-allowlist contract with its reserved status value only;
-    // no entitlement, disconnect, token, or activation behavior belongs here.
+    // OPE-24 owns the eventual OCC/audit write/API. OPE-21 owns only this
+    // additive field and allocator behavior; health status remains active.
     await admin`
       update codex_subscription_credentials
-      set status = 'temporarily_disabled', updated_at = now()
+      set allocator_enabled = false
       where workspace_id = ${ws!.workspaceId} and id = ${toggledCredential}`;
     expect(
       await heartbeatCodexCredentialLease(
@@ -335,25 +345,84 @@ describe("OPE-21 atomic Codex credential allocation", () => {
     const [afterDisable] = await admin<
       {
         status: string;
+        allocator_enabled: boolean;
         version: number;
         has_secret: boolean;
         holder_id: string;
         generation: number;
       }[]
     >`
-      select c.status, c.version, c.credential_encrypted is not null as has_secret,
+      select c.status, c.allocator_enabled, c.version,
+             c.credential_encrypted is not null as has_secret,
              l.holder_id, l.generation
       from codex_subscription_credentials c
       join codex_credential_leases l
         on l.workspace_id = c.workspace_id and l.credential_id = c.id
       where c.id = ${toggledCredential} and l.turn_id = ${inFlightTurn}`;
     expect(afterDisable).toEqual({
-      status: "temporarily_disabled",
+      status: "active",
+      allocator_enabled: false,
       version: beforeDisable!.version,
       has_secret: true,
       holder_id: beforeDisable!.holder_id,
       generation: beforeDisable!.generation,
     });
+
+    // Refresh is health/token maintenance, not allocator policy. It succeeds
+    // while disabled, leaves status active, and cannot re-enable new allocation.
+    const loaded = await loadCodexCredentialForRun(
+      dbA,
+      settings,
+      ws!.workspaceId,
+      toggledCredential,
+    );
+    expect(loaded?.status).toBe("active");
+    expect(
+      await recordCodexTokenRefresh(dbA, {
+        id: toggledCredential,
+        version: loaded!.version,
+        workspaceId: ws!.workspaceId,
+        credentialEncrypted: encryptEnvironmentValue(
+          Buffer.alloc(32, 7),
+          JSON.stringify({ access_token: "next-a", refresh_token: "next-r", id_token: "next-i" }),
+        ),
+        expiresAt: null,
+        lastRefreshAt: new Date(),
+      }),
+    ).toBe(true);
+    const [afterRefresh] = await admin<
+      { status: string; allocator_enabled: boolean; version: number }[]
+    >`
+      select status, allocator_enabled, version
+      from codex_subscription_credentials where id = ${toggledCredential}`;
+    expect(afterRefresh).toEqual({
+      status: "active",
+      allocator_enabled: false,
+      version: loaded!.version + 1,
+    });
+
+    // A redispatch of the same still-live durable turn keeps its exact
+    // credential even though the row is no longer available to new turns.
+    const resumedInFlight = await acquire(
+      dbB,
+      ws!,
+      inFlightTurn,
+      300_000,
+      "temporary-disable-live-resume",
+    );
+    expect(resumedInFlight.credentialId).toBe(toggledCredential);
+    expect(resumedInFlight.reused).toBe(true);
+    expect(resumedInFlight.generation).toBeGreaterThan(inFlight.generation!);
+    expect(
+      await releaseCodexCredentialLease(
+        dbB,
+        ws!.accountId,
+        ws!.workspaceId,
+        inFlightTurn,
+        resumedInFlight.holderId!,
+        resumedInFlight.generation!,
+      ),
+    ).toBe(true);
 
     const disabledTurn = await seedTurn(ws!, 2);
     const disabledSelection = await acquire(dbB, ws!, disabledTurn);
@@ -368,14 +437,71 @@ describe("OPE-21 atomic Codex credential allocation", () => {
         disabledSelection.generation!,
       ),
     ).toBe(true);
+
+    // Approval/preemption checkpoints release their live lease between worker
+    // activities. The exact frozen credential is still a same-turn continuation
+    // exception, not a new automatic allocation. An unpersisted caller claim is
+    // rejected before the durable checkpoint is present.
+    const frozenTurn = await seedTurn(ws!, 3);
+    await expect(
+      acquireCodexCredentialLease(
+        dbA,
+        {
+          accountId: ws!.accountId,
+          workspaceId: ws!.workspaceId,
+          turnId: frozenTurn,
+          holderId: "unpersisted-continuation-must-fail",
+          advanceActivePointer: true,
+          continuationCredentialId: toggledCredential,
+        },
+        () => ({
+          credentialId: toggledCredential,
+          decision: {
+            kind: "active" as const,
+            credentialId: toggledCredential,
+            moved: false,
+          },
+        }),
+      ),
+    ).rejects.toThrow("disabled for new allocations");
+    await admin`
+      insert into agent_run_states (
+        account_id, workspace_id, session_id, turn_id, state_version,
+        serialized_run_state, pending_approvals, frozen_codex_credential_id
+      )
+      select account_id, workspace_id, session_id, id, 1,
+             '{}', '[]'::jsonb, ${toggledCredential}
+      from session_turns where id = ${frozenTurn}`;
+    const frozen = await acquireCodexCredentialLease(
+      dbA,
+      {
+        accountId: ws!.accountId,
+        workspaceId: ws!.workspaceId,
+        turnId: frozenTurn,
+        holderId: "temporary-disable-frozen-resume",
+        advanceActivePointer: true,
+        continuationCredentialId: toggledCredential,
+      },
+      (context) =>
+        selectCodexCredentialLeaseForTurn({
+          context,
+          leasingEnabled: true,
+          sessionPinnedCredentialId: null,
+          sessionLastCredentialId: toggledCredential,
+          continuationCredentialId: toggledCredential,
+          nearExhaustionPct: 90,
+          now: new Date(),
+        }),
+    );
+    expect(frozen.credentialId).toBe(toggledCredential);
     expect(
       await releaseCodexCredentialLease(
         dbA,
         ws!.accountId,
         ws!.workspaceId,
-        inFlightTurn,
-        inFlight.holderId!,
-        inFlight.generation!,
+        frozenTurn,
+        frozen.holderId!,
+        frozen.generation!,
       ),
     ).toBe(true);
 
@@ -404,20 +530,11 @@ describe("OPE-21 atomic Codex credential allocation", () => {
     const resetAt = new Date(Date.now() + 60 * 60_000);
     expect(
       await chooseWhile(
-        3,
-        () => admin`
-        update codex_subscription_credentials
-        set status = 'active', exhausted_until = ${resetAt},
-            primary_used_percent = 0, primary_reset_at = null
-        where id = ${toggledCredential}`,
-      ),
-    ).toBe(alternateCredential);
-    expect(
-      await chooseWhile(
         4,
         () => admin`
         update codex_subscription_credentials
-        set status = 'needs_relogin', exhausted_until = null
+        set status = 'active', allocator_enabled = true, exhausted_until = ${resetAt},
+            primary_used_percent = 0, primary_reset_at = null
         where id = ${toggledCredential}`,
       ),
     ).toBe(alternateCredential);
@@ -426,7 +543,16 @@ describe("OPE-21 atomic Codex credential allocation", () => {
         5,
         () => admin`
         update codex_subscription_credentials
-        set status = 'active', primary_used_percent = 99,
+        set status = 'needs_relogin', allocator_enabled = true, exhausted_until = null
+        where id = ${toggledCredential}`,
+      ),
+    ).toBe(alternateCredential);
+    expect(
+      await chooseWhile(
+        6,
+        () => admin`
+        update codex_subscription_credentials
+        set status = 'active', allocator_enabled = true, primary_used_percent = 99,
             primary_reset_at = ${resetAt}
         where id = ${toggledCredential}`,
       ),
@@ -437,11 +563,11 @@ describe("OPE-21 atomic Codex credential allocation", () => {
     // deterministic; this never consumes or activates an entitlement.
     expect(
       await chooseWhile(
-        6,
+        7,
         () => admin`
         update codex_subscription_credentials
-        set status = case when id = ${toggledCredential} then 'active'
-                          else 'temporarily_disabled' end,
+        set status = 'active',
+            allocator_enabled = (id = ${toggledCredential}),
             exhausted_until = null,
             primary_used_percent = 0,
             primary_reset_at = null

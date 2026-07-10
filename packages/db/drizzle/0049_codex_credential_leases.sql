@@ -9,6 +9,7 @@
 -- hints, but are never the allocator's only state: live DB leases are ranked
 -- first and this cursor breaks equal-load/equal-capacity ties.
 ALTER TABLE "codex_subscription_credentials"
+  ADD COLUMN IF NOT EXISTS "allocator_enabled" boolean NOT NULL DEFAULT true,
   ADD COLUMN IF NOT EXISTS "selection_count" integer NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS "last_selected_at" timestamptz;
 

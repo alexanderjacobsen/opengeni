@@ -14,6 +14,7 @@ import {
   getSessionEvent,
   getSessionGoal,
   getSessionTurn,
+  getLatestRunState,
   isCodexBilledTurn,
   workspaceCodexSubscriptionActive,
   acquireCodexCredentialLease,
@@ -1538,6 +1539,9 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
         throw new Error(`Session turn not found for trigger: ${input.triggerEventId}`);
       }
       turnId = turn.id;
+      const latestTurnState = await getLatestRunState(db, input.workspaceId, input.sessionId);
+      const continuationCodexCredentialId =
+        latestTurnState?.turnId === turnId ? latestTurnState.frozenCodexCredentialId : null;
       redispatchesAtDispatch = Number(
         (turn.metadata as { workerDeathRedispatches?: number } | null)?.workerDeathRedispatches ??
           0,
@@ -1664,6 +1668,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             leasingEnabled: settings.codexCredentialLeasingEnabled,
             sessionPinnedCredentialId: sessionPin,
             sessionLastCredentialId: sessionCodex?.lastCredentialId ?? null,
+            continuationCredentialId: continuationCodexCredentialId,
             nearExhaustionPct: settings.codexRotationNearExhaustionPct,
             now: new Date(),
           });
@@ -1681,6 +1686,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
               turnId,
               holderId: codexLeaseHolderId,
               advanceActivePointer: sessionPin === null,
+              continuationCredentialId: continuationCodexCredentialId,
             },
             selectForTurn,
           );
@@ -1728,6 +1734,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
                 turnId,
                 holderId: codexLeaseHolderId,
                 advanceActivePointer: sessionPin === null,
+                continuationCredentialId: continuationCodexCredentialId,
               },
               selectForTurn,
             );
@@ -1801,6 +1808,35 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             connectedCount: leased.accounts.length,
             depth: poolDepth,
           });
+        }
+
+        if (
+          effectiveCodexCredentialId === null &&
+          leased.accounts.length > 0 &&
+          leased.accounts.every((account) => !account.allocatorEnabled) &&
+          publish &&
+          turnId
+        ) {
+          await publish(
+            [
+              {
+                type: "turn.failed",
+                payload: {
+                  error: "All connected Codex subscriptions are disabled for new allocations.",
+                  code: "codex_allocator_disabled",
+                  retryable: false,
+                  recovery: "user_message",
+                },
+              },
+              { type: "session.status.changed", payload: { status: "idle" } },
+            ],
+            true,
+          );
+          await finishTurn(db, input.workspaceId, turnId, "failed");
+          turnMetricOutcome = "failed";
+          await setSessionStatus(db, input.workspaceId, input.sessionId, "idle", null);
+          activityStatus = "idle";
+          return { status: "idle" };
         }
 
         if (rotationDecision.kind === "allCapped" && publish && turnId) {

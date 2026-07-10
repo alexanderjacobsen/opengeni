@@ -33,6 +33,7 @@ function acct(id: string, over: Partial<CodexAccountStatus> = {}): CodexAccountS
     accountEmail: null,
     planType: "pro",
     status: "active",
+    allocatorEnabled: true,
     isActive: false,
     expiresAt: null,
     lastRefreshAt: null,
@@ -74,6 +75,21 @@ describe("chooseRotationActive — most_remaining", () => {
     expect(chooseRotationActive({ ...base, activeCredentialId: null, accounts: [] })).toEqual({
       kind: "none",
     });
+  });
+
+  test("allocator-disabled accounts are excluded and an all-disabled pool is not a fake cooldown", () => {
+    const disabled = acct("disabled", { allocatorEnabled: false });
+    const healthy = acct("healthy");
+    expect(
+      chooseRotationActive({
+        ...base,
+        activeCredentialId: disabled.id,
+        accounts: [disabled, healthy],
+      }),
+    ).toMatchObject({ kind: "active", credentialId: healthy.id });
+    expect(
+      chooseRotationActive({ ...base, activeCredentialId: disabled.id, accounts: [disabled] }),
+    ).toEqual({ kind: "none" });
   });
 
   test("healthy active pointer is not sticky; higher capacity wins", () => {
@@ -1175,5 +1191,38 @@ describe("OPE-21 pin and rollout policy", () => {
       now: NOW,
     });
     expect(decision.credentialId).toBe("c");
+  });
+
+  test("same-turn frozen continuation keeps a healthy disabled credential without admitting new work", () => {
+    const accounts = [leasedAcct("frozen", { allocatorEnabled: false }), leasedAcct("eligible")];
+    const context = {
+      accounts,
+      activeCredentialId: "frozen",
+      rotationEnabled: true,
+      leaseRotationEnabled: true,
+      rotationStrategy: "most_remaining",
+      existingCredentialId: null,
+    };
+    expect(
+      selectCodexCredentialLeaseForTurn({
+        context,
+        leasingEnabled: true,
+        sessionPinnedCredentialId: null,
+        sessionLastCredentialId: "frozen",
+        continuationCredentialId: "frozen",
+        nearExhaustionPct: 90,
+        now: NOW,
+      }).credentialId,
+    ).toBe("frozen");
+    expect(
+      selectCodexCredentialLeaseForTurn({
+        context,
+        leasingEnabled: true,
+        sessionPinnedCredentialId: null,
+        sessionLastCredentialId: "frozen",
+        nearExhaustionPct: 90,
+        now: NOW,
+      }).credentialId,
+    ).toBe("eligible");
   });
 });

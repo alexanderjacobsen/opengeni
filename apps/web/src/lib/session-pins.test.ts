@@ -64,4 +64,39 @@ describe("session pin reconciliation", () => {
       }),
     ).toBe(session);
   });
+
+  test("never lets a stale list or mutation response regress a newer pin revision", () => {
+    const current = {
+      ...session,
+      pinned: true,
+      pinnedAt: "2026-07-10T00:03:00.000Z",
+      pinVersion: 4,
+    };
+
+    expect(
+      applySessionPinProjection(current, {
+        id: session.id,
+        workspaceId: session.workspaceId,
+        pinned: false,
+        pinnedAt: null,
+        pinVersion: 3,
+      }),
+    ).toBe(current);
+
+    // Equal revisions are allowed to replace an optimistic timestamp with the
+    // canonical timestamp returned by the server.
+    expect(
+      applySessionPinProjection(current, {
+        id: session.id,
+        workspaceId: session.workspaceId,
+        pinned: true,
+        pinnedAt: "2026-07-10T00:02:59.000Z",
+        pinVersion: 4,
+      }),
+    ).toMatchObject({
+      pinned: true,
+      pinnedAt: "2026-07-10T00:02:59.000Z",
+      pinVersion: 4,
+    });
+  });
 });

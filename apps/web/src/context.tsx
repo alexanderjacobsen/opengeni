@@ -37,7 +37,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { sameSessionForContext } from "@/lib/session-context";
-import { notifySessionPinChanged } from "@/lib/session-pins";
+import { applySessionPinProjection, notifySessionPinChanged } from "@/lib/session-pins";
 import {
   buildResources,
   buildTools,
@@ -518,22 +518,32 @@ export function RootRouteComponent() {
         pinned,
         ...(expectedVersion !== undefined ? { expectedVersion } : {}),
       });
-      setSession((current) => (current?.id === updated.id ? updated : current));
+      // The mutation can race a newer page poll/other-device write, and its
+      // full Session projection can lag lifecycle/SSE fields. Merge only the
+      // monotonic personal pin fields rather than replacing the open session.
+      setSession((current) => applySessionPinProjection(current, updated));
       notifySessionPinChanged(workspaceId, sessionId);
       return updated;
     } catch (error) {
-      if (error instanceof OpenGeniApiError && error.status === 409) {
-        // The server response intentionally returns only non-secret pin
-        // metadata. Re-read the whole member-projected session so the open
-        // header converges to the winning tab/device rather than rolling back
-        // to another stale snapshot.
-        const authoritative = await client.getSession(workspaceId, sessionId).catch(() => null);
-        if (authoritative) {
-          setSession((current) => (current?.id === sessionId ? authoritative : current));
-        }
+      // Re-read on every failure, not only OCC conflicts. A transport failure
+      // may have happened after the server committed; blindly restoring
+      // `before` would temporarily lie and could overwrite a newer device.
+      const authoritative = await client.getSession(workspaceId, sessionId).catch(() => null);
+      if (authoritative) {
+        setSession((current) => applySessionPinProjection(current, authoritative));
         notifySessionPinChanged(workspaceId, sessionId);
       } else if (optimistic) {
-        setSession((current) => (current?.id === sessionId ? before : current));
+        // If reconciliation is also unavailable (for example while offline),
+        // roll back only the exact optimistic projection this call installed.
+        // Any intervening poll/device response remains untouched.
+        setSession((current) =>
+          current?.id === sessionId &&
+          Boolean(current.pinned) === Boolean(optimistic.pinned) &&
+          (current.pinnedAt ?? null) === (optimistic.pinnedAt ?? null) &&
+          (current.pinVersion ?? 0) === (optimistic.pinVersion ?? 0)
+            ? before
+            : current,
+        );
       }
       toast.error(
         error instanceof OpenGeniApiError && error.status === 409

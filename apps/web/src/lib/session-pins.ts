@@ -25,6 +25,14 @@ export function applySessionPinProjection(
   const pinned = Boolean(projected.pinned);
   const pinnedAt = projected.pinnedAt ?? null;
   const pinVersion = projected.pinVersion ?? 0;
+  // A page poll, mutation response, or legacy-replica response can finish
+  // after a newer optimistic/authoritative projection is already visible.
+  // Pin revisions are monotonic, so never let that older response undo the
+  // newer header/list state. Equal revisions remain authoritative: they let a
+  // server response replace the local optimistic timestamp for that revision.
+  if (pinVersion < (current.pinVersion ?? 0)) {
+    return current;
+  }
   if (
     Boolean(current.pinned) === pinned &&
     (current.pinnedAt ?? null) === pinnedAt &&

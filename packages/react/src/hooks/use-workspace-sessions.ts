@@ -14,7 +14,12 @@ export type UseWorkspaceSessionsOptions = ClientOverride & {
 };
 
 export type UseWorkspaceSessionsResult = {
+  /**
+   * All visible rows, with pins first. This preserves the pre-pinning hook
+   * contract for consumers that only read `sessions`.
+   */
   sessions: Session[];
+  /** The complete personal pinned section, also present in `sessions`. */
   pinned: Session[];
   nextCursor: string | null;
   loading: boolean;
@@ -45,9 +50,14 @@ export function useWorkspaceSessions(
     pollIntervalMs: options.pollIntervalMs,
     enabled: options.enabled,
   });
+  const pinned = state.data?.pinned ?? [];
+  const ordinary = state.data?.sessions ?? [];
   return {
-    sessions: state.data?.sessions ?? [],
-    pinned: state.data?.pinned ?? [],
+    // The old hook returned every visible session. Keep that public behavior
+    // while exposing `pinned` separately for the compact section. The API page
+    // itself continues to paginate only `ordinary` rows via nextCursor.
+    sessions: [...pinned, ...ordinary],
+    pinned,
     nextCursor: state.data?.nextCursor ?? null,
     loading: state.loading,
     error: state.error,

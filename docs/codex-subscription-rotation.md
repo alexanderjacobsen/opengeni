@@ -117,7 +117,11 @@ not replay work absent from history.
 Rotating refresh tokens are protected separately: a workspace credential-scoped
 Postgres advisory transaction lock serializes API/worker replicas before the
 provider refresh call, waiters re-read the row after acquiring the lock, and the
-existing `(id, version)` CAS remains the stale-family write fence.
+existing `(id, version)` CAS remains the stale-family write fence. Refresh and
+relogin-status writes also require health `status = 'active'`, so a refresh that
+started earlier cannot reactivate or overwrite a definitive model quarantine;
+this health fence does not read or change the independent `allocator_enabled`
+new-allocation policy.
 
 ## Rollout and rollback
 

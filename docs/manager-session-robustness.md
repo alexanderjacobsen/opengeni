@@ -138,20 +138,25 @@ functions directly. Only the MCP tool result a *manager model* reads is shaped.
 
 ## 2b. Don't-busy-poll doctrine (Geni pack — private repo)
 
-The platform cap bounds the blast radius, but the manager should not be paging a
-worker on a poll loop in the first place. opengeni **#60** auto-wakes the parent
-session when a spawned worker reaches a terminal-for-now state (`idle` or
-`failed`) — see `apps/worker/src/activities/parent-wake.ts`
-(`notifyParentOfChildTerminal`, idempotent per terminal episode via the child's
-`lastSequence`). So the manager should **spawn, then go idle and await the
-wakeup**, not busy-poll; when it does need a status glance it uses a **single
-bounded check**, not a poll loop.
+The platform cap bounds the blast radius, but the manager should not page a
+worker on a poll loop. Child-completion parent wakes are temporarily disabled by
+default (`OPENGENI_CHILD_COMPLETION_PARENT_WAKE_ENABLED=false`): spawned workers
+still retain their durable events and goal evidence, but reaching `idle` or
+`failed` does not inject a synthetic user message or turn into the parent chat.
+Deployments may explicitly opt into the legacy #60 wake behavior while the
+compatibility flag exists.
+
+Managers must therefore use a durable external completion signal or a bounded
+scheduled/event-driven reconciliation that performs one status read at the
+intended wake time. They must not assume that going idle will produce a child
+wake, and they must never replace the missing wake with a poll loop.
 
 That behavioral doctrine lives in the **private** Geni pack
 (`skills/geni-manager` §2 Orchestration), not in this OSS repo. It is shipped on
-Geni `origin/main` as **Pack 0.4.3** (PR #20, commit `5ce7354`): the monitor
-guidance now reads "await completion by going idle — do not busy-poll", aligned
-with the shipped wakeup. No content from the private pack is reproduced here.
+Geni `origin/main` as **Pack 0.4.3** (PR #20, commit `5ce7354`), but that
+point-in-time guidance predates the temporary default-off compatibility flag
+and must not be treated as the current platform contract. No content from the
+private pack is reproduced here.
 
 ## 3. `user.interrupt` cleanly cancels a running turn
 

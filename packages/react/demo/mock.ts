@@ -47,6 +47,7 @@ import type {
   ScheduledTask,
   SendMessageInput,
   Session,
+  SessionListResponse,
   SessionEvent,
   SessionGoal,
   SessionLineageResponse,
@@ -57,6 +58,7 @@ import type {
   UploadFileInput,
   UpdateSessionGoalRequest,
   UpdateSessionRequest,
+  UpdateSessionPinRequest,
   UpdateSessionTurnRequest,
   UpdateWorkspaceEnvironmentRequest,
   UpdateVariableSetRequest,
@@ -192,10 +194,32 @@ export class MockOpenGeniClient implements SessionClientLike {
     return { ...session, title: request.title, titleSource: "user" };
   }
 
-  async listSessions(): Promise<Session[]> {
-    return FLEET.map((spec) =>
-      this.fabricateSession(spec.id, spec.status, spec.title, spec.agoMinutes),
+  async updateSessionPin(
+    _workspaceId: string,
+    sessionId: string,
+    request: UpdateSessionPinRequest,
+  ): Promise<Session> {
+    const session = this.fabricateSession(
+      sessionId,
+      this.bus(sessionId).status,
+      "Ops channel — manager session",
     );
+    return {
+      ...session,
+      pinned: request.pinned,
+      pinnedAt: request.pinned ? new Date().toISOString() : null,
+      pinVersion: request.pinned ? Math.max(1, session.pinVersion + 1) : 0,
+    };
+  }
+
+  async listSessions(): Promise<SessionListResponse> {
+    return {
+      pinned: [],
+      sessions: FLEET.map((spec) =>
+        this.fabricateSession(spec.id, spec.status, spec.title, spec.agoMinutes),
+      ),
+      nextCursor: null,
+    };
   }
 
   async listEvents(
@@ -1293,6 +1317,9 @@ export class MockOpenGeniClient implements SessionClientLike {
       temporalWorkflowId: null,
       activeTurnId: null,
       lastSequence: this.bus(sessionId).events.length,
+      pinned: false,
+      pinnedAt: null,
+      pinVersion: 0,
       createdAt: updatedAt,
       updatedAt,
     };

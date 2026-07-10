@@ -82,6 +82,8 @@ import type {
   ScheduledTask,
   ScheduledTaskRun,
   Session,
+  SessionListResponse,
+  UpdateSessionPinRequest,
   SessionEvent,
   SessionGoal,
   SessionLineageResponse,
@@ -239,14 +241,21 @@ export class OpenGeniClient {
 
   async listSessions(
     workspaceId: string,
-    options: { limit?: number; parentSessionId?: string | null } = {},
-  ): Promise<Session[]> {
-    return await this.requestJson<Session[]>(
+    options: {
+      limit?: number;
+      parentSessionId?: string | null;
+      cursor?: string;
+      search?: string;
+    } = {},
+  ): Promise<SessionListResponse> {
+    return await this.requestJson<SessionListResponse>(
       "GET",
       `/v1/workspaces/${workspaceId}/sessions`,
       undefined,
       {
         ...(options.limit !== undefined ? { limit: String(options.limit) } : {}),
+        ...(options.cursor !== undefined ? { cursor: options.cursor } : {}),
+        ...(options.search?.trim() ? { search: options.search.trim() } : {}),
         ...(Object.prototype.hasOwnProperty.call(options, "parentSessionId") &&
         options.parentSessionId !== undefined
           ? {
@@ -255,6 +264,19 @@ export class OpenGeniClient {
             }
           : {}),
       },
+    );
+  }
+
+  /** Set this authenticated member's personal workspace pin for a session. */
+  async updateSessionPin(
+    workspaceId: string,
+    sessionId: string,
+    request: UpdateSessionPinRequest,
+  ): Promise<Session> {
+    return await this.requestJson<Session>(
+      "PUT",
+      `/v1/workspaces/${workspaceId}/sessions/${sessionId}/pin`,
+      request,
     );
   }
 

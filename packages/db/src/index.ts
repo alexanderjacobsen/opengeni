@@ -37,6 +37,7 @@ import type {
   ScheduledTaskStatus,
   ScheduledTaskTriggerType,
   Session,
+  SessionListResponse,
   SessionEvent,
   SessionEventType,
   SessionGoal,
@@ -87,6 +88,7 @@ import {
   gte,
   inArray,
   isNotNull,
+  ilike,
   isNull,
   lt,
   ne,
@@ -10442,6 +10444,267 @@ export type ListSessionsOptions = {
   parentSessionId?: string | null;
 };
 
+export type SessionListCursor = {
+  updatedAt: Date;
+  id: string;
+};
+
+export type ListSessionsForSubjectOptions = ListSessionsOptions & {
+  subjectId: string;
+  cursor?: SessionListCursor | undefined;
+  search?: string | undefined;
+};
+
+export class SessionPinVersionConflictError extends Error {
+  constructor(readonly current: Pick<Session, "pinned" | "pinnedAt" | "pinVersion">) {
+    super("session pin version conflict");
+    this.name = "SessionPinVersionConflictError";
+  }
+}
+
+type SessionPinRow = Pick<typeof schema.sessionPins.$inferSelect, "pinnedAt" | "version">;
+
+function mapSessionPin(
+  row: SessionPinRow | null | undefined,
+): Pick<Session, "pinned" | "pinnedAt" | "pinVersion"> {
+  return row
+    ? { pinned: true, pinnedAt: row.pinnedAt.toISOString(), pinVersion: Number(row.version) }
+    : { pinned: false, pinnedAt: null, pinVersion: 0 };
+}
+
+function sessionFilters(
+  options: Pick<ListSessionsForSubjectOptions, "parentSessionId" | "search">,
+): SQL[] {
+  const filters: SQL[] = [];
+  if (Object.prototype.hasOwnProperty.call(options, "parentSessionId")) {
+    const parentSessionId = options.parentSessionId;
+    if (parentSessionId === null) {
+      filters.push(isNull(schema.sessions.parentSessionId));
+    } else if (parentSessionId !== undefined) {
+      filters.push(eq(schema.sessions.parentSessionId, parentSessionId));
+    }
+  }
+  const search = options.search?.trim();
+  if (search) {
+    const pattern = `%${search.replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
+    filters.push(
+      or(ilike(schema.sessions.title, pattern), ilike(schema.sessions.initialMessage, pattern))!,
+    );
+  }
+  return filters;
+}
+
+/** Opaque, URL-safe cursor encoding for the ordinary `updated_at, id` ordering. */
+export function encodeSessionListCursor(cursor: SessionListCursor): string {
+  return Buffer.from(
+    JSON.stringify({ updatedAt: cursor.updatedAt.toISOString(), id: cursor.id }),
+  ).toString("base64url");
+}
+
+/** Decode and validate a cursor before it reaches any SQL predicate. */
+export function decodeSessionListCursor(value: string): SessionListCursor | null {
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as {
+      updatedAt?: unknown;
+      id?: unknown;
+    };
+    const updatedAt = typeof parsed.updatedAt === "string" ? new Date(parsed.updatedAt) : null;
+    if (!updatedAt || Number.isNaN(updatedAt.getTime()) || typeof parsed.id !== "string") {
+      return null;
+    }
+    return { updatedAt, id: parsed.id };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Server-authoritative member-specific page. Pinned rows are returned separately
+ * and omitted from ordinary cursor pages, so list pagination cannot duplicate a
+ * session. Both sections share parent/search predicates.
+ */
+export async function listSessionsForSubject(
+  db: Database,
+  workspaceId: string,
+  options: ListSessionsForSubjectOptions,
+): Promise<SessionListResponse> {
+  const limit = options.limit ?? 50;
+  return await withWorkspaceRls(
+    db,
+    workspaceId,
+    async (scopedDb) =>
+      await scopedDb.transaction(async (tx) => {
+        const filters = [eq(schema.sessions.workspaceId, workspaceId), ...sessionFilters(options)];
+        const pinnedRows = await tx
+          .select({ session: schema.sessions, pin: schema.sessionPins })
+          .from(schema.sessionPins)
+          .innerJoin(schema.sessions, eq(schema.sessions.id, schema.sessionPins.sessionId))
+          .where(
+            and(
+              eq(schema.sessionPins.workspaceId, workspaceId),
+              eq(schema.sessionPins.subjectId, options.subjectId),
+              ...filters,
+            ),
+          )
+          .orderBy(desc(schema.sessionPins.pinnedAt), desc(schema.sessions.id));
+        const cursorFilter = options.cursor
+          ? or(
+              lt(schema.sessions.updatedAt, options.cursor.updatedAt),
+              and(
+                eq(schema.sessions.updatedAt, options.cursor.updatedAt),
+                lt(schema.sessions.id, options.cursor.id),
+              ),
+            )
+          : undefined;
+        const ordinaryRows = await tx
+          .select({ session: schema.sessions })
+          .from(schema.sessions)
+          .leftJoin(
+            schema.sessionPins,
+            and(
+              eq(schema.sessionPins.workspaceId, workspaceId),
+              eq(schema.sessionPins.subjectId, options.subjectId),
+              eq(schema.sessionPins.sessionId, schema.sessions.id),
+            ),
+          )
+          .where(
+            and(...filters, isNull(schema.sessionPins.id), ...(cursorFilter ? [cursorFilter] : [])),
+          )
+          .orderBy(desc(schema.sessions.updatedAt), desc(schema.sessions.id))
+          .limit(limit + 1);
+        const pageRows = ordinaryRows.slice(0, limit);
+        const ids = [
+          ...pinnedRows.map((row) => row.session.id),
+          ...pageRows.map((row) => row.session.id),
+        ];
+        const mcpServers = await sessionMcpServerMetadataForSessions(tx, workspaceId, ids);
+        const tail = pageRows.at(-1)?.session;
+        return {
+          pinned: pinnedRows.map((row) =>
+            mapSession(row.session, mcpServers.get(row.session.id) ?? [], mapSessionPin(row.pin)),
+          ),
+          sessions: pageRows.map((row) =>
+            mapSession(row.session, mcpServers.get(row.session.id) ?? [], mapSessionPin(null)),
+          ),
+          nextCursor:
+            ordinaryRows.length > limit && tail
+              ? encodeSessionListCursor({ updatedAt: tail.updatedAt, id: tail.id })
+              : null,
+        };
+      }),
+  );
+}
+
+/** Read a session with the caller subject's personal pin projection. */
+export async function getSessionForSubject(
+  db: Database,
+  workspaceId: string,
+  sessionId: string,
+  subjectId: string,
+): Promise<Session | null> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [row] = await scopedDb
+      .select({ session: schema.sessions, pin: schema.sessionPins })
+      .from(schema.sessions)
+      .leftJoin(
+        schema.sessionPins,
+        and(
+          eq(schema.sessionPins.workspaceId, workspaceId),
+          eq(schema.sessionPins.subjectId, subjectId),
+          eq(schema.sessionPins.sessionId, schema.sessions.id),
+        ),
+      )
+      .where(and(eq(schema.sessions.workspaceId, workspaceId), eq(schema.sessions.id, sessionId)))
+      .limit(1);
+    if (!row) return null;
+    const mcpServers = await sessionMcpServerMetadataForSessions(scopedDb, workspaceId, [
+      sessionId,
+    ]);
+    return mapSession(row.session, mcpServers.get(sessionId) ?? [], mapSessionPin(row.pin));
+  });
+}
+
+/**
+ * Idempotently set a member's pin without mutating the session's lifecycle or
+ * activity timestamps. A transaction advisory lock serializes same-subject,
+ * same-session actions across API replicas; expectedVersion rejects stale tabs.
+ */
+export async function setSessionPin(
+  db: Database,
+  input: {
+    workspaceId: string;
+    subjectId: string;
+    sessionId: string;
+    pinned: boolean;
+    expectedVersion?: number | undefined;
+  },
+): Promise<Session | null> {
+  return await withWorkspaceRls(
+    db,
+    input.workspaceId,
+    async (scopedDb) =>
+      await scopedDb.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtext(${`session-pin:${input.workspaceId}:${input.subjectId}:${input.sessionId}`}))`,
+        );
+        const [session] = await tx
+          .select()
+          .from(schema.sessions)
+          .where(
+            and(
+              eq(schema.sessions.workspaceId, input.workspaceId),
+              eq(schema.sessions.id, input.sessionId),
+            ),
+          )
+          .limit(1);
+        if (!session) return null;
+        const [existing] = await tx
+          .select()
+          .from(schema.sessionPins)
+          .where(
+            and(
+              eq(schema.sessionPins.workspaceId, input.workspaceId),
+              eq(schema.sessionPins.subjectId, input.subjectId),
+              eq(schema.sessionPins.sessionId, input.sessionId),
+            ),
+          )
+          .limit(1);
+        const current = mapSessionPin(existing);
+        if (input.expectedVersion !== undefined && input.expectedVersion !== current.pinVersion) {
+          throw new SessionPinVersionConflictError(current);
+        }
+        let pin = existing ?? null;
+        if (input.pinned && !existing) {
+          const [inserted] = await tx
+            .insert(schema.sessionPins)
+            .values({
+              accountId: session.accountId,
+              workspaceId: input.workspaceId,
+              subjectId: input.subjectId,
+              sessionId: input.sessionId,
+            })
+            .returning();
+          pin = inserted ?? null;
+        } else if (!input.pinned && existing) {
+          await tx
+            .delete(schema.sessionPins)
+            .where(
+              and(
+                eq(schema.sessionPins.workspaceId, input.workspaceId),
+                eq(schema.sessionPins.subjectId, input.subjectId),
+                eq(schema.sessionPins.sessionId, input.sessionId),
+              ),
+            );
+          pin = null;
+        }
+        const mcpServers = await sessionMcpServerMetadataForSessions(tx, input.workspaceId, [
+          session.id,
+        ]);
+        return mapSession(session, mcpServers.get(session.id) ?? [], mapSessionPin(pin));
+      }),
+  );
+}
+
 export async function listSessions(
   db: Database,
   workspaceId: string,
@@ -18034,6 +18297,7 @@ export function sessionSubject(workspaceId: string, sessionId: string): string {
 function mapSession(
   row: typeof schema.sessions.$inferSelect,
   mcpServers: SessionMcpServerMetadata[] = [],
+  pin: Pick<Session, "pinned" | "pinnedAt" | "pinVersion"> = mapSessionPin(null),
 ): Session {
   return {
     id: row.id,
@@ -18072,6 +18336,7 @@ function mapSession(
     lastSequence: row.lastSequence,
     codexPinnedCredentialId: row.codexPinnedCredentialId ?? null,
     codexLastCredentialId: row.codexLastCredentialId ?? null,
+    ...pin,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };

@@ -399,11 +399,29 @@ export type Session = {
   codexPinnedCredentialId?: string | null;
   /** Multi-account Codex (P1): the account the most recent turn ran on (the "Running on:" indicator). */
   codexLastCredentialId?: string | null;
+  /** Personal (authenticated subject) workspace pin state, never workspace-global. */
+  pinned: boolean;
+  /** Stable pin ordering key; null when this subject has not pinned the session. */
+  pinnedAt: string | null;
+  /** Optimistic pin-state revision; zero represents an absent pin relation. */
+  pinVersion: number;
   createdAt: string;
   updatedAt: string;
 };
 
 export type SessionSummary = Session;
+
+/** Canonical session-list page; pinned rows are excluded from ordinary pages. */
+export type SessionListResponse = {
+  pinned: Session[];
+  sessions: Session[];
+  nextCursor: string | null;
+};
+
+export type UpdateSessionPinRequest = {
+  pinned: boolean;
+  expectedVersion?: number;
+};
 
 export type LineageNode = {
   session: SessionSummary;

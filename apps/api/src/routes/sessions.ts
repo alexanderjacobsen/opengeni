@@ -20,6 +20,7 @@ import {
   PtyWriteRequest,
   ReorderSessionTurnsRequest,
   TerminalExecRequest,
+  UpdateSessionPinRequest,
   UpdateSessionGoalRequest,
   UpdateSessionRequest,
   UpdateSessionTurnRequest,
@@ -39,12 +40,14 @@ import {
   getOpenPtySession,
   getSandbox,
   getSession,
+  getSessionForSubject,
   getSessionGoal,
   getStreamAcknowledgment,
   insertPtySession,
   listSessionEvents,
   listSessionIdsInGroup,
   listSessions,
+  listSessionsForSubject,
   listSessionTurns,
   recordStreamAcknowledgment,
   reorderQueuedSessionTurns,
@@ -52,6 +55,9 @@ import {
   requireSession,
   setSessionCodexPin,
   withCodexCapacityMutation,
+  setSessionPin,
+  SessionPinVersionConflictError,
+  decodeSessionListCursor,
   revokeViewer,
   setSessionGoalStatus,
   updatePtySessionActivity,
@@ -115,7 +121,7 @@ export function registerSessionRoutes(app: Hono, deps: ApiRouteDeps): void {
 
   app.get("/v1/workspaces/:workspaceId/sessions", async (c) => {
     const workspaceId = c.req.param("workspaceId");
-    await requireAccessGrant(c, deps, workspaceId, "sessions:read");
+    const grant = await requireAccessGrant(c, deps, workspaceId, "sessions:read");
     const parentSessionId = c.req.query("parentSessionId");
     // "null" = roots only; a uuid = children of that session; anything else is
     // a client error (an unvalidated value would surface as a Postgres uuid
@@ -129,9 +135,21 @@ export function registerSessionRoutes(app: Hono, deps: ApiRouteDeps): void {
         message: 'parentSessionId must be a session id or the literal "null"',
       });
     }
+    const rawCursor = c.req.query("cursor");
+    const cursor = rawCursor ? decodeSessionListCursor(rawCursor) : undefined;
+    if (rawCursor && !cursor) {
+      throw new HTTPException(400, { message: "cursor is invalid" });
+    }
+    const search = c.req.query("search")?.trim();
+    if (search && search.length > 200) {
+      throw new HTTPException(400, { message: "search must be at most 200 characters" });
+    }
     return c.json(
-      await listSessions(db, workspaceId, {
+      await listSessionsForSubject(db, workspaceId, {
+        subjectId: grant.subjectId,
         limit: boundedLimit(c.req.query("limit")),
+        ...(cursor ? { cursor } : {}),
+        ...(search ? { search } : {}),
         ...(parentSessionId !== undefined
           ? { parentSessionId: parentSessionId === "null" ? null : parentSessionId }
           : {}),
@@ -141,12 +159,49 @@ export function registerSessionRoutes(app: Hono, deps: ApiRouteDeps): void {
 
   app.get("/v1/workspaces/:workspaceId/sessions/:sessionId", async (c) => {
     const workspaceId = c.req.param("workspaceId");
-    await requireAccessGrant(c, deps, workspaceId, "sessions:read");
-    const session = await getSession(db, workspaceId, c.req.param("sessionId"));
+    const grant = await requireAccessGrant(c, deps, workspaceId, "sessions:read");
+    const session = await getSessionForSubject(
+      db,
+      workspaceId,
+      c.req.param("sessionId"),
+      grant.subjectId,
+    );
     if (!session) {
       throw new HTTPException(404, { message: "session not found" });
     }
     return c.json(session);
+  });
+
+  // Personal pin only: this is organization state for the authenticated member,
+  // not a mutation of the shared session. It deliberately requires read access
+  // (not session control) and returns 404 for a foreign/inaccessible session.
+  app.put("/v1/workspaces/:workspaceId/sessions/:sessionId/pin", async (c) => {
+    const workspaceId = c.req.param("workspaceId");
+    const grant = await requireAccessGrant(c, deps, workspaceId, "sessions:read");
+    const parsed = UpdateSessionPinRequest.safeParse(await c.req.json());
+    if (!parsed.success) {
+      throw new HTTPException(400, { message: "invalid session pin request" });
+    }
+    try {
+      const session = await setSessionPin(db, {
+        workspaceId,
+        subjectId: grant.subjectId,
+        sessionId: c.req.param("sessionId"),
+        ...parsed.data,
+      });
+      if (!session) {
+        throw new HTTPException(404, { message: "session not found" });
+      }
+      return c.json(session);
+    } catch (error) {
+      if (error instanceof SessionPinVersionConflictError) {
+        return c.json(
+          { message: "session pin changed in another client", current: error.current },
+          409,
+        );
+      }
+      throw error;
+    }
   });
 
   app.get("/v1/workspaces/:workspaceId/sessions/:sessionId/lineage", async (c) => {

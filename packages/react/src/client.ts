@@ -13,6 +13,7 @@ export type SessionClientLike = Pick<
   | "getSession"
   | "getSessionLineage"
   | "updateSession"
+  | "updateSessionPin"
   | "listSessions"
   | "sendMessage"
   | "steerMessage"

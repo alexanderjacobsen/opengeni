@@ -580,6 +580,44 @@ export const sessions = pgTable(
   }),
 );
 
+// Per-authenticated-subject session organization. This is deliberately a
+// relation instead of a session column: one member's pin must never reorder a
+// shared workspace for another member, and a session's own activity timestamps
+// must remain agent/runtime truth. `subjectId` is the trusted AccessGrant
+// subject, which is text because configured/delegated principals are not always
+// UUIDs. The account/workspace pair carries the standard forced-RLS boundary.
+export const sessionPins = pgTable(
+  "session_pins",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    accountId: uuid("account_id")
+      .notNull()
+      .references(() => managedAccounts.id, { onDelete: "cascade" }),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    subjectId: text("subject_id").notNull(),
+    sessionId: uuid("session_id")
+      .notNull()
+      .references(() => sessions.id, { onDelete: "cascade" }),
+    pinnedAt: timestamp("pinned_at", { withTimezone: true }).notNull().defaultNow(),
+    version: integer("version").notNull().default(1),
+  },
+  (table) => ({
+    subjectSession: uniqueIndex("session_pins_subject_workspace_session_idx").on(
+      table.subjectId,
+      table.workspaceId,
+      table.sessionId,
+    ),
+    subjectPinned: index("session_pins_workspace_subject_pinned_idx").on(
+      table.workspaceId,
+      table.subjectId,
+      table.pinnedAt,
+      table.sessionId,
+    ),
+  }),
+);
+
 export const sessionMcpServers = pgTable(
   "session_mcp_servers",
   {

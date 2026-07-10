@@ -28,9 +28,9 @@ import {
   setSessionCodexPin,
   recordCodexAccountUsage,
   recordCodexAccountConnectors,
+  quarantineCodexCredentialForLease,
   resolveWorkspaceMemoryBlock,
   setCodexCredentialExhausted,
-  setCodexCredentialStatusById,
   countConsecutiveReactiveRotations,
   requireSession,
   recordUsageEvent,
@@ -40,6 +40,7 @@ import {
   getActiveSessionHistoryItems,
   nextSessionHistoryPosition,
   requeuePreemptedTurn,
+  settleCodexCredentialLeaseLoss,
   settleCodexCredentialFailover,
   saveRunState,
   upsertSandboxSessionEnvelope,
@@ -292,6 +293,11 @@ export const WORKER_DEATH_RESUME_TEXT = [
 export const CODEX_ROTATION_RESUME_TEXT = [
   "[TURN RESUMED AFTER CODEX ACCOUNT FAILOVER] The previous Codex subscription definitively refused the model request and was quarantined or placed in cooldown.",
   "Continue the same task on the newly leased subscription. Earlier model/tool progress is already preserved; before repeating any external side effect, verify whether it already happened.",
+].join("\n");
+
+export const CODEX_LEASE_LOSS_RESUME_TEXT = [
+  "[TURN RESUMED AFTER CODEX LEASE LOSS] This turn's workspace-local Codex lease expired or was lost before the turn finished.",
+  "The durable conversation checkpoint is preserved. Continue the same task, and verify any external side effect before repeating it.",
 ].join("\n");
 
 /** Fixed-length one-way tenant correlation for metrics/alerts; never a raw id. */
@@ -3627,6 +3633,122 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
         activityStatus = "idle";
         return { status: "idle" };
       }
+      const settleLostCodexAttempt = async (
+        lostTurnId: string,
+        holderId: string,
+        generation: number,
+        historyCheckpointDurable = false,
+      ): Promise<RunAgentTurnResult> => {
+        let checkpointDurable = historyCheckpointDurable;
+        let resumeWithNotice =
+          settings.sessionHistorySource === "items" &&
+          persistedHistoryCount > historyCountAtTurnStart;
+        try {
+          if (!historyCheckpointDurable) {
+            await flushRuntimeBatcher();
+            await reconcileConversationTruth({ requireDurable: true });
+          }
+          if (settings.sessionHistorySource === "items") {
+            // Reconciliation above may have just persisted this turn's first
+            // model/tool items. Recompute after it completes so a recovered
+            // turn never replays the original trigger over newly durable work.
+            resumeWithNotice = persistedHistoryCount > historyCountAtTurnStart;
+          }
+          if (settings.sessionHistorySource !== "items" && stream) {
+            await saveRunState(db, {
+              accountId: input.accountId,
+              workspaceId: input.workspaceId,
+              sessionId: input.sessionId,
+              turnId: lostTurnId,
+              serializedRunState: stream.state.toString(),
+              pendingApprovals: runtime.serializeApprovals(stream.interruptions ?? []),
+              frozenCodexCredentialId: effectiveCodexCredentialId,
+            });
+            resumeWithNotice = true;
+          }
+          checkpointDurable = true;
+        } catch (checkpointError) {
+          resumeWithNotice = false;
+          observability.warn("Codex lease-loss checkpoint failed; refusing automatic turn replay", {
+            workspaceId: input.workspaceId,
+            turnId: lostTurnId,
+            errorName: checkpointError instanceof Error ? checkpointError.name : "unknown",
+          });
+        }
+
+        const settlement = await settleCodexCredentialLeaseLoss(db, {
+          accountId: input.accountId,
+          workspaceId: input.workspaceId,
+          sessionId: input.sessionId,
+          turnId: lostTurnId,
+          originalTriggerEventId: input.triggerEventId,
+          holderId,
+          generation,
+          expectedRedispatches: redispatchesAtDispatch,
+          checkpointDurable,
+          resumeWithNotice,
+          preemptedPayload: {
+            triggerEventId: input.triggerEventId,
+            reason: "codex_lease_lost",
+            credentialId: effectiveCodexCredentialId,
+            resumeWithNotice,
+            ...(resumeWithNotice ? { text: CODEX_LEASE_LOSS_RESUME_TEXT } : {}),
+          },
+          failedPayload: {
+            error:
+              "The Codex credential lease was lost and the latest conversation checkpoint could not be persisted. Automatic replay was refused.",
+            code: "codex_lease_checkpoint_failed",
+            retryable: false,
+          },
+        });
+        codexLeaseHeld = false;
+        observability.incrementCounter({
+          name: "opengeni_codex_lease_loss_settlements_total",
+          help: "Fenced Codex lease-loss settlements by outcome.",
+          labels: { workspace_key: codexWorkspaceKey, outcome: settlement.action },
+        });
+        if (settlement.events.length > 0) {
+          try {
+            await bus.publish(input.workspaceId, input.sessionId, settlement.events);
+          } catch {
+            // Durable events are replayed/backfilled by the SSE path.
+          }
+        }
+        activityError = error;
+        if (settlement.action === "failed") {
+          activityStatus = "failed";
+          turnMetricOutcome = "failed";
+          await notifyParentOfChildTerminal(
+            { db, bus, settings, observability, wakeSessionWorkflow },
+            input.workspaceId,
+            input.sessionId,
+            "failed",
+            `turn:${lostTurnId}`,
+          );
+          return { status: "failed" };
+        }
+        activityStatus = "preempted";
+        turnMetricOutcome = "preempted";
+        return { status: "preempted" };
+      };
+
+      // A missing/expired/superseded lease is an execution-ownership failure,
+      // not a provider failure. Settle it before credential quarantine or the
+      // generic terminal path: the DB transaction requeues a still-current
+      // holder, but a successor holder/worker redispatch makes this activity
+      // stale and unable to clobber the shared turn/session.
+      if (
+        codexLeaseLost &&
+        settings.codexCredentialLeasingEnabled &&
+        isCodexTurn &&
+        publish &&
+        turnId &&
+        turnStartedPublished &&
+        codexLeaseHolderId &&
+        codexLeaseGeneration !== null
+      ) {
+        return await settleLostCodexAttempt(turnId, codexLeaseHolderId, codexLeaseGeneration);
+      }
       // Definitive Codex credential/account refusals are the only provider
       // errors that may walk the pool. This is an explicit checkpoint + SAME
       // turn requeue, never an SDK/Temporal blind retry. A network break,
@@ -3702,28 +3824,39 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             now,
           );
           const statePersisted =
-            codexCredentialFailure.kind === "auth"
-              ? await setCodexCredentialStatusById(
-                  db,
-                  input.workspaceId,
-                  effectiveCodexCredentialId,
-                  "needs_relogin",
-                  "model request remained unauthorized after refresh",
-                ).catch(() => false)
-              : codexCredentialFailure.kind === "forbidden"
-                ? await setCodexCredentialStatusById(
-                    db,
-                    input.workspaceId,
-                    effectiveCodexCredentialId,
-                    "error",
-                    "model request was forbidden for this credential",
-                  ).catch(() => false)
-                : await setCodexCredentialExhausted(
-                    db,
-                    input.workspaceId,
-                    effectiveCodexCredentialId,
-                    cooldownUntil,
-                  ).catch(() => false);
+            codexLeaseHolderId && codexLeaseGeneration !== null
+              ? await quarantineCodexCredentialForLease(db, {
+                  accountId: input.accountId,
+                  workspaceId: input.workspaceId,
+                  turnId,
+                  credentialId: effectiveCodexCredentialId,
+                  holderId: codexLeaseHolderId,
+                  generation: codexLeaseGeneration,
+                  quarantine:
+                    codexCredentialFailure.kind === "auth"
+                      ? {
+                          kind: "status",
+                          status: "needs_relogin",
+                          lastError: "model request remained unauthorized after refresh",
+                        }
+                      : codexCredentialFailure.kind === "forbidden"
+                        ? {
+                            kind: "status",
+                            status: "error",
+                            lastError: "model request was forbidden for this credential",
+                          }
+                        : { kind: "cooldown", until: cooldownUntil! },
+                })
+              : false;
+          if (!statePersisted && codexLeaseHolderId && codexLeaseGeneration !== null) {
+            codexLeaseLost = true;
+            return await settleLostCodexAttempt(
+              turnId,
+              codexLeaseHolderId,
+              codexLeaseGeneration,
+              true,
+            );
+          }
           const [rotation, accounts] = await Promise.all([
             getCodexRotationSettings(db, input.workspaceId).catch(() => null),
             listCodexAccountStatuses(db, input.workspaceId).catch(() => []),
@@ -3885,18 +4018,15 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
           if (rotating && rotation) {
             const accounts = await listCodexAccountStatuses(db, input.workspaceId).catch(() => []);
             const serving = accounts.find((a) => a.id === effectiveCodexCredentialId) ?? null;
-            // Cooldown end (invariant 5): authoritative resets_in_seconds from the 429; else
-            // the serving account's soonest cached window reset; else the 1h cap.
-            const cachedReset =
-              [serving?.primaryResetAt, serving?.secondaryResetAt]
-                .filter((d): d is Date => d instanceof Date && d.getTime() > Date.now())
-                .sort((a, b) => a.getTime() - b.getTime())[0] ?? null;
-            const until =
-              usageLimit.resetsInSeconds !== null &&
-              Number.isFinite(usageLimit.resetsInSeconds) &&
-              usageLimit.resetsInSeconds > 0
-                ? new Date(Date.now() + Math.ceil(usageLimit.resetsInSeconds) * 1000)
-                : (cachedReset ?? new Date(Date.now() + CODEX_USAGE_LIMIT_MAX_RESUME_MS));
+            // Both provider allowance windows bind. Use the same canonical
+            // quarantine calculation as the fenced failover path so a short
+            // five-hour reset can never overwrite a later weekly reset.
+            const until = codexCredentialCooldownUntil(
+              { kind: "quota", cooldownSeconds: usageLimit.resetsInSeconds },
+              serving,
+              settings.codexRotationNearExhaustionPct,
+              new Date(),
+            )!;
             // Finding 1a: INSPECT the cooldown-write result. A swallowed best-effort
             // write whose failure went unnoticed is exactly what lets the next proactive
             // rank re-pick this just-capped account (stale-low cached usedPercent, not
@@ -4565,10 +4695,11 @@ export type CodexCredentialFailure = {
 export const CODEX_ALLOWANCE_FALLBACK_MS = 5 * 60 * 60_000;
 
 /**
- * Resolve a deterministic quarantine end. Provider retry-after wins. Generic
- * request throttling gets a minute; allowance/quota refusal waits for the LAST
- * still-blocking cached window (five-hour and weekly both bind), falling back to
- * one complete five-hour window when the provider supplied no reset metadata.
+ * Resolve a deterministic quarantine end. Generic request throttling honors
+ * provider retry-after (or one minute); allowance/quota refusal waits for the
+ * LAST of provider reset and every still-binding cached window (five-hour and
+ * weekly both bind), falling back to one complete five-hour window when no reset
+ * metadata exists.
  */
 export function codexCredentialCooldownUntil(
   failure: CodexCredentialFailure,
@@ -4582,15 +4713,14 @@ export function codexCredentialCooldownUntil(
   if (failure.kind === "auth" || failure.kind === "forbidden") {
     return null;
   }
-  if (
+  const providerReset =
     failure.cooldownSeconds !== null &&
     Number.isFinite(failure.cooldownSeconds) &&
     failure.cooldownSeconds > 0
-  ) {
-    return new Date(now.getTime() + Math.ceil(failure.cooldownSeconds) * 1000);
-  }
+      ? new Date(now.getTime() + Math.ceil(failure.cooldownSeconds) * 1000)
+      : null;
   if (failure.kind === "rate_limit") {
-    return new Date(now.getTime() + PROVIDER_BACKPRESSURE_DELAY_MS);
+    return providerReset ?? new Date(now.getTime() + PROVIDER_BACKPRESSURE_DELAY_MS);
   }
   const blockingResets = account
     ? [
@@ -4605,10 +4735,11 @@ export function codexCredentialCooldownUntil(
         )
         .map((window) => window.reset)
     : [];
-  if (blockingResets.length === 0) {
+  const quotaResets = providerReset ? [...blockingResets, providerReset] : blockingResets;
+  if (quotaResets.length === 0) {
     return new Date(now.getTime() + CODEX_ALLOWANCE_FALLBACK_MS);
   }
-  return blockingResets.reduce((latest, reset) =>
+  return quotaResets.reduce((latest, reset) =>
     reset.getTime() > latest.getTime() ? reset : latest,
   );
 }

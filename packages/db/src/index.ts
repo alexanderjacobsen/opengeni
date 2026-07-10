@@ -7584,6 +7584,74 @@ export async function releaseCodexCredentialLease(
   });
 }
 
+export type CodexCredentialLeaseQuarantine =
+  | {
+      kind: "status";
+      status: "needs_relogin" | "error";
+      lastError: string;
+    }
+  | { kind: "cooldown"; until: Date };
+
+/**
+ * Quarantine the credential served by one exact live holder. The lease row is
+ * locked and checked before the credential write, so a superseded/expired
+ * activity cannot poison status or cooldown after a successor owns the turn.
+ */
+export async function quarantineCodexCredentialForLease(
+  db: Database,
+  input: {
+    accountId: string;
+    workspaceId: string;
+    turnId: string;
+    credentialId: string;
+    holderId: string;
+    generation: number;
+    quarantine: CodexCredentialLeaseQuarantine;
+  },
+): Promise<boolean> {
+  return await withRlsContext(
+    db,
+    { accountId: input.accountId, workspaceId: input.workspaceId },
+    async (scopedDb) =>
+      await scopedDb.transaction(async (tx) => {
+        const leaseRows = await tx.execute(sql<{ id: string }>`
+          select id from codex_credential_leases
+          where account_id = ${input.accountId}
+            and workspace_id = ${input.workspaceId}
+            and turn_id = ${input.turnId}
+            and credential_id = ${input.credentialId}
+            and holder_id = ${input.holderId}
+            and generation = ${input.generation}
+            and leased_until > now()
+          for update
+        `);
+        if (!leaseRows[0]) {
+          return false;
+        }
+        const updated = await tx
+          .update(schema.codexSubscriptionCredentials)
+          .set(
+            input.quarantine.kind === "status"
+              ? {
+                  status: input.quarantine.status,
+                  lastError: input.quarantine.lastError,
+                  updatedAt: new Date(),
+                }
+              : { exhaustedUntil: input.quarantine.until },
+          )
+          .where(
+            and(
+              eq(schema.codexSubscriptionCredentials.accountId, input.accountId),
+              eq(schema.codexSubscriptionCredentials.workspaceId, input.workspaceId),
+              eq(schema.codexSubscriptionCredentials.id, input.credentialId),
+            ),
+          )
+          .returning({ id: schema.codexSubscriptionCredentials.id });
+        return updated.length > 0;
+      }),
+  );
+}
+
 /**
  * Metadata-only list of every connected Codex account in the workspace, for the
  * accounts UI + the worker's selection resolver. NEVER decrypts. `isActive` marks
@@ -15376,6 +15444,221 @@ export type SettleCodexCredentialFailoverResult =
   | { action: "requeued"; failoverCount: number; events: SessionEvent[] }
   | { action: "stale"; failoverCount: number; events: [] }
   | { action: "limit_exceeded"; failoverCount: number; events: [] };
+
+export type SettleCodexCredentialLeaseLossResult =
+  | { action: "requeued"; events: SessionEvent[] }
+  | { action: "failed"; events: SessionEvent[] }
+  | { action: "stale"; events: [] };
+
+/**
+ * Settle an activity that discovered its Codex lease was lost before it could
+ * make more model progress. A current attempt is checkpointed and requeued;
+ * when that checkpoint failed, the turn fails honestly instead of replaying
+ * unpersisted work. A successor holder or worker-death redispatch makes the
+ * caller stale and therefore unable to mutate the shared turn/session.
+ *
+ * The lease row may be absent because another turn reaped its expired row. The
+ * persisted worker-death counter is the second dispatch fence for that case.
+ */
+export async function settleCodexCredentialLeaseLoss(
+  db: Database,
+  input: {
+    accountId: string;
+    workspaceId: string;
+    sessionId: string;
+    turnId: string;
+    originalTriggerEventId: string;
+    holderId: string;
+    generation: number;
+    expectedRedispatches: number;
+    checkpointDurable: boolean;
+    resumeWithNotice: boolean;
+    preemptedPayload: Record<string, unknown>;
+    failedPayload: Record<string, unknown>;
+  },
+): Promise<SettleCodexCredentialLeaseLossResult> {
+  if (!Number.isInteger(input.expectedRedispatches) || input.expectedRedispatches < 0) {
+    throw new Error("Codex lease-loss redispatch fence must be a non-negative integer");
+  }
+  if (input.resumeWithNotice && !input.checkpointDurable) {
+    throw new Error("Codex lease-loss resume notice requires a durable checkpoint");
+  }
+  return await withRlsContext(
+    db,
+    { accountId: input.accountId, workspaceId: input.workspaceId },
+    async (scopedDb) =>
+      await scopedDb.transaction(async (tx) => {
+        const [turn] = await tx
+          .select({
+            sessionId: schema.sessionTurns.sessionId,
+            status: schema.sessionTurns.status,
+            metadata: schema.sessionTurns.metadata,
+          })
+          .from(schema.sessionTurns)
+          .where(
+            and(
+              eq(schema.sessionTurns.accountId, input.accountId),
+              eq(schema.sessionTurns.workspaceId, input.workspaceId),
+              eq(schema.sessionTurns.id, input.turnId),
+              eq(schema.sessionTurns.sessionId, input.sessionId),
+            ),
+          )
+          .for("update")
+          .limit(1);
+        const currentRedispatches = Number(turn?.metadata?.workerDeathRedispatches ?? 0);
+        if (
+          !turn ||
+          !["running", "requires_action"].includes(turn.status) ||
+          currentRedispatches !== input.expectedRedispatches
+        ) {
+          return { action: "stale", events: [] } as const;
+        }
+
+        const [session] = await tx
+          .select()
+          .from(schema.sessions)
+          .where(
+            and(
+              eq(schema.sessions.accountId, input.accountId),
+              eq(schema.sessions.workspaceId, input.workspaceId),
+              eq(schema.sessions.id, input.sessionId),
+            ),
+          )
+          .for("update")
+          .limit(1);
+        if (!session || session.activeTurnId !== input.turnId) {
+          return { action: "stale", events: [] } as const;
+        }
+
+        const leaseRows = await tx.execute(
+          sql<{ holder_id: string; generation: number }>`
+            select holder_id, generation from codex_credential_leases
+            where account_id = ${input.accountId}
+              and workspace_id = ${input.workspaceId}
+              and turn_id = ${input.turnId}
+            for update
+          `,
+        );
+        const lease = leaseRows[0];
+        if (
+          lease &&
+          (lease.holder_id !== input.holderId || Number(lease.generation) !== input.generation)
+        ) {
+          return { action: "stale", events: [] } as const;
+        }
+
+        const now = new Date();
+        const inserted = input.checkpointDurable
+          ? await tx
+              .insert(schema.sessionEvents)
+              .values([
+                {
+                  accountId: input.accountId,
+                  workspaceId: input.workspaceId,
+                  sessionId: input.sessionId,
+                  sequence: session.lastSequence + 1,
+                  type: "turn.preempted",
+                  payload: sanitizeEventPayload(input.preemptedPayload),
+                  turnId: input.turnId,
+                  occurredAt: now,
+                },
+                {
+                  accountId: input.accountId,
+                  workspaceId: input.workspaceId,
+                  sessionId: input.sessionId,
+                  sequence: session.lastSequence + 2,
+                  type: "session.status.changed",
+                  payload: { status: "queued" },
+                  turnId: input.turnId,
+                  occurredAt: now,
+                },
+              ])
+              .returning()
+          : await tx
+              .insert(schema.sessionEvents)
+              .values([
+                {
+                  accountId: input.accountId,
+                  workspaceId: input.workspaceId,
+                  sessionId: input.sessionId,
+                  sequence: session.lastSequence + 1,
+                  type: "turn.failed",
+                  payload: sanitizeEventPayload(input.failedPayload),
+                  turnId: input.turnId,
+                  occurredAt: now,
+                },
+                {
+                  accountId: input.accountId,
+                  workspaceId: input.workspaceId,
+                  sessionId: input.sessionId,
+                  sequence: session.lastSequence + 2,
+                  type: "session.status.changed",
+                  payload: { status: "failed" },
+                  turnId: input.turnId,
+                  occurredAt: now,
+                },
+              ])
+              .returning();
+        const settlementEvent = inserted[0];
+        if (!settlementEvent) {
+          throw new Error("Codex lease-loss settlement did not persist its checkpoint event");
+        }
+
+        await tx
+          .update(schema.sessionTurns)
+          .set(
+            input.checkpointDurable
+              ? {
+                  status: "queued",
+                  triggerEventId: input.resumeWithNotice
+                    ? settlementEvent.id
+                    : input.originalTriggerEventId,
+                  startedAt: null,
+                  finishedAt: null,
+                  updatedAt: now,
+                }
+              : {
+                  status: "failed",
+                  finishedAt: now,
+                  updatedAt: now,
+                },
+          )
+          .where(
+            and(
+              eq(schema.sessionTurns.workspaceId, input.workspaceId),
+              eq(schema.sessionTurns.id, input.turnId),
+            ),
+          );
+        await tx
+          .update(schema.sessions)
+          .set({
+            status: input.checkpointDurable ? "queued" : "failed",
+            activeTurnId: null,
+            lastSequence: session.lastSequence + 2,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(schema.sessions.workspaceId, input.workspaceId),
+              eq(schema.sessions.id, input.sessionId),
+              eq(schema.sessions.activeTurnId, input.turnId),
+            ),
+          );
+        await tx.execute(sql`
+          delete from codex_credential_leases
+          where account_id = ${input.accountId}
+            and workspace_id = ${input.workspaceId}
+            and turn_id = ${input.turnId}
+            and holder_id = ${input.holderId}
+            and generation = ${input.generation}
+        `);
+        return {
+          action: input.checkpointDurable ? "requeued" : "failed",
+          events: inserted.map(mapEvent),
+        } as const;
+      }),
+  );
+}
 
 /**
  * Atomically settle a definitive Codex credential failover. Conversation

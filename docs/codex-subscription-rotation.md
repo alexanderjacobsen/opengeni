@@ -63,8 +63,12 @@ healthy workspace alternative. `rotation_enabled=false` and
 The unique same-turn lease is idempotent. A one-minute heartbeat renews its
 five-minute TTL throughout long tool/model runs; normal completion releases it
 idempotently. A killed worker stops renewing, and expiry lets a successor turn
-reclaim capacity. Credential leases do not serialize inference: they are load
-signals used to spread concurrent turns, not exclusive locks on an account.
+reclaim capacity. If a live activity discovers that its lease was lost, a
+holder/generation plus worker-redispatch-fenced transaction either requeues that
+still-current turn from its durable checkpoint or treats the activity as stale;
+it never falls through to an unfenced terminal write. Credential leases do not
+serialize inference: they are load signals used to spread concurrent turns, not
+exclusive locks on an account.
 
 ## Reset and failure semantics
 
@@ -86,11 +90,13 @@ another credential:
 | Network break, 5xx, invalid content, malformed/partial 200 stream | No credential quarantine | **No** |
 
 Before definitive failover, the worker flushes streamed events and reconciles
-`session_history_items`, then increments a persisted per-turn failover counter,
+`session_history_items`, then quarantines status/cooldown only through the exact
+live holder/generation. It increments a persisted per-turn failover counter,
 emits `turn.preempted`, and requeues the **same turn row**. This is an explicit
 checkpoint/resume, not a Temporal or SDK blind retry. The resumed attempt receives
 a side-effect verification notice when progress already exists. The counter is
-bounded by pool size so a malformed classification cannot walk forever.
+bounded by pool size so a malformed classification cannot walk forever; a stale
+holder cannot quarantine a credential or settle the turn.
 
 Ambiguous failures never walk the pool because a partial stream may already have
 performed tools or consumed allowance. Every terminal failure path reconciles

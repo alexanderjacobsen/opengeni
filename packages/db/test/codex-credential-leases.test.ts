@@ -18,8 +18,10 @@ import {
   heartbeatCodexCredentialLease,
   listCodexAccountStatuses,
   loadCodexCredentialForRun,
+  quarantineCodexCredentialForLease,
   recordCodexAccountUsage,
   recordCodexTokenRefresh,
+  settleCodexCredentialLeaseLoss,
   settleCodexCredentialFailover,
   releaseCodexCredentialLease,
   setCodexCredentialExhausted,
@@ -396,6 +398,174 @@ describe("OPE-21 atomic Codex credential allocation", () => {
         successor.generation!,
       ),
     ).toBe(true);
+
+    const staleQuarantine = await quarantineCodexCredentialForLease(dbA, {
+      accountId: ws!.accountId,
+      workspaceId: ws!.workspaceId,
+      turnId,
+      credentialId: first.credentialId!,
+      holderId: first.holderId!,
+      generation: first.generation!,
+      quarantine: { kind: "cooldown", until: new Date(Date.now() + 60_000) },
+    });
+    expect(staleQuarantine).toBe(false);
+    const [credentialAfterStaleAttempt] = await admin<
+      { status: string; exhausted_until: Date | null }[]
+    >`
+      select status, exhausted_until from codex_subscription_credentials
+      where id = ${first.credentialId}`;
+    expect(credentialAfterStaleAttempt).toEqual({ status: "active", exhausted_until: null });
+
+    const [session] = await admin<{ session_id: string }[]>`
+      select session_id from session_turns where id = ${turnId}`;
+    const staleSettlement = await settleCodexCredentialLeaseLoss(dbA, {
+      accountId: ws!.accountId,
+      workspaceId: ws!.workspaceId,
+      sessionId: session!.session_id,
+      turnId,
+      originalTriggerEventId: crypto.randomUUID(),
+      holderId: first.holderId!,
+      generation: first.generation!,
+      expectedRedispatches: 0,
+      checkpointDurable: true,
+      resumeWithNotice: false,
+      preemptedPayload: { reason: "stale-holder-must-not-settle" },
+      failedPayload: { error: "stale-holder-must-not-fail" },
+    });
+    expect(staleSettlement.action).toBe("stale");
+    expect(
+      await heartbeatCodexCredentialLease(
+        dbB,
+        ws!.accountId,
+        ws!.workspaceId,
+        turnId,
+        successor.holderId!,
+        successor.generation!,
+      ),
+    ).toBe(true);
+  });
+
+  test("a current attempt atomically requeues after its expired lease row is reaped", async () => {
+    if (!available) return;
+    const [ws] = await freshAccount();
+    await connectCredential(ws!, "lease-loss-a");
+    const turnId = await seedTurn(ws!, 1);
+    const first = await acquire(dbA, ws!, turnId);
+    const [session] = await admin<{ session_id: string; trigger_event_id: string }[]>`
+      select session_id, trigger_event_id from session_turns where id = ${turnId}`;
+    await admin`delete from codex_credential_leases where turn_id = ${turnId}`;
+
+    const settled = await settleCodexCredentialLeaseLoss(dbA, {
+      accountId: ws!.accountId,
+      workspaceId: ws!.workspaceId,
+      sessionId: session!.session_id,
+      turnId,
+      originalTriggerEventId: session!.trigger_event_id,
+      holderId: first.holderId!,
+      generation: first.generation!,
+      expectedRedispatches: 0,
+      checkpointDurable: true,
+      resumeWithNotice: true,
+      preemptedPayload: { reason: "codex_lease_lost", resumeWithNotice: true },
+      failedPayload: { error: "must-not-fail" },
+    });
+    expect(settled.action).toBe("requeued");
+    if (settled.action !== "requeued") throw new Error("expected lease-loss requeue");
+    const [row] = await admin<
+      { turn_status: string; session_status: string; active_turn_id: string | null }[]
+    >`
+      select t.status as turn_status, s.status as session_status,
+             s.active_turn_id
+      from session_turns t join sessions s on s.id = t.session_id
+      where t.id = ${turnId}`;
+    expect(row).toEqual({ turn_status: "queued", session_status: "queued", active_turn_id: null });
+    expect(settled.events.map((event) => event.type)).toEqual([
+      "turn.preempted",
+      "session.status.changed",
+    ]);
+
+    const duplicate = await settleCodexCredentialLeaseLoss(dbB, {
+      accountId: ws!.accountId,
+      workspaceId: ws!.workspaceId,
+      sessionId: session!.session_id,
+      turnId,
+      originalTriggerEventId: session!.trigger_event_id,
+      holderId: first.holderId!,
+      generation: first.generation!,
+      expectedRedispatches: 0,
+      checkpointDurable: true,
+      resumeWithNotice: false,
+      preemptedPayload: { reason: "duplicate" },
+      failedPayload: { error: "duplicate" },
+    });
+    expect(duplicate.action).toBe("stale");
+    const [preemptions] = await admin<{ count: number }[]>`
+      select count(*)::int as count from session_events
+      where turn_id = ${turnId} and type = 'turn.preempted'`;
+    expect(preemptions!.count).toBe(1);
+  });
+
+  test("lease loss fails closed exactly once when its conversation checkpoint is not durable", async () => {
+    if (!available) return;
+    const [ws] = await freshAccount();
+    await connectCredential(ws!, "lease-loss-checkpoint-a");
+    const turnId = await seedTurn(ws!, 1);
+    const first = await acquire(dbA, ws!, turnId);
+    const [session] = await admin<{ session_id: string; trigger_event_id: string }[]>`
+      select session_id, trigger_event_id from session_turns where id = ${turnId}`;
+    await admin`delete from codex_credential_leases where turn_id = ${turnId}`;
+
+    const settled = await settleCodexCredentialLeaseLoss(dbA, {
+      accountId: ws!.accountId,
+      workspaceId: ws!.workspaceId,
+      sessionId: session!.session_id,
+      turnId,
+      originalTriggerEventId: session!.trigger_event_id,
+      holderId: first.holderId!,
+      generation: first.generation!,
+      expectedRedispatches: 0,
+      checkpointDurable: false,
+      resumeWithNotice: false,
+      preemptedPayload: { reason: "must-not-requeue" },
+      failedPayload: {
+        error: "checkpoint failed; replay refused",
+        code: "codex_lease_checkpoint_failed",
+      },
+    });
+    expect(settled.action).toBe("failed");
+    if (settled.action !== "failed") throw new Error("expected fail-closed settlement");
+    expect(settled.events.map((event) => event.type)).toEqual([
+      "turn.failed",
+      "session.status.changed",
+    ]);
+    const [row] = await admin<
+      { turn_status: string; session_status: string; active_turn_id: string | null }[]
+    >`
+      select t.status as turn_status, s.status as session_status,
+             s.active_turn_id
+      from session_turns t join sessions s on s.id = t.session_id
+      where t.id = ${turnId}`;
+    expect(row).toEqual({ turn_status: "failed", session_status: "failed", active_turn_id: null });
+
+    const duplicate = await settleCodexCredentialLeaseLoss(dbB, {
+      accountId: ws!.accountId,
+      workspaceId: ws!.workspaceId,
+      sessionId: session!.session_id,
+      turnId,
+      originalTriggerEventId: session!.trigger_event_id,
+      holderId: first.holderId!,
+      generation: first.generation!,
+      expectedRedispatches: 0,
+      checkpointDurable: false,
+      resumeWithNotice: false,
+      preemptedPayload: { reason: "duplicate" },
+      failedPayload: { error: "duplicate" },
+    });
+    expect(duplicate.action).toBe("stale");
+    const [failures] = await admin<{ count: number }[]>`
+      select count(*)::int as count from session_events
+      where turn_id = ${turnId} and type = 'turn.failed'`;
+    expect(failures!.count).toBe(1);
   });
 
   test("lease rows remain RLS-isolated across workspaces and managed accounts", async () => {

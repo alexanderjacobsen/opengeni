@@ -105,6 +105,19 @@ describe("OPE-21 definitive credential failure classification", () => {
     ).toBe(weeklyReset.getTime());
     expect(
       codexCredentialCooldownUntil(
+        { kind: "quota", cooldownSeconds: 31 },
+        {
+          primaryUsedPercent: 100,
+          primaryResetAt: fiveHourReset,
+          secondaryUsedPercent: 100,
+          secondaryResetAt: weeklyReset,
+        },
+        90,
+        now,
+      )?.getTime(),
+    ).toBe(weeklyReset.getTime());
+    expect(
+      codexCredentialCooldownUntil(
         { kind: "quota", cooldownSeconds: null },
         null,
         90,

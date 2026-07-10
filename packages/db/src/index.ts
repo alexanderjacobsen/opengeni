@@ -1999,6 +1999,17 @@ export async function completeFileUpload(
         if (!fileRow) {
           throw new Error(`File not found for upload: ${uploadId}`);
         }
+        // The API route normally handles this fast path, but the second half of
+        // a concurrent finalize race can enter this transaction after the first
+        // caller committed. Locking makes the retry return the original ready
+        // asset rather than writing a second transition or failing a client that
+        // never received the first response.
+        if (uploadRow.status === "completed" && fileRow.status === "ready") {
+          return mapFile(fileRow);
+        }
+        if (uploadRow.status !== "pending") {
+          throw new Error(`File upload is ${uploadRow.status}: ${uploadId}`);
+        }
         const now = new Date();
         const [updatedFile] = await tx
           .update(schema.files)

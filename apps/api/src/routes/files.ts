@@ -83,6 +83,13 @@ export function registerFileRoutes(app: Hono, deps: ApiRouteDeps): void {
     if (!upload) {
       throw new HTTPException(404, { message: "file upload not found" });
     }
+    // A client can lose the response after the server commits completion, or two
+    // tabs can race the same completion request. A ready object is durable and
+    // safe to return again; forcing a retry to fail here would strand the
+    // attachment reference even though its storage work succeeded.
+    if (upload.status === "completed" && upload.file.status === "ready") {
+      return c.json(CompleteFileUploadResponse.parse({ file: upload.file }));
+    }
     if (upload.status !== "pending") {
       throw new HTTPException(409, { message: `file upload is ${upload.status}` });
     }

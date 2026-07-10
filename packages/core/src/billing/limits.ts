@@ -235,10 +235,7 @@ function usesCreditLimits(deps: LimitDependencies): boolean {
 
 function isCostlyAction(action: LimitAction): boolean {
   return (
-    action === "agent_run:create" ||
-    action === "tokens:consume" ||
-    action === "file:upload" ||
-    action === "document:index"
+    action === "agent_run:create" || action === "tokens:consume" || action === "document:index"
   );
 }
 

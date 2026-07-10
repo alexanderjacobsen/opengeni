@@ -11,6 +11,7 @@ import { join } from "node:path";
 // ~5x faster wall time and bounded per-process RSS. Keep this list in sync
 // with the per-package `typecheck` scripts.
 const projects = [
+  "scripts/operator",
   "packages/contracts",
   "packages/agent-proto",
   "packages/codex",

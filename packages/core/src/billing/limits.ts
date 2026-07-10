@@ -12,6 +12,8 @@ import {
 import { HTTPException } from "hono/http-exception";
 import type { ApiRouteDeps } from "../dependencies";
 
+export type LimitDependencies = Pick<ApiRouteDeps, "db" | "settings">;
+
 export type LimitCheckInput = {
   accountId: string;
   workspaceId?: string;
@@ -26,7 +28,7 @@ export type LimitCheckInput = {
   model?: string | null;
 };
 
-export async function requireLimit(deps: ApiRouteDeps, input: LimitCheckInput): Promise<void> {
+export async function requireLimit(deps: LimitDependencies, input: LimitCheckInput): Promise<void> {
   const decision = await checkLimit(deps, input);
   if (decision.allowed) {
     return;
@@ -37,7 +39,7 @@ export async function requireLimit(deps: ApiRouteDeps, input: LimitCheckInput): 
 }
 
 export async function checkLimit(
-  deps: ApiRouteDeps,
+  deps: LimitDependencies,
   input: LimitCheckInput,
 ): Promise<LimitDecision> {
   // Resolve the canonical codex-billed predicate ONCE. Returns false for any
@@ -62,7 +64,7 @@ export async function checkLimit(
 }
 
 async function checkCreditBalance(
-  deps: ApiRouteDeps,
+  deps: LimitDependencies,
   input: LimitCheckInput,
   codexBilled: boolean,
 ): Promise<LimitDecision> {
@@ -80,7 +82,7 @@ async function checkCreditBalance(
 }
 
 async function checkStaticCaps(
-  deps: ApiRouteDeps,
+  deps: LimitDependencies,
   input: LimitCheckInput,
   codexBilled: boolean,
 ): Promise<LimitDecision> {
@@ -201,7 +203,7 @@ async function checkStaticCaps(
 }
 
 export async function recordWorkspaceUsage(
-  deps: ApiRouteDeps,
+  deps: LimitDependencies,
   input: {
     accountId: string;
     workspaceId: string;
@@ -227,7 +229,7 @@ export async function recordWorkspaceUsage(
   });
 }
 
-function usesCreditLimits(deps: ApiRouteDeps): boolean {
+function usesCreditLimits(deps: LimitDependencies): boolean {
   return deps.settings.billingMode === "stripe" || deps.settings.usageLimitsMode === "managed";
 }
 

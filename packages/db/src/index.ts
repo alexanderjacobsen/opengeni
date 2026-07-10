@@ -1834,6 +1834,11 @@ export type EnqueueSessionTurnInput = {
   reasoningEffort: ReasoningEffort;
   sandboxBackend: SandboxBackend;
   metadata: Record<string, unknown>;
+  // When true, this turn is placed AHEAD of any queued machine child-completion
+  // notification turns instead of at the back of the queue: a genuine human
+  // message must never wait behind a flood of "worker FAILED" notices. Only the
+  // human-message enqueue path sets it; machine wakes never do.
+  preemptChildNotifications?: boolean;
 };
 
 export type UpdateQueuedSessionTurnInput = Partial<{
@@ -13520,6 +13525,32 @@ export async function updateSessionTitle(
   });
 }
 
+export type ChildNotificationsMode = "digest" | "passive";
+
+/**
+ * Set how a manager session receives spawned-worker completion notifications:
+ * `digest` (default) enqueues a coalesced turn the manager processes; `passive`
+ * lands each completion as a timeline card only, never a queued turn / model run
+ * (the "don't bring spawned sessions back into my chat" opt-in). Merges the one
+ * key into `metadata` (jsonb `||`) so nothing else on the row is clobbered.
+ */
+export async function setSessionChildNotificationsMode(
+  db: Database,
+  workspaceId: string,
+  sessionId: string,
+  mode: ChildNotificationsMode,
+): Promise<void> {
+  await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    await scopedDb
+      .update(schema.sessions)
+      .set({
+        metadata: sql`${schema.sessions.metadata} || jsonb_build_object('childNotificationsMode', ${mode}::text)`,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(schema.sessions.workspaceId, workspaceId), eq(schema.sessions.id, sessionId)));
+  });
+}
+
 /**
  * Status transition helper. Idempotent: requesting the current status returns
  * `changed: false` so callers can skip emitting a duplicate event. `completed`
@@ -13944,11 +13975,7 @@ export async function enqueueSessionTurn(
     { accountId: input.accountId, workspaceId: input.workspaceId },
     async (scopedDb) =>
       await scopedDb.transaction(async (tx) => {
-        const position = await nextTurnPosition(
-          tx as unknown as Database,
-          input.workspaceId,
-          input.sessionId,
-        );
+        const position = await positionForEnqueue(tx as unknown as Database, input);
         const [row] = await tx
           .insert(schema.sessionTurns)
           .values({
@@ -14054,8 +14081,12 @@ export type WakeParentForChildCompletionInput = {
   // Stable per terminal episode, unique across episodes: the idempotency key
   // for exactly-once delivery (a unique session_events.client_event_id).
   clientEventId: string;
-  // System-authored wake text rendered to the manager as its next turn input.
-  text: string;
+  // This child's worker-specific summary lines (what happened + its goal), with
+  // NO trailing instruction. Stored per child so a coalesced digest turn can
+  // rebuild one numbered digest across all pending children.
+  childSummary: string;
+  // The single trailing "what to do next" instruction shared by the digest.
+  trailing: string;
   // Structured payload describing the completed child (id, status, goal).
   childCompletion: Record<string, unknown>;
   reasoningEffortFallback: ReasoningEffort;
@@ -14065,11 +14096,39 @@ export type WakeParentForChildCompletionResult =
   | { delivered: false; reason: "already_delivered" | "parent_cancelled" }
   | {
       delivered: true;
+      passive: false;
+      // True when this child folded into an already-queued child-notification
+      // digest turn (no new turn created); false when it opened a new one.
+      folded: boolean;
       turn: SessionTurn;
       triggerEvent: SessionEvent;
       events: SessionEvent[];
       temporalWorkflowId: string;
+    }
+  | {
+      // Suppression mode: the completion landed as a passive card event only (no
+      // turn, no model run). The caller publishes `events` but must NOT wake the
+      // workflow — there is nothing to claim.
+      delivered: true;
+      passive: true;
+      events: SessionEvent[];
+      temporalWorkflowId: string;
     };
+
+/**
+ * Render N pending child-completion summaries as ONE model-facing digest with a
+ * single shared trailing instruction. A single child reads exactly like the old
+ * per-child wake (no header/numbering); two or more are numbered under a count
+ * header. This is what lets one digest turn stand in for N enqueued turns.
+ */
+export function buildChildCompletionDigest(summaries: string[], trailing: string): string {
+  if (summaries.length <= 1) {
+    return [summaries[0] ?? "", "", trailing].join("\n");
+  }
+  const header = `${summaries.length} worker sessions you spawned reached a terminal state:`;
+  const numbered = summaries.map((summary, index) => `${index + 1}. ${summary}`).join("\n\n");
+  return [header, "", numbered, "", trailing].join("\n");
+}
 
 /**
  * Deliver a one-shot completion wake from a spawned worker into its parent
@@ -14130,6 +14189,54 @@ export async function wakeParentSessionForChildCompletion(
           return { delivered: false, reason: "already_delivered" as const };
         }
 
+        const passiveMode =
+          (parent.metadata as { childNotificationsMode?: unknown } | null)
+            ?.childNotificationsMode === "passive";
+        if (passiveMode) {
+          // SUPPRESSION OPT-IN: the parent asked not to have spawned-session
+          // completions come back as queued messages. Land exactly one passive
+          // card event — the worker-result card still renders in the timeline —
+          // but create NO turn and change NO status, so it never forces a model
+          // run. The caller publishes this event and does NOT wake the workflow.
+          const passiveText = buildChildCompletionDigest([input.childSummary], input.trailing);
+          const now = new Date();
+          const sequence = parent.lastSequence + 1;
+          const [passiveRow] = await tx
+            .insert(schema.sessionEvents)
+            .values({
+              accountId: parent.accountId,
+              workspaceId: parent.workspaceId,
+              sessionId: parent.id,
+              sequence,
+              type: "user.message",
+              payload: sanitizeEventPayload({
+                text: passiveText,
+                childCompletion: input.childCompletion,
+              }),
+              clientEventId: input.clientEventId,
+              turnId: null,
+              producerId: null,
+              producerSeq: null,
+              occurredAt: now,
+            })
+            .returning();
+          await tx
+            .update(schema.sessions)
+            .set({ lastSequence: sequence, updatedAt: now })
+            .where(
+              and(
+                eq(schema.sessions.workspaceId, input.workspaceId),
+                eq(schema.sessions.id, parent.id),
+              ),
+            );
+          return {
+            delivered: true as const,
+            passive: true as const,
+            events: passiveRow ? [mapEvent(passiveRow)] : [],
+            temporalWorkflowId: parent.temporalWorkflowId ?? `session-${parent.id}`,
+          };
+        }
+
         // Child completion is follow-up work for the manager turn that spawned
         // or supervised it. Preserve the newest model/reasoning policy that
         // actually reached agent execution. Falling straight back to
@@ -14150,10 +14257,16 @@ export async function wakeParentSessionForChildCompletion(
         const workflowId = parent.temporalWorkflowId ?? `session-${parent.id}`;
         let sequence = parent.lastSequence;
         const now = new Date();
-        const eventRows = [
+
+        // 1. Always record THIS child's own card event: a `user.message` carrying
+        // the childCompletion payload renders as one quiet worker-result card and
+        // holds the idempotency key. Its text is the single-child digest, so it
+        // doubles as the trigger text when it opens a fresh digest turn.
+        const cardText = buildChildCompletionDigest([input.childSummary], input.trailing);
+        const cardEventRows = [
           {
             type: "user.message",
-            payload: { text: input.text, childCompletion: input.childCompletion },
+            payload: { text: cardText, childCompletion: input.childCompletion },
             clientEventId: input.clientEventId,
           },
           ...(shouldQueue
@@ -14178,63 +14291,164 @@ export async function wakeParentSessionForChildCompletion(
           producerSeq: null,
           occurredAt: now,
         }));
-        const inserted = (await tx.insert(schema.sessionEvents).values(eventRows).returning()).map(
-          mapEvent,
-        );
-        const triggerEvent = inserted[0]!;
+        const inserted = (
+          await tx.insert(schema.sessionEvents).values(cardEventRows).returning()
+        ).map(mapEvent);
+        const cardEvent = inserted[0]!;
 
-        const position = await nextTurnPosition(
-          tx as unknown as Database,
-          input.workspaceId,
-          parent.id,
-        );
-        const [turnRow] = await tx
-          .insert(schema.sessionTurns)
-          .values({
-            accountId: parent.accountId,
-            workspaceId: parent.workspaceId,
-            sessionId: parent.id,
-            triggerEventId: triggerEvent.id,
-            temporalWorkflowId: workflowId,
-            status: "queued",
-            source: "user",
-            position,
-            prompt: input.text,
-            resources: [],
-            tools: parent.tools as ToolRef[],
-            model: continuationModel,
-            reasoningEffort: continuationReasoningEffort,
-            sandboxBackend: parent.sandboxBackend as SandboxBackend,
-            metadata: { childCompletion: input.childCompletion },
-          })
-          .returning();
-        if (!turnRow) {
-          throw new Error("Failed to enqueue parent wake turn");
-        }
-        const turn = mapSessionTurn(turnRow);
+        // 2. COALESCE: fold into an already-queued, not-yet-started child-
+        // notification turn instead of enqueuing a second one. `metadata ?
+        // 'childCompletion'` matches only machine child-wake turns (user/goal
+        // turns never carry it). FOR UPDATE locks the candidate so a concurrent
+        // claimNextQueuedTurn (FOR UPDATE SKIP LOCKED) cannot start it mid-fold:
+        // either we fold while it stays queued, or the claim already won and our
+        // `status = 'queued'` filter finds nothing and we open a fresh digest
+        // turn. This is what stops N terminating workers from injecting N model
+        // runs the user's stop button can never outrun.
+        const [digestTurnRow] = await tx
+          .select()
+          .from(schema.sessionTurns)
+          .where(
+            and(
+              eq(schema.sessionTurns.workspaceId, input.workspaceId),
+              eq(schema.sessionTurns.sessionId, parent.id),
+              eq(schema.sessionTurns.status, "queued"),
+              sql`jsonb_exists(${schema.sessionTurns.metadata}, 'childCompletion')`,
+            ),
+          )
+          .orderBy(desc(schema.sessionTurns.position))
+          .limit(1)
+          .for("update");
 
-        sequence += 1;
-        const [queuedEventRow] = await tx
-          .insert(schema.sessionEvents)
-          .values({
-            accountId: parent.accountId,
-            workspaceId: parent.workspaceId,
-            sessionId: parent.id,
-            sequence,
-            type: "turn.queued",
-            payload: sanitizeEventPayload({
+        let turn: SessionTurn;
+        let triggerEvent: SessionEvent;
+        let folded: boolean;
+        const events: SessionEvent[] = [...inserted];
+
+        if (digestTurnRow) {
+          // FOLD: append this child to the digest turn's trigger text. Only the
+          // new card event is published (its own result card); the trigger text
+          // update is silent — the model reads it fresh from the DB when the
+          // digest turn finally runs.
+          folded = true;
+          const priorSummaries = Array.isArray(
+            (digestTurnRow.metadata as { childSummaries?: unknown } | null)?.childSummaries,
+          )
+            ? (digestTurnRow.metadata as { childSummaries: string[] }).childSummaries
+            : [];
+          const summaries = [...priorSummaries, input.childSummary];
+          const digestText = buildChildCompletionDigest(summaries, input.trailing);
+          const [existingTrigger] = await tx
+            .select()
+            .from(schema.sessionEvents)
+            .where(
+              and(
+                eq(schema.sessionEvents.workspaceId, input.workspaceId),
+                eq(schema.sessionEvents.id, digestTurnRow.triggerEventId),
+              ),
+            )
+            .limit(1);
+          const mergedTriggerPayload = {
+            ...(existingTrigger?.payload && typeof existingTrigger.payload === "object"
+              ? (existingTrigger.payload as Record<string, unknown>)
+              : {}),
+            text: digestText,
+          };
+          const [updatedTriggerRow] = await tx
+            .update(schema.sessionEvents)
+            .set({ payload: sanitizeEventPayload(mergedTriggerPayload) })
+            .where(
+              and(
+                eq(schema.sessionEvents.workspaceId, input.workspaceId),
+                eq(schema.sessionEvents.id, digestTurnRow.triggerEventId),
+              ),
+            )
+            .returning();
+          triggerEvent = updatedTriggerRow ? mapEvent(updatedTriggerRow) : cardEvent;
+          const [updatedTurnRow] = await tx
+            .update(schema.sessionTurns)
+            .set({
+              prompt: digestText,
+              metadata: {
+                ...(digestTurnRow.metadata as Record<string, unknown> | null),
+                childSummaries: summaries,
+              },
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(schema.sessionTurns.workspaceId, input.workspaceId),
+                eq(schema.sessionTurns.id, digestTurnRow.id),
+              ),
+            )
+            .returning();
+          if (!updatedTurnRow) {
+            throw new Error("Failed to fold child completion into digest turn");
+          }
+          turn = mapSessionTurn(updatedTurnRow);
+        } else {
+          // CREATE: the card event IS the digest turn's trigger (its text is
+          // already the single-child digest). childSummaries seeds the fold.
+          folded = false;
+          triggerEvent = cardEvent;
+          const position = await nextTurnPosition(
+            tx as unknown as Database,
+            input.workspaceId,
+            parent.id,
+          );
+          const [turnRow] = await tx
+            .insert(schema.sessionTurns)
+            .values({
+              accountId: parent.accountId,
+              workspaceId: parent.workspaceId,
+              sessionId: parent.id,
+              triggerEventId: cardEvent.id,
+              temporalWorkflowId: workflowId,
+              status: "queued",
+              source: "user",
+              position,
+              prompt: cardText,
+              resources: [],
+              tools: parent.tools as ToolRef[],
+              model: continuationModel,
+              reasoningEffort: continuationReasoningEffort,
+              sandboxBackend: parent.sandboxBackend as SandboxBackend,
+              metadata: {
+                childCompletion: input.childCompletion,
+                childSummaries: [input.childSummary],
+              },
+            })
+            .returning();
+          if (!turnRow) {
+            throw new Error("Failed to enqueue parent wake turn");
+          }
+          turn = mapSessionTurn(turnRow);
+
+          sequence += 1;
+          const [queuedEventRow] = await tx
+            .insert(schema.sessionEvents)
+            .values({
+              accountId: parent.accountId,
+              workspaceId: parent.workspaceId,
+              sessionId: parent.id,
+              sequence,
+              type: "turn.queued",
+              payload: sanitizeEventPayload({
+                turnId: turn.id,
+                triggerEventId: cardEvent.id,
+                source: turn.source,
+              }),
+              clientEventId: null,
               turnId: turn.id,
-              triggerEventId: triggerEvent.id,
-              source: turn.source,
-            }),
-            clientEventId: null,
-            turnId: turn.id,
-            producerId: null,
-            producerSeq: null,
-            occurredAt: now,
-          })
-          .returning();
-        const events = [...inserted, ...(queuedEventRow ? [mapEvent(queuedEventRow)] : [])];
+              producerId: null,
+              producerSeq: null,
+              occurredAt: now,
+            })
+            .returning();
+          if (queuedEventRow) {
+            events.push(mapEvent(queuedEventRow));
+          }
+        }
 
         await tx
           .update(schema.sessions)
@@ -14252,6 +14466,8 @@ export async function wakeParentSessionForChildCompletion(
 
         return {
           delivered: true as const,
+          passive: false as const,
+          folded,
           turn,
           triggerEvent,
           events,
@@ -14550,6 +14766,41 @@ export async function cancelQueuedSessionTurn(
       throw new Error(`Queued session turn not found: ${turnId}`);
     }
     return mapSessionTurn(row);
+  });
+}
+
+/**
+ * Cancel every not-yet-started queued turn for a session in one UPDATE and
+ * return the cancelled ids (newest position first). This is the "stop means
+ * stop" drain: a user stop must clear the whole backlog, not just the active
+ * turn, so a flood of machine-injected turns (child-completion notifications)
+ * cannot outrun the human's stop button. Only `queued` rows are touched — the
+ * active `running`/`requires_action` turn is settled by `interruptActiveTurn`,
+ * and terminal turns are left as-is (idempotent: a retry drains nothing and
+ * returns []). No event is emitted here; the caller emits ONE summary event.
+ */
+export async function cancelQueuedSessionTurns(
+  db: Database,
+  workspaceId: string,
+  sessionId: string,
+): Promise<string[]> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const rows = await scopedDb
+      .update(schema.sessionTurns)
+      .set({
+        status: "cancelled",
+        finishedAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(schema.sessionTurns.workspaceId, workspaceId),
+          eq(schema.sessionTurns.sessionId, sessionId),
+          eq(schema.sessionTurns.status, "queued"),
+        ),
+      )
+      .returning({ id: schema.sessionTurns.id, position: schema.sessionTurns.position });
+    return rows.sort((a, b) => b.position - a.position).map((row) => row.id);
   });
 }
 
@@ -15011,6 +15262,48 @@ async function latestStartedSessionTurnRow(
     .orderBy(desc(schema.sessionEvents.sequence))
     .limit(1);
   return row?.turn ?? null;
+}
+
+/**
+ * The queue position for a newly enqueued turn. Default: the back of the queue
+ * (nextTurnPosition). With `preemptChildNotifications`, a genuine human message
+ * jumps AHEAD of any queued machine child-completion notification turns — it
+ * takes the earliest such turn's slot and shifts that whole machine band back
+ * by one, so it claims strictly before them while staying behind the running
+ * turn and any earlier human turns. This is what stops a person's message from
+ * being buried behind a flood of "worker FAILED" notices (and cancelled by its
+ * own author's stop-spree before it ever runs).
+ */
+async function positionForEnqueue(db: Database, input: EnqueueSessionTurnInput): Promise<number> {
+  if (!input.preemptChildNotifications) {
+    return await nextTurnPosition(db, input.workspaceId, input.sessionId);
+  }
+  const [{ minPos } = { minPos: null }] = await db
+    .select({ minPos: sql<number | null>`min(${schema.sessionTurns.position})` })
+    .from(schema.sessionTurns)
+    .where(
+      and(
+        eq(schema.sessionTurns.workspaceId, input.workspaceId),
+        eq(schema.sessionTurns.sessionId, input.sessionId),
+        eq(schema.sessionTurns.status, "queued"),
+        sql`jsonb_exists(${schema.sessionTurns.metadata}, 'childCompletion')`,
+      ),
+    );
+  if (minPos === null || minPos === undefined) {
+    return await nextTurnPosition(db, input.workspaceId, input.sessionId);
+  }
+  await db
+    .update(schema.sessionTurns)
+    .set({ position: sql`${schema.sessionTurns.position} + 1`, updatedAt: new Date() })
+    .where(
+      and(
+        eq(schema.sessionTurns.workspaceId, input.workspaceId),
+        eq(schema.sessionTurns.sessionId, input.sessionId),
+        eq(schema.sessionTurns.status, "queued"),
+        gte(schema.sessionTurns.position, minPos),
+      ),
+    );
+  return Number(minPos);
 }
 
 async function nextTurnPosition(

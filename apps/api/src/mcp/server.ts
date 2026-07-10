@@ -17,6 +17,7 @@ import {
   encryptVariableSetValue,
   getSession,
   getSessionGoal,
+  getSessionTurn,
   getVariableSet,
   getVariableSetByName,
   listGitHubInstallationIdsForWorkspace,
@@ -36,6 +37,7 @@ import {
   requireSession,
   saveWorkspaceMemory,
   searchWorkspaceMemories,
+  setSessionChildNotificationsMode,
   setSessionGoalStatus,
   setVariableSetVariable,
   updateScheduledTask,
@@ -144,6 +146,18 @@ export function buildOpenGeniMcpServer(
       async ({ title }) => {
         const result = await updateSessionTitle(deps, grant.workspaceId, sessionId, title, "agent");
         return json({ ok: true, updated: result.updated, title: result.title ?? title });
+      },
+    );
+    server.registerTool(
+      "set_child_notifications_mode",
+      {
+        description:
+          "Control how workers you spawn report back when they finish. 'digest' (default): their completions arrive as a coalesced turn you process. 'passive': their completions appear only as quiet cards in your timeline and never queue a turn or a model run — use this when spawned-session completions are flooding your chat and you want them out of the way.",
+        inputSchema: { mode: z4.enum(["digest", "passive"]) },
+      },
+      async ({ mode }) => {
+        await setSessionChildNotificationsMode(deps.db, grant.workspaceId, sessionId, mode);
+        return json({ ok: true, mode });
       },
     );
   }
@@ -614,6 +628,62 @@ function registerToolspaceProxyTools(server: McpServer, surface: ToolspaceMcpSur
   }
 }
 
+/**
+ * A turn injected by the machine to notify a manager that a spawned worker
+ * reached a terminal state — either a coalesced child-notification digest turn
+ * (source 'child_notification') or a legacy per-child wake (source 'user' with
+ * a `childCompletion` marker). NOT a genuine human message.
+ */
+export function isMachineChildNotificationTurn(turn: {
+  source: string;
+  metadata: Record<string, unknown> | null;
+}): boolean {
+  if (turn.source === "child_notification") {
+    return true;
+  }
+  return Boolean(turn.metadata && "childCompletion" in turn.metadata);
+}
+
+/**
+ * Sacred user pause: a goal a human stopped (pausedReason 'user_interrupt') must
+ * never be resurrected by a MACHINE turn. Child-completion notification turns
+ * carry a "resume it now" nudge; without this guard the agent processing one of
+ * them would call goal_set and re-arm the exact autonomous loop the user just
+ * stopped (the runaway that made "stop" feel broken). A genuine user message
+ * still redirects freely (it is not a child-notification turn), and the
+ * human-driven API resume path (PATCH /goal) is unaffected.
+ *
+ * Classification is by CALLER IDENTITY — `callerTurnId` is the turn that minted
+ * this MCP token (signed into it by the worker at turn setup). We deliberately
+ * do NOT read the session's live `active_turn_id`: that pointer can flip to a
+ * different turn between reads (a machine turn ends and a human turn becomes
+ * active mid-check), which would misclassify the caller and, worst case, refuse
+ * a legitimate human `goal_set` — inverting the guard against the very human
+ * power it must preserve. A caller turn's source/metadata are immutable, so this
+ * read is race-free. No caller identity ⇒ fail OPEN (only a positively
+ * identified machine child-notification caller is refused).
+ */
+export async function assertGoalReactivationAllowed(
+  deps: ApiRouteDeps,
+  workspaceId: string,
+  sessionId: string,
+  callerTurnId: string | null,
+): Promise<void> {
+  if (!callerTurnId) {
+    return;
+  }
+  const goal = await getSessionGoal(deps.db, workspaceId, sessionId);
+  if (!goal || goal.status !== "paused" || goal.pausedReason !== "user_interrupt") {
+    return;
+  }
+  const turn = await getSessionTurn(deps.db, workspaceId, callerTurnId);
+  if (turn && isMachineChildNotificationTurn(turn)) {
+    throw new Error(
+      "This session was paused by the user (stop). A worker-completion turn cannot resume or replace the goal — only the user can. Report your findings for the user and stop; do not call goal_set.",
+    );
+  }
+}
+
 function registerGoalTools(
   server: McpServer,
   deps: ApiRouteDeps,
@@ -634,6 +704,11 @@ function registerGoalTools(
     },
     async ({ text, successCriteria, maxAutoContinuations }) => {
       await requireSession(deps.db, grant.workspaceId, sessionId);
+      const callerTurnId =
+        typeof grant.metadata?.["turnId"] === "string"
+          ? (grant.metadata["turnId"] as string)
+          : null;
+      await assertGoalReactivationAllowed(deps, grant.workspaceId, sessionId, callerTurnId);
       const { goal, replaced } = await upsertSessionGoal(deps.db, {
         accountId: grant.accountId,
         workspaceId: grant.workspaceId,

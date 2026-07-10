@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { acquireSharedTestDatabase, type SharedTestDatabase } from "@opengeni/testing";
 import postgres from "postgres";
 import {
+  clearEnrollmentWentOffline,
   createDb,
   createEnrollment,
   createSandbox,
@@ -18,7 +19,9 @@ import {
   readMachineMetricsLatestForWorkspace,
   readMachineMetricsSeries,
   revokeEnrollment,
+  sessionsWithActiveOpOnEnrollment,
   setActiveSandbox,
+  setEnrollmentWentOffline,
   touchEnrollmentLastSeen,
   upsertMachineMetricsLatest,
   type Database,
@@ -166,6 +169,147 @@ describe("0024 sandboxes / enrollments / metrics DAOs + active-sandbox pointer",
     expect(reactivated.id).toBe(created.id);
     expect(reactivated.status).toBe("active");
     expect(reactivated.revokedAt).toBeNull();
+  }, 60_000);
+
+  test("clean going-offline marker: set → clear-on-heartbeat and clear-on-Hello (change-guarded)", async () => {
+    if (!available) return;
+    const { accountId, workspaceId } = await freshWorkspace();
+    const created = await createEnrollment(db, {
+      accountId,
+      workspaceId,
+      pubkey: "ed25519:GOODBYE",
+      hasDisplay: true,
+    });
+    // A machine reporting a heartbeat first (fresh last_seen, no marker).
+    await touchEnrollmentLastSeen(db, { accountId, workspaceId, enrollmentId: created.id });
+    const online = await getEnrollment(db, workspaceId, created.id);
+    expect(online?.wentOfflineAt).toBeNull();
+    expect(online?.lastSeenAt).not.toBeNull();
+
+    // GoingOffline stamps the marker (WHEN + typed reason) WITHOUT touching last_seen.
+    await setEnrollmentWentOffline(db, {
+      accountId,
+      workspaceId,
+      enrollmentId: created.id,
+      reason: "GOING_OFFLINE_REASON_HOST_SHUTDOWN",
+    });
+    const goodbye = await getEnrollment(db, workspaceId, created.id);
+    expect(goodbye?.wentOfflineAt).not.toBeNull();
+    expect(goodbye?.wentOfflineReason).toBe("GOING_OFFLINE_REASON_HOST_SHUTDOWN");
+    // last_seen is NOT bumped by the goodbye (a shutdown must not look more alive).
+    expect(goodbye?.lastSeenAt).toBe(online?.lastSeenAt);
+
+    // A fresh heartbeat clears the marker in the SAME update that bumps last_seen.
+    await touchEnrollmentLastSeen(db, { accountId, workspaceId, enrollmentId: created.id });
+    const revived = await getEnrollment(db, workspaceId, created.id);
+    expect(revived?.wentOfflineAt).toBeNull();
+    expect(revived?.wentOfflineReason).toBeNull();
+
+    // clearEnrollmentWentOffline (the Hello path): reports cleared only when a
+    // marker was present, and is a no-op (cleared:false) on a steady-state clear.
+    await setEnrollmentWentOffline(db, {
+      accountId,
+      workspaceId,
+      enrollmentId: created.id,
+      reason: "GOING_OFFLINE_REASON_USER_STOP",
+    });
+    const firstClear = await clearEnrollmentWentOffline(db, {
+      accountId,
+      workspaceId,
+      enrollmentId: created.id,
+    });
+    expect(firstClear.cleared).toBe(true);
+    expect((await getEnrollment(db, workspaceId, created.id))?.wentOfflineAt).toBeNull();
+    const secondClear = await clearEnrollmentWentOffline(db, {
+      accountId,
+      workspaceId,
+      enrollmentId: created.id,
+    });
+    expect(secondClear.cleared).toBe(false); // nothing to clear → no churn
+  }, 60_000);
+
+  test("sessionsWithActiveOpOnEnrollment: only active-sandbox + running-turn sessions for enrollment X", async () => {
+    if (!available) return;
+    const { accountId, workspaceId } = await freshWorkspace();
+    const enrollX = await createEnrollment(db, {
+      accountId,
+      workspaceId,
+      pubkey: "ed25519:FANX",
+      hasDisplay: true,
+    });
+    const enrollY = await createEnrollment(db, {
+      accountId,
+      workspaceId,
+      pubkey: "ed25519:FANY",
+      hasDisplay: true,
+    });
+    const sandX = await createSandbox(db, {
+      accountId,
+      workspaceId,
+      kind: "selfhosted",
+      name: "machine-x",
+      enrollmentId: enrollX.id,
+    });
+    const sandY = await createSandbox(db, {
+      accountId,
+      workspaceId,
+      kind: "selfhosted",
+      name: "machine-y",
+      enrollmentId: enrollY.id,
+    });
+    const sandModal = await createSandbox(db, {
+      accountId,
+      workspaceId,
+      kind: "modal",
+      name: "group-box",
+    });
+
+    const mkSession = async () =>
+      await createSession(db, {
+        accountId,
+        workspaceId,
+        initialMessage: "hi",
+        resources: [],
+        metadata: {},
+        model: "gpt",
+        sandboxBackend: "modal",
+      });
+    const point = async (sessionId: string, sandboxId: string) =>
+      await setActiveSandbox(db, {
+        accountId,
+        workspaceId,
+        sessionId,
+        targetSandboxId: sandboxId,
+        expectedEpoch: 0,
+      });
+    const setTurn = async (sessionId: string, turnId: string) =>
+      await admin`update sessions set active_turn_id = ${turnId} where id = ${sessionId}`;
+
+    // INCLUDED: pointer → machine X's sandbox + a running turn.
+    const included = await mkSession();
+    await point(included.id, sandX.id);
+    const includedTurn = "cccccccc-0000-4000-8000-000000000001";
+    await setTurn(included.id, includedTurn);
+
+    // EXCLUDED: pointer → machine X but NO running turn (active_turn_id null).
+    const noTurn = await mkSession();
+    await point(noTurn.id, sandX.id);
+
+    // EXCLUDED: pointer → machine Y's sandbox (a different enrollment) + a turn.
+    const otherEnrollment = await mkSession();
+    await point(otherEnrollment.id, sandY.id);
+    await setTurn(otherEnrollment.id, "cccccccc-0000-4000-8000-000000000002");
+
+    // EXCLUDED: pointer → the Modal group box (kind != selfhosted) + a turn.
+    const modal = await mkSession();
+    await point(modal.id, sandModal.id);
+    await setTurn(modal.id, "cccccccc-0000-4000-8000-000000000003");
+
+    const rows = await sessionsWithActiveOpOnEnrollment(db, {
+      workspaceId,
+      enrollmentId: enrollX.id,
+    });
+    expect(rows).toEqual([{ sessionId: included.id, activeTurnId: includedTurn }]);
   }, 60_000);
 
   test("sandbox create: selfhosted requires enrollment, modal forbids it; get + list", async () => {

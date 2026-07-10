@@ -6,7 +6,13 @@ import {
   acquireSharedTestDatabase,
   type SharedTestDatabase,
 } from "@opengeni/testing";
-import { AgentEvent, ControlRequest, ControlResponse } from "@opengeni/agent-proto";
+import {
+  AgentEvent,
+  ControlRequest,
+  ControlResponse,
+  GoingOfflineReason,
+  Hello,
+} from "@opengeni/agent-proto";
 import { signDelegatedAccessToken, type Permission } from "@opengeni/contracts";
 import {
   createDb,
@@ -15,13 +21,18 @@ import {
   createSession,
   listSandboxes,
   revokeEnrollment,
+  setActiveSandbox,
   type Database,
   type DbClient,
 } from "@opengeni/db";
 import { subjectFor } from "@opengeni/runtime";
 import { createApp } from "../src/app";
 import type { AppDependencies, SessionWorkflowClient } from "@opengeni/core";
-import { startMetricsIngestion } from "../src/sandbox/metrics-ingestion";
+import {
+  handleAgentEventPayload,
+  handleHelloPayload,
+  startMetricsIngestion,
+} from "../src/sandbox/metrics-ingestion";
 
 // Track started ingestion consumers so afterEach can unsubscribe them (each test
 // uses its own bus, but cleaning up keeps subscriptions from leaking).
@@ -156,6 +167,21 @@ async function emitHeartbeat(
         },
       },
     },
+  }).finish();
+  await bus.emitAgentEvent(`agent.${workspaceId}.${agentId}.events`, event);
+}
+
+/** Emit a clean GoingOffline AgentEvent, driving the ingestion consumer to stamp
+ *  the enrollment's clean going-offline marker. */
+async function emitGoingOffline(
+  bus: MemoryEventBus,
+  workspaceId: string,
+  agentId: string,
+  reason: GoingOfflineReason,
+): Promise<void> {
+  const event = AgentEvent.encode({
+    agentId,
+    event: { $case: "goingOffline", goingOffline: { reason } },
   }).finish();
   await bus.emitAgentEvent(`agent.${workspaceId}.${agentId}.events`, event);
 }
@@ -340,6 +366,43 @@ describe("M10 GET /machines — dashboard list + states + metrics", () => {
     expect(sessBody.machines.length).toBe(2);
   }, 90_000);
 
+  test("clean going-offline round-trip: online → GoingOffline reads OFFLINE immediately (probe still responds) → heartbeat reads ONLINE again", async () => {
+    if (!available) return;
+    // seed() registers a ping responder (online) + a fresh last_seen, so WITHOUT a
+    // marker the machine reads online. This proves the marker takes precedence over
+    // BOTH a still-responding probe and a still-fresh last_seen — the #348 fix —
+    // end-to-end through the real ingestion consumer + derivation + endpoint.
+    const { accountId, workspaceId, enrollment, bus } = await seed();
+    const app = appFor(bus);
+    const auth = `Bearer ${await bearer(accountId, workspaceId, ["enrollments:read"])}`;
+    const stateNow = async (): Promise<string> => {
+      const body = (await (
+        await app.request(`/v1/workspaces/${workspaceId}/machines`, {
+          headers: { authorization: auth },
+        })
+      ).json()) as { machines: Array<{ state: string }> };
+      return body.machines[0]!.state;
+    };
+
+    // 1. Online: probe responds + last_seen fresh.
+    await emitHeartbeat(bus, workspaceId, enrollment.id, 10);
+    expect(await stateNow()).toBe("online");
+
+    // 2. Clean GoingOffline → OFFLINE immediately, though the probe STILL responds
+    //    and last_seen is still fresh (the marker wins).
+    await emitGoingOffline(
+      bus,
+      workspaceId,
+      enrollment.id,
+      GoingOfflineReason.GOING_OFFLINE_REASON_HOST_SHUTDOWN,
+    );
+    expect(await stateNow()).toBe("offline");
+
+    // 3. A fresh heartbeat clears the marker → ONLINE again (round-trip complete).
+    await emitHeartbeat(bus, workspaceId, enrollment.id, 12);
+    expect(await stateNow()).toBe("online");
+  }, 90_000);
+
   test("state matrix: displayed-but-unconsented is ONLINE (view/control decoupled); offline when no responder", async () => {
     if (!available) return;
     // A displayed machine whose SCREEN CONTROL isn't consented is still ONLINE:
@@ -508,5 +571,220 @@ describe("M10 flag gate + authz", () => {
 
     // No bearer at all → 401.
     expect((await onApp.request(`/v1/workspaces/${workspaceId}/machines`)).status).toBe(401);
+  }, 90_000);
+});
+
+describe("machine.link.* fan-out — link-plane session events on going-offline / reconnect", () => {
+  // Read the machine-link events a session accumulated (ordered), each with the
+  // turn they were stamped on.
+  async function machineLinkEvents(
+    sessionId: string,
+  ): Promise<Array<{ type: string; turn_id: string | null }>> {
+    return await admin<{ type: string; turn_id: string | null }[]>`
+      select type, turn_id from session_events
+      where session_id = ${sessionId}
+        and (type like 'machine.link.%' or type = 'machine.runner.restarted')
+      order by sequence`;
+  }
+
+  // Point a seeded session at its machine's sandbox with a running turn, so the
+  // fan-out query counts it as "a session with an active op on the machine".
+  async function makeActiveOp(
+    accountId: string,
+    workspaceId: string,
+    sessionId: string,
+    sandboxId: string,
+    turnId: string,
+  ): Promise<void> {
+    await setActiveSandbox(db, {
+      accountId,
+      workspaceId,
+      sessionId,
+      targetSandboxId: sandboxId,
+      expectedEpoch: 0,
+    });
+    await admin`update sessions set active_turn_id = ${turnId} where id = ${sessionId}`;
+  }
+
+  function helloBytes(agentId: string, workspaceId: string): Uint8Array {
+    return Hello.encode(
+      Hello.fromPartial({ agentId, workspaceId, capabilities: { desktop: true } }),
+    ).finish();
+  }
+
+  test("a self-update GoingOffline fans out link.lost + runner.restarted to the active-op session, on its running turn", async () => {
+    if (!available) return;
+    const { accountId, workspaceId, session, enrollment, sandbox, bus } = await seed();
+    const turnId = "dddddddd-0000-4000-8000-000000000001";
+    await makeActiveOp(accountId, workspaceId, session.id, sandbox.id, turnId);
+    appFor(bus); // starts the metrics-ingestion consumer
+
+    await emitGoingOffline(
+      bus,
+      workspaceId,
+      enrollment.id,
+      GoingOfflineReason.GOING_OFFLINE_REASON_UPDATE,
+    );
+
+    const events = await machineLinkEvents(session.id);
+    expect(events.map((e) => e.type)).toEqual(["machine.link.lost", "machine.runner.restarted"]);
+    // Both are stamped on the session's OWN running turn.
+    expect(events.every((e) => e.turn_id === turnId)).toBe(true);
+  }, 90_000);
+
+  test("a plain (non-update) GoingOffline fans out link.lost ONLY (no runner.restarted)", async () => {
+    if (!available) return;
+    const { accountId, workspaceId, session, enrollment, sandbox, bus } = await seed();
+    const turnId = "dddddddd-0000-4000-8000-000000000002";
+    await makeActiveOp(accountId, workspaceId, session.id, sandbox.id, turnId);
+    appFor(bus);
+
+    await emitGoingOffline(
+      bus,
+      workspaceId,
+      enrollment.id,
+      GoingOfflineReason.GOING_OFFLINE_REASON_HOST_SHUTDOWN,
+    );
+
+    expect((await machineLinkEvents(session.id)).map((e) => e.type)).toEqual(["machine.link.lost"]);
+  }, 90_000);
+
+  test("a reconnect Hello after a lost fans out link.restored; a second Hello (marker already cleared) emits nothing more", async () => {
+    if (!available) return;
+    const { accountId, workspaceId, session, enrollment, sandbox, bus } = await seed();
+    const turnId = "dddddddd-0000-4000-8000-000000000003";
+    await makeActiveOp(accountId, workspaceId, session.id, sandbox.id, turnId);
+    appFor(bus);
+
+    // Lose the link first (sets the marker + emits link.lost).
+    await emitGoingOffline(
+      bus,
+      workspaceId,
+      enrollment.id,
+      GoingOfflineReason.GOING_OFFLINE_REASON_USER_STOP,
+    );
+
+    // Reconnect: the Hello clears the marker → emits link.restored on the turn.
+    await handleHelloPayload(
+      db,
+      undefined,
+      helloBytes(enrollment.id, workspaceId),
+      `agent.${workspaceId}.${enrollment.id}.hello`,
+      bus,
+    );
+    const afterFirst = await machineLinkEvents(session.id);
+    const restored = afterFirst.filter((e) => e.type === "machine.link.restored");
+    expect(restored).toHaveLength(1);
+    expect(restored[0]!.turn_id).toBe(turnId);
+
+    // A second Hello finds no marker to clear → no further restored (a restored only
+    // ever pairs a prior lost).
+    await handleHelloPayload(
+      db,
+      undefined,
+      helloBytes(enrollment.id, workspaceId),
+      `agent.${workspaceId}.${enrollment.id}.hello`,
+      bus,
+    );
+    const afterSecond = await machineLinkEvents(session.id);
+    expect(afterSecond.filter((e) => e.type === "machine.link.restored")).toHaveLength(1);
+  }, 90_000);
+
+  test("no session with an active op on the machine ⇒ a GoingOffline emits NO session events (idle blip stays silent)", async () => {
+    if (!available) return;
+    // seed() creates a session but does NOT point it at the machine / give it a
+    // running turn, so the fan-out query matches nothing.
+    const { workspaceId, session, enrollment, bus } = await seed();
+    appFor(bus);
+
+    await emitGoingOffline(
+      bus,
+      workspaceId,
+      enrollment.id,
+      GoingOfflineReason.GOING_OFFLINE_REASON_UPDATE,
+    );
+
+    expect(await machineLinkEvents(session.id)).toEqual([]);
+    // And nothing leaked onto any other session in the workspace either.
+    const [{ count }] = await admin<{ count: number }[]>`
+      select count(*)::int as count from session_events
+      where workspace_id = ${workspaceId}
+        and (type like 'machine.link.%' or type = 'machine.runner.restarted')`;
+    expect(count).toBe(0);
+  }, 90_000);
+
+  test("a per-session emission failure is ISOLATED: the first session's append rejecting still delivers to the rest + logs the failure", async () => {
+    if (!available) return;
+    const { accountId, workspaceId, enrollment, sandbox, bus } = await seed();
+
+    // Two sessions with an active op on the machine. sessionA is created first, so
+    // the fan-out's stable order (oldest first) processes it FIRST.
+    const mk = async (msg: string) =>
+      await createSession(db, {
+        accountId,
+        workspaceId,
+        initialMessage: msg,
+        resources: [],
+        metadata: {},
+        model: "gpt-test",
+        sandboxBackend: "modal",
+      });
+    const sessionA = await mk("a");
+    const sessionB = await mk("b");
+    await makeActiveOp(
+      accountId,
+      workspaceId,
+      sessionA.id,
+      sandbox.id,
+      "eeeeeeee-0000-4000-8000-000000000001",
+    );
+    await makeActiveOp(
+      accountId,
+      workspaceId,
+      sessionB.id,
+      sandbox.id,
+      "eeeeeeee-0000-4000-8000-000000000002",
+    );
+
+    // Rig sessionA's NEXT append to REJECT: pre-occupy its next sequence slot so the
+    // unique (workspace, session, sequence) index throws on sessionA's fan-out
+    // append — a faithful stand-in for the session-specific / racing-writer failure
+    // the isolation must survive. sessionB is untouched.
+    const [{ last_sequence: lastSeqA }] = await admin<{ last_sequence: number }[]>`
+      select last_sequence from sessions where id = ${sessionA.id}`;
+    await admin`
+      insert into session_events (account_id, workspace_id, session_id, sequence, type)
+      values (${accountId}, ${workspaceId}, ${sessionA.id}, ${lastSeqA + 1}, 'user.message')`;
+
+    // Capture warns; call the handler directly so the per-session log is observable.
+    const warns: Array<{ message: string; meta?: Record<string, unknown> }> = [];
+    const observability = {
+      incrementCounter: () => {},
+      warn: (message: string, meta?: Record<string, unknown>) => warns.push({ message, meta }),
+    } as unknown as Parameters<typeof handleAgentEventPayload>[1];
+    const payload = AgentEvent.encode({
+      agentId: enrollment.id,
+      event: {
+        $case: "goingOffline",
+        goingOffline: { reason: GoingOfflineReason.GOING_OFFLINE_REASON_UPDATE },
+      },
+    }).finish();
+    await handleAgentEventPayload(
+      db,
+      observability,
+      payload,
+      `agent.${workspaceId}.${enrollment.id}.events`,
+      bus,
+    );
+
+    // sessionA's append rejected → it got NO machine-link events...
+    expect(await machineLinkEvents(sessionA.id)).toEqual([]);
+    // ...but sessionB, processed AFTER the failure, still received its full set.
+    expect((await machineLinkEvents(sessionB.id)).map((e) => e.type)).toEqual([
+      "machine.link.lost",
+      "machine.runner.restarted",
+    ]);
+    // ...and the failure is visible in the logs, naming the failed sessionId.
+    expect(warns.some((w) => w.meta?.sessionId === sessionA.id)).toBe(true);
   }, 90_000);
 });

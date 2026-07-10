@@ -159,16 +159,29 @@ export function buildCodexTokenResolver(
     }
     const promise = deps
       .withRefreshLock(db, workspaceId, credentialId, async (lockedDb) => {
-        const current = await deps.loadCredential(lockedDb, settings, workspaceId, credentialId);
-        if (!current || current.status !== "active") {
-          throw new CodexReloginRequired(
-            "Codex credential became unavailable while waiting to refresh.",
-          );
+        try {
+          const current = await deps.loadCredential(lockedDb, settings, workspaceId, credentialId);
+          if (!current || current.status !== "active") {
+            throw new CodexReloginRequired(
+              "Codex credential became unavailable while waiting to refresh.",
+            );
+          }
+          if (current.version !== cred.version) {
+            return { ok: true as const, value: snapshot(current) };
+          }
+          return { ok: true as const, value: await performRefresh(lockedDb, current) };
+        } catch (error) {
+          // withCodexCredentialRefreshLock uses an advisory TRANSACTION lock.
+          // performRefresh may persist `needs_relogin` before surfacing a
+          // permanent OAuth failure; throwing from this callback would roll that
+          // status write back with the outer transaction. Return the failure so
+          // the transaction commits, then rethrow after the lock is released.
+          return { ok: false as const, error };
         }
-        if (current.version !== cred.version) {
-          return snapshot(current);
-        }
-        return await performRefresh(lockedDb, current);
+      })
+      .then((outcome) => {
+        if (!outcome.ok) throw outcome.error;
+        return outcome.value;
       })
       .finally(() => {
         if (inflight.get(key) === promise) {

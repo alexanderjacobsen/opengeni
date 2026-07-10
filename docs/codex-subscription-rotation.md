@@ -106,9 +106,13 @@ existing `(id, version)` CAS remains the stale-family write fence.
 
 Migration `0049_codex_credential_leases.sql` is additive. It creates the
 workspace-local lease table and fairness columns, strengthens workspace reference
-integrity, and changes the **database default for newly created rotation-setting
-rows** to enabled. It does not update existing rows: an existing false value is
-preserved as operator/user intent.
+integrity, and adds a separate `lease_rotation_enabled` rollout bit. Both that bit
+and the legacy `rotation_enabled` column keep a database default of `false`, so a
+schema-first migration or an older binary can never opt a workspace into mixed-mode
+rotation. After the deployment flag is enabled, migration-compatible API/worker
+code explicitly sets the new bit only when it creates a rotation-setting row;
+existing rows are not updated, preserving an existing false value as operator/user
+intent.
 
 Safe rollout order:
 

@@ -1,0 +1,297 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { acquireBlankTestDatabase, type BlankTestDatabase } from "@opengeni/testing";
+import { readdir, readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import postgres from "postgres";
+import { selectCodexCredentialLeaseForTurn } from "../../../apps/worker/src/activities/codex-rotation";
+import { acquireCodexCredentialLease, createDb } from "../src/index";
+import { migrate } from "../src/migrate";
+
+const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), "../drizzle");
+
+async function applyFile(sql: postgres.Sql, file: string): Promise<void> {
+  await sql.unsafe(await readFile(join(migrationsDir, file), "utf8"));
+}
+
+let available = true;
+let blank: BlankTestDatabase | null = null;
+let databaseUrl = "";
+
+beforeAll(async () => {
+  blank = await acquireBlankTestDatabase("migration-0049");
+  if (!blank) {
+    available = false;
+    console.warn("[migration-0049] postgres unavailable, skipping");
+    return;
+  }
+  databaseUrl = blank.databaseUrl;
+}, 180_000);
+
+afterAll(async () => {
+  await blank?.release();
+});
+
+describe("migration 0049 (Codex credential leases)", () => {
+  test("keeps old workers compatible through schema-first rollout, cutover, and feature-off rollback", async () => {
+    if (!available) return;
+
+    const admin = postgres(databaseUrl, { max: 1 });
+    let app: ReturnType<typeof createDb> | null = null;
+    try {
+      const files = (await readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).sort();
+      expect(files.includes("0049_codex_credential_leases.sql")).toBe(true);
+      const pre0049 = files.filter((file) => file < "0049_");
+
+      await admin`select pg_advisory_lock(727458)`;
+      await admin.unsafe(
+        `CREATE TABLE IF NOT EXISTS "schema_migrations" ("name" text PRIMARY KEY, "applied_at" timestamptz NOT NULL DEFAULT now())`,
+      );
+      for (const file of pre0049) {
+        await applyFile(admin, file);
+        await admin`insert into schema_migrations (name) values (${file}) on conflict do nothing`;
+      }
+
+      const accountId = (
+        await admin<
+          { id: string }[]
+        >`insert into managed_accounts (name) values ('migration-0049-account') returning id`
+      )[0]!.id;
+      const workspaceId = (
+        await admin<
+          { id: string }[]
+        >`insert into workspaces (account_id, name) values (${accountId}, 'legacy-workspace') returning id`
+      )[0]!.id;
+      const credentials = await admin<{ id: string }[]>`
+        insert into codex_subscription_credentials (
+          account_id, workspace_id, credential_encrypted, chatgpt_account_id,
+          plan_type, status
+        ) values
+          (${accountId}, ${workspaceId}, 'legacy-a', 'external-a', 'pro', 'active'),
+          (${accountId}, ${workspaceId}, 'legacy-b', 'external-b', 'pro', 'active')
+        returning id`;
+      const credentialA = credentials[0]!.id;
+      const credentialB = credentials[1]!.id;
+      await admin`
+        insert into codex_rotation_settings (
+          account_id, workspace_id, active_credential_id,
+          rotation_enabled, rotation_strategy
+        ) values (${accountId}, ${workspaceId}, ${credentialA}, false, 'most_remaining')`;
+
+      const sessionId = crypto.randomUUID();
+      const turnId = crypto.randomUUID();
+      await admin`
+        insert into sessions (
+          id, account_id, workspace_id, initial_message, model,
+          sandbox_backend, sandbox_group_id, status
+        ) values (
+          ${sessionId}, ${accountId}, ${workspaceId}, 'legacy turn',
+          'codex/gpt-5.6-sol', 'modal', ${sessionId}, 'running'
+        )`;
+      await admin`
+        insert into session_turns (
+          id, account_id, workspace_id, session_id, trigger_event_id,
+          temporal_workflow_id, status, position, prompt, model,
+          reasoning_effort, sandbox_backend
+        ) values (
+          ${turnId}, ${accountId}, ${workspaceId}, ${sessionId}, ${crypto.randomUUID()},
+          'legacy-workflow', 'running', 1, 'legacy turn',
+          'codex/gpt-5.6-sol', 'low', 'modal'
+        )`;
+      await admin`update sessions set active_turn_id = ${turnId} where id = ${sessionId}`;
+
+      // The pre-migration binary knows only these columns and can read its
+      // sticky pointer normally. The additive objects do not exist yet.
+      const [before] = await admin<
+        { active_credential_id: string; rotation_enabled: boolean; rotation_strategy: string }[]
+      >`
+        select active_credential_id, rotation_enabled, rotation_strategy
+        from codex_rotation_settings where workspace_id = ${workspaceId}`;
+      expect(before).toEqual({
+        active_credential_id: credentialA,
+        rotation_enabled: false,
+        rotation_strategy: "most_remaining",
+      });
+      const preColumns = await admin<{ column_name: string }[]>`
+        select column_name from information_schema.columns
+        where table_name = 'codex_rotation_settings'
+          and column_name = 'lease_rotation_enabled'`;
+      expect(preColumns).toHaveLength(0);
+
+      await applyFile(admin, "0049_codex_credential_leases.sql");
+      await admin`
+        insert into schema_migrations (name)
+        values ('0049_codex_credential_leases.sql') on conflict do nothing`;
+      await admin`select pg_advisory_unlock(727458)`;
+
+      // Schema-first rollout preserves all existing rows and keeps both old and
+      // new selector bits false. An old binary's column-only read/write remains
+      // valid, and an old-style insert cannot opt a new workspace into leasing.
+      const [migrated] = await admin<
+        {
+          active_credential_id: string;
+          rotation_enabled: boolean;
+          lease_rotation_enabled: boolean;
+          rotation_strategy: string;
+        }[]
+      >`
+        select active_credential_id, rotation_enabled,
+               lease_rotation_enabled, rotation_strategy
+        from codex_rotation_settings where workspace_id = ${workspaceId}`;
+      expect(migrated).toEqual({
+        active_credential_id: credentialA,
+        rotation_enabled: false,
+        lease_rotation_enabled: false,
+        rotation_strategy: "most_remaining",
+      });
+      await admin`
+        update codex_rotation_settings
+        set active_credential_id = ${credentialB}, rotation_enabled = false
+        where workspace_id = ${workspaceId}`;
+      const rollbackSelection = selectCodexCredentialLeaseForTurn({
+        context: {
+          accounts: [credentialA, credentialB].map((id) => ({
+            id,
+            chatgptAccountId: null,
+            label: null,
+            accountEmail: null,
+            planType: "pro",
+            status: "active",
+            isActive: id === credentialB,
+            expiresAt: null,
+            lastRefreshAt: null,
+            lastError: null,
+            primaryUsedPercent: 0,
+            primaryResetAt: null,
+            secondaryUsedPercent: 0,
+            secondaryResetAt: null,
+            usageCheckedAt: null,
+            exhaustedUntil: null,
+            connectorNamespaces: null,
+            connectorsCheckedAt: null,
+            activeLeaseCount: 0,
+            selectionCount: 0,
+            lastSelectedAt: null,
+          })),
+          activeCredentialId: credentialB,
+          rotationEnabled: false,
+          rotationStrategy: "most_remaining",
+          existingCredentialId: null,
+        },
+        leasingEnabled: false,
+        sessionPinnedCredentialId: null,
+        sessionLastCredentialId: credentialA,
+        nearExhaustionPct: 90,
+        now: new Date(),
+      });
+      expect(rollbackSelection.credentialId).toBe(credentialB);
+      const [inert] = await admin<{ count: number }[]>`
+        select count(*)::int as count from codex_credential_leases`;
+      expect(inert!.count).toBe(0);
+
+      // Full cutover explicitly enables the new bit. The current worker can
+      // then create a fenced lease while the old binary's narrow read remains
+      // valid against the same additive schema.
+      await admin`
+        update codex_rotation_settings set lease_rotation_enabled = true
+        where workspace_id = ${workspaceId}`;
+      const appUrl = new URL(databaseUrl);
+      appUrl.username = "opengeni_app";
+      appUrl.password = "apppw";
+      app = createDb(appUrl.toString(), { max: 2 });
+      const leased = await acquireCodexCredentialLease(
+        app.db,
+        {
+          accountId,
+          workspaceId,
+          turnId,
+          holderId: "migration-0049-new-worker",
+          advanceActivePointer: true,
+        },
+        (context) =>
+          selectCodexCredentialLeaseForTurn({
+            context,
+            leasingEnabled: true,
+            sessionPinnedCredentialId: null,
+            sessionLastCredentialId: null,
+            nearExhaustionPct: 90,
+            now: new Date(),
+          }),
+      );
+      expect(leased.credentialId).not.toBeNull();
+      if (!leased.credentialId) throw new Error("expected migration cutover lease");
+      expect([credentialA, credentialB]).toContain(leased.credentialId);
+      const [liveLease] = await admin<{ count: number }[]>`
+        select count(*)::int as count from codex_credential_leases
+        where workspace_id = ${workspaceId} and turn_id = ${turnId}`;
+      expect(liveLease!.count).toBe(1);
+      const [oldWorkerAfterCutover] = await admin<
+        { active_credential_id: string; rotation_enabled: boolean; rotation_strategy: string }[]
+      >`
+        select active_credential_id, rotation_enabled, rotation_strategy
+        from codex_rotation_settings where workspace_id = ${workspaceId}`;
+      expect(oldWorkerAfterCutover?.rotation_enabled).toBe(false);
+      expect(oldWorkerAfterCutover?.rotation_strategy).toBe("most_remaining");
+
+      // Immediate rollback is configuration-only: a current/old worker with
+      // leasing disabled again uses the active pointer and never needs to drop
+      // the additive row/table. Re-running the real migration chain is a no-op.
+      const featureOffAgain = selectCodexCredentialLeaseForTurn({
+        context: {
+          ...rollbackSelectionContext(credentialA, credentialB),
+          activeCredentialId: oldWorkerAfterCutover!.active_credential_id,
+        },
+        leasingEnabled: false,
+        sessionPinnedCredentialId: null,
+        sessionLastCredentialId: leased.credentialId,
+        nearExhaustionPct: 90,
+        now: new Date(),
+      });
+      expect(featureOffAgain.credentialId).toBe(oldWorkerAfterCutover!.active_credential_id);
+      await migrate(databaseUrl);
+      const [afterIdempotentMigrate] = await admin<
+        { count: number; lease_rotation_enabled: boolean }[]
+      >`
+        select count(l.id)::int as count, bool_or(r.lease_rotation_enabled) as lease_rotation_enabled
+        from codex_rotation_settings r
+        left join codex_credential_leases l on l.workspace_id = r.workspace_id
+        where r.workspace_id = ${workspaceId}`;
+      expect(afterIdempotentMigrate).toEqual({ count: 1, lease_rotation_enabled: true });
+    } finally {
+      await app?.close().catch(() => undefined);
+      await admin.end();
+    }
+  }, 180_000);
+});
+
+function rollbackSelectionContext(credentialA: string, credentialB: string) {
+  return {
+    accounts: [credentialA, credentialB].map((id) => ({
+      id,
+      chatgptAccountId: null,
+      label: null,
+      accountEmail: null,
+      planType: "pro",
+      status: "active",
+      isActive: false,
+      expiresAt: null,
+      lastRefreshAt: null,
+      lastError: null,
+      primaryUsedPercent: 0,
+      primaryResetAt: null,
+      secondaryUsedPercent: 0,
+      secondaryResetAt: null,
+      usageCheckedAt: null,
+      exhaustedUntil: null,
+      connectorNamespaces: null,
+      connectorsCheckedAt: null,
+      activeLeaseCount: 0,
+      selectionCount: 0,
+      lastSelectedAt: null,
+    })),
+    activeCredentialId: credentialB,
+    rotationEnabled: true,
+    rotationStrategy: "most_remaining",
+    existingCredentialId: null,
+  };
+}

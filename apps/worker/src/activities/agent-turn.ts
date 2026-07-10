@@ -3644,6 +3644,15 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
         turnId &&
         turnStartedPublished
       ) {
+        observability.incrementCounter({
+          name: "opengeni_codex_credential_failures_total",
+          help: "Definitive Codex credential failures classified for safe failover.",
+          labels: {
+            workspace_key: codexWorkspaceKey,
+            kind: codexCredentialFailure.kind,
+            outcome: "classified",
+          },
+        });
         const failoverStartedAt = performance.now();
         let checkpointDurable = false;
         try {
@@ -3671,9 +3680,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
           });
           const now = new Date();
           const before = await listCodexAccountStatuses(db, input.workspaceId).catch(() => []);
-          const servingCached = before.find(
-            (account) => account.id === effectiveCodexCredentialId,
-          );
+          const servingCached = before.find((account) => account.id === effectiveCodexCredentialId);
           const usageSnapshot = latestCodexUsage as CodexUsageHeaderSnapshot | null;
           const serving = servingCached
             ? {
@@ -3738,11 +3745,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             decision.kind === "active" &&
             decision.credentialId !== effectiveCodexCredentialId;
 
-          if (
-            candidateAvailable &&
-            codexLeaseHolderId &&
-            codexLeaseGeneration !== null
-          ) {
+          if (candidateAvailable && codexLeaseHolderId && codexLeaseGeneration !== null) {
             let resumeWithNotice =
               settings.sessionHistorySource === "items" &&
               persistedHistoryCount > historyCountAtTurnStart;
@@ -4282,12 +4285,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
         clearInterval(codexLeaseHeartbeatTimer);
         codexLeaseHeartbeatTimer = undefined;
       }
-      if (
-        codexLeaseHeld &&
-        turnId &&
-        codexLeaseHolderId &&
-        codexLeaseGeneration !== null
-      ) {
+      if (codexLeaseHeld && turnId && codexLeaseHolderId && codexLeaseGeneration !== null) {
         await releaseCodexCredentialLease(
           db,
           input.accountId,

@@ -7391,8 +7391,7 @@ export async function acquireCodexCredentialLease<T>(
         throw new Error(`Codex rotation settings not visible for workspace ${input.workspaceId}`);
       }
       const activeCredentialId = settingsRow.active_credential_id;
-      const rotationEnabled =
-        settingsRow.rotation_enabled || settingsRow.lease_rotation_enabled;
+      const rotationEnabled = settingsRow.rotation_enabled || settingsRow.lease_rotation_enabled;
       const rotationStrategy = settingsRow.rotation_strategy;
 
       await tx.execute(sql`
@@ -15572,37 +15571,6 @@ export async function incrementTurnWorkerDeathRedispatches(
           updated_at = now()
       where workspace_id = ${workspaceId} and id = ${turnId}
       returning (metadata->>'workerDeathRedispatches')::int as count
-    `);
-    const count = rows[0]?.count;
-    if (count === undefined || count === null) {
-      throw new Error(`Session turn not found: ${turnId}`);
-    }
-    return Number(count);
-  });
-}
-
-/**
- * Atomic, replay-safe bound for same-turn Codex credential failovers. Unlike the
- * older event-derived counter, this survives preemption because the SAME turn
- * row is requeued and claimed again.
- */
-export async function incrementTurnCodexCredentialFailovers(
-  db: Database,
-  workspaceId: string,
-  turnId: string,
-): Promise<number> {
-  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
-    const rows = await scopedDb.execute(sql<{ count: number }>`
-      update session_turns
-      set metadata = jsonb_set(
-            coalesce(metadata, '{}'::jsonb),
-            '{codexCredentialFailovers}',
-            to_jsonb(coalesce((metadata->>'codexCredentialFailovers')::int, 0) + 1),
-            true
-          ),
-          updated_at = now()
-      where workspace_id = ${workspaceId} and id = ${turnId}
-      returning (metadata->>'codexCredentialFailovers')::int as count
     `);
     const count = rows[0]?.count;
     if (count === undefined || count === null) {

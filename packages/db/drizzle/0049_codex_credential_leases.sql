@@ -69,6 +69,7 @@ BEGIN
     DROP POLICY workspace_isolation ON "codex_credential_leases";
   END IF;
 END $$;
+
 CREATE POLICY workspace_isolation ON "codex_credential_leases"
   USING (opengeni_private.workspace_rls_visible(account_id, workspace_id))
   WITH CHECK (opengeni_private.workspace_rls_visible(account_id, workspace_id));

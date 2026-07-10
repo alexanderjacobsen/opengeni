@@ -182,9 +182,7 @@ describe("OPE-21 atomic Codex credential allocation", () => {
     if (!available) return;
     const [ws] = await freshAccount();
     await ensureCodexRotationSettings(dbA, ws!.accountId, ws!.workspaceId);
-    const [row] = await admin<
-      { rotation_enabled: boolean; lease_rotation_enabled: boolean }[]
-    >`
+    const [row] = await admin<{ rotation_enabled: boolean; lease_rotation_enabled: boolean }[]>`
       select rotation_enabled, lease_rotation_enabled
       from codex_rotation_settings where workspace_id = ${ws!.workspaceId}`;
     expect(row).toEqual({ rotation_enabled: false, lease_rotation_enabled: false });
@@ -292,7 +290,9 @@ describe("OPE-21 atomic Codex credential allocation", () => {
     await connectCredential(ws!, "long-turn-a");
     await connectCredential(ws!, "long-turn-b");
     const turnA = await seedTurn(ws!, 1);
-    const first = await acquire(dbA, ws!, turnA, 2_000);
+    const originalTtlMs = 200;
+    const renewedTtlMs = 2_000;
+    const first = await acquire(dbA, ws!, turnA, originalTtlMs);
     expect(first.credentialId).not.toBeNull();
     expect(
       await heartbeatCodexCredentialLease(
@@ -302,16 +302,34 @@ describe("OPE-21 atomic Codex credential allocation", () => {
         turnA,
         first.holderId!,
         first.generation!,
-        10_000,
+        renewedTtlMs,
       ),
     ).toBe(true);
+
+    // Cross the ORIGINAL TTL while the renewed holder stays live. A competing
+    // replica must still observe that reservation and use the other credential.
+    await Bun.sleep(originalTtlMs + 100);
     const [lease] = await admin<{ leased_until: Date }[]>`
       select leased_until from codex_credential_leases where turn_id = ${turnA}`;
     expect(lease!.leased_until.getTime()).toBeGreaterThan(Date.now());
+    const liveCompetitorTurn = await seedTurn(ws!, 2);
+    const liveCompetitor = await acquire(dbB, ws!, liveCompetitorTurn);
+    expect(liveCompetitor.credentialId).not.toBeNull();
+    expect(liveCompetitor.credentialId).not.toBe(first.credentialId);
+    expect(
+      await releaseCodexCredentialLease(
+        dbB,
+        ws!.accountId,
+        ws!.workspaceId,
+        liveCompetitorTurn,
+        liveCompetitor.holderId!,
+        liveCompetitor.generation!,
+      ),
+    ).toBe(true);
 
     // Deterministic worker-crash injection: expire the workspace holder without sleeping.
     await admin`update codex_credential_leases set leased_until = now() - interval '1 second' where turn_id = ${turnA}`;
-    const turnB = await seedTurn(ws!, 2);
+    const turnB = await seedTurn(ws!, 3);
     const second = await acquire(dbB, ws!, turnB);
     expect(second.credentialId).not.toBeNull();
     const [stale] = await admin<{ count: number }[]>`

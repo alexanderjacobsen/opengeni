@@ -1017,13 +1017,17 @@ describe("worker activities integration", () => {
       workspaceId: grant.workspaceId,
       sessionId: session.id,
       items: [
-        { position: 0, item: { type: "message", role: "user", content: "x".repeat(75_000 * 4) } },
+        { position: 0, item: { type: "message", role: "user", content: "proactive context" } },
         {
           position: 1,
           item: {
             type: "message",
             role: "assistant",
-            content: [{ type: "output_text", text: "old answer" }],
+            // Compaction intentionally preserves every real user message. Put
+            // the bulk in droppable assistant output so this fixture can prove
+            // a strict active-history shrink rather than asking the worker to
+            // discard user-authored context.
+            content: [{ type: "output_text", text: "x".repeat(75_000 * 4) }],
           },
         },
       ],
@@ -1909,6 +1913,7 @@ describe("worker activities integration", () => {
     try {
       const { environment, gitToken } = await sandboxEnvironmentForRun(
         testSettings({
+          sandboxBackend: "modal",
           githubAppId: "99",
           githubClientId: "client-id",
           githubClientSecret: "client-secret",
@@ -4421,7 +4426,15 @@ describe("worker activities integration", () => {
         },
         {
           position: 2,
-          item: { type: "function_call_result", callId: "c0", status: "completed", output: "ok0" },
+          item: {
+            type: "function_call_result",
+            callId: "c0",
+            status: "completed",
+            // Make the active transcript genuinely larger than its replacement.
+            // Provider-reported token signals alone are not permission to grow
+            // or fake a shrink of a tiny model-facing history.
+            output: "ok0 ".repeat(1_000),
+          },
         },
         {
           position: 3,
@@ -4438,7 +4451,12 @@ describe("worker activities integration", () => {
         },
         {
           position: 6,
-          item: { type: "function_call_result", callId: "c1", status: "completed", output: "ok1" },
+          item: {
+            type: "function_call_result",
+            callId: "c1",
+            status: "completed",
+            output: "ok1 ".repeat(1_000),
+          },
         },
         {
           position: 7,
@@ -4573,7 +4591,7 @@ describe("worker activities integration", () => {
           item: {
             type: "message",
             role: "assistant",
-            content: [{ type: "output_text", text: "a1" }],
+            content: [{ type: "output_text", text: "a1 ".repeat(1_000) }],
           },
         },
         { position: 2, item: { type: "message", role: "user", content: "old turn 2" } },
@@ -4582,7 +4600,7 @@ describe("worker activities integration", () => {
           item: {
             type: "message",
             role: "assistant",
-            content: [{ type: "output_text", text: "a2" }],
+            content: [{ type: "output_text", text: "a2 ".repeat(1_000) }],
           },
         },
         { position: 4, item: { type: "message", role: "user", content: "recent turn" } },
@@ -4591,7 +4609,7 @@ describe("worker activities integration", () => {
           item: {
             type: "message",
             role: "assistant",
-            content: [{ type: "output_text", text: "a3" }],
+            content: [{ type: "output_text", text: "a3 ".repeat(1_000) }],
           },
         },
       ],

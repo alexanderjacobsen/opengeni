@@ -2965,7 +2965,10 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
         );
       };
 
-      const forceContextCompaction = async (triggerLabel: "overflow" | "proactive") => {
+      const forceContextCompaction = async (
+        triggerLabel: "overflow" | "proactive",
+        recoverySignalTokens: number | null,
+      ) => {
         const clientCompactionSettings: Settings = {
           ...runSettings,
           contextCompactionMode: "client",
@@ -2980,7 +2983,12 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             sessionId: input.sessionId,
             turnId: activeTurnId,
           },
-          session.lastInputTokens,
+          // Recovery must use the signal that triggered THIS compaction. A
+          // stale prior-turn value can be tiny (or refer to different active
+          // history), which would make the strict-shrink ceiling impossible.
+          // Proactive guards provide their exact current signal; provider
+          // overflows do not, so null derives the ceiling from active history.
+          recoverySignalTokens,
           compactSummarizer,
           { force: true, requireShrink: true },
         );
@@ -3396,7 +3404,10 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
           let compacted = false;
           let compactionFailureMessage: string | null = null;
           try {
-            const outcome = await forceContextCompaction(recoveryKind);
+            const outcome = await forceContextCompaction(
+              recoveryKind,
+              compactionNeeded?.signalTokens ?? null,
+            );
             compacted = outcome.compacted;
             if (!outcome.compacted) {
               compactionFailureMessage = compactionFailureReason(outcome.reason);

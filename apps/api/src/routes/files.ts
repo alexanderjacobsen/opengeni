@@ -6,10 +6,11 @@ import {
   FileDownloadUrlResponse,
 } from "@opengeni/contracts";
 import {
+  claimFileUploadCleanup,
+  completeFileUploadCleanup,
   completeFileUpload,
   createFileUpload,
   getFileUpload,
-  markFileUploadFailed,
   requireFile,
 } from "@opengeni/db";
 import type { Hono } from "hono";
@@ -83,19 +84,109 @@ export function registerFileRoutes(app: Hono, deps: ApiRouteDeps): void {
     if (!upload) {
       throw new HTTPException(404, { message: "file upload not found" });
     }
+    const recordUploadedFileUsage = async (file: typeof upload.file): Promise<void> => {
+      await recordWorkspaceUsage(deps, {
+        accountId: grant.accountId,
+        workspaceId,
+        subjectId: grant.subjectId,
+        eventType: "file.uploaded",
+        quantity: file.sizeBytes,
+        unit: "byte",
+        sourceResourceType: "file",
+        sourceResourceId: file.id,
+        idempotencyKey: `file.uploaded:${workspaceId}:${file.id}`,
+      });
+    };
+    const completeAndRecordUsage = async (): Promise<typeof upload.file> => {
+      let file: typeof upload.file;
+      try {
+        file = await completeFileUpload(db, workspaceId, upload.id);
+      } catch (error) {
+        // HEAD runs outside the DB transaction. If the expiry reaper claims the
+        // row in that window, report the durable state instead of leaking an
+        // internal 500. A concurrent successful finalize remains a normal
+        // idempotent completion and still repairs usage below.
+        const current = await getFileUpload(db, workspaceId, upload.id);
+        if (current?.status === "completed" && current.file.status === "ready") {
+          file = current.file;
+        } else if (current && current.status !== "pending") {
+          throw new HTTPException(409, {
+            message: `file upload is ${publicFileUploadStatus(current.status)}`,
+          });
+        } else {
+          throw error;
+        }
+      }
+      await recordUploadedFileUsage(file);
+      return file;
+    };
+    const rejectAndCleanObject = async (
+      status: 409 | 422,
+      message: string,
+      terminalStatus: "failed" | "expired",
+    ): Promise<typeof upload.file> => {
+      const claim = await claimFileUploadCleanup(db, {
+        workspaceId,
+        uploadId: upload.id,
+        fileId: upload.file.id,
+      });
+      // A concurrent valid finalize may have committed while this request was
+      // checking expiry/provider metadata. Never delete that ready object's
+      // key; preserve normal idempotent finalize and repair usage instead.
+      if (claim.outcome === "completed") {
+        await recordUploadedFileUsage(claim.file);
+        return claim.file;
+      }
+      if (claim.outcome === "unavailable") {
+        throw new HTTPException(409, {
+          message: `file upload is ${publicFileUploadStatus(claim.status)}`,
+        });
+      }
+      try {
+        await objectStorage.deleteObject(upload.file.objectKey);
+      } catch (error) {
+        // The row remains cleanup_pending and the file non-ready. The global
+        // reaper can reclaim the idempotent delete after its claim timeout.
+        deps.observability?.warn(
+          "file upload rejection cleanup failed; claim remains reclaimable",
+          {
+            workspaceId,
+            fileId: upload.file.id,
+            uploadId: upload.id,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        );
+        throw new HTTPException(status, { message });
+      }
+      const settled = await completeFileUploadCleanup(db, {
+        accountId: grant.accountId,
+        workspaceId,
+        uploadId: upload.id,
+        fileId: upload.file.id,
+        terminalStatus,
+      });
+      if (!settled) {
+        throw new HTTPException(409, { message: "file upload cleanup claim was superseded" });
+      }
+      throw new HTTPException(status, { message });
+    };
     // A client can lose the response after the server commits completion, or two
     // tabs can race the same completion request. A ready object is durable and
-    // safe to return again; forcing a retry to fail here would strand the
-    // attachment reference even though its storage work succeeded.
+    // safe to return again. Re-enter the row-locked DB finalize and retry the
+    // idempotent usage write before returning: the previous request may have
+    // died after completion committed but before `file.uploaded` was recorded.
     if (upload.status === "completed" && upload.file.status === "ready") {
-      return c.json(CompleteFileUploadResponse.parse({ file: upload.file }));
+      const file = await completeAndRecordUsage();
+      return c.json(CompleteFileUploadResponse.parse({ file }));
     }
     if (upload.status !== "pending") {
-      throw new HTTPException(409, { message: `file upload is ${upload.status}` });
+      throw new HTTPException(409, {
+        message: `file upload is ${publicFileUploadStatus(upload.status)}`,
+      });
     }
     if (upload.expiresAt.getTime() < Date.now()) {
-      await markFileUploadFailed(db, workspaceId, upload.id, upload.file.id);
-      throw new HTTPException(409, { message: "file upload has expired" });
+      const file = await rejectAndCleanObject(409, "file upload has expired", "expired");
+      return c.json(CompleteFileUploadResponse.parse({ file }));
     }
     const head = await objectStorage.headFile(upload.file).catch((error) => {
       throw new HTTPException(409, {
@@ -103,39 +194,34 @@ export function registerFileRoutes(app: Hono, deps: ApiRouteDeps): void {
       });
     });
     if (Number(head.ContentLength ?? -1) !== upload.file.sizeBytes) {
-      await markFileUploadFailed(db, workspaceId, upload.id, upload.file.id);
-      throw new HTTPException(422, {
-        message: "uploaded object size does not match file metadata",
-      });
+      const file = await rejectAndCleanObject(
+        422,
+        "uploaded object size does not match file metadata",
+        "failed",
+      );
+      return c.json(CompleteFileUploadResponse.parse({ file }));
     }
     if (
       upload.file.contentType &&
       head.ContentType &&
       head.ContentType !== upload.file.contentType
     ) {
-      await markFileUploadFailed(db, workspaceId, upload.id, upload.file.id);
-      throw new HTTPException(422, {
-        message: "uploaded object content type does not match file metadata",
-      });
+      const file = await rejectAndCleanObject(
+        422,
+        "uploaded object content type does not match file metadata",
+        "failed",
+      );
+      return c.json(CompleteFileUploadResponse.parse({ file }));
     }
     if (upload.file.sha256 && head.Metadata?.sha256 !== upload.file.sha256) {
-      await markFileUploadFailed(db, workspaceId, upload.id, upload.file.id);
-      throw new HTTPException(422, {
-        message: "uploaded object checksum metadata does not match file metadata",
-      });
+      const file = await rejectAndCleanObject(
+        422,
+        "uploaded object checksum metadata does not match file metadata",
+        "failed",
+      );
+      return c.json(CompleteFileUploadResponse.parse({ file }));
     }
-    const file = await completeFileUpload(db, workspaceId, upload.id);
-    await recordWorkspaceUsage(deps, {
-      accountId: grant.accountId,
-      workspaceId,
-      subjectId: grant.subjectId,
-      eventType: "file.uploaded",
-      quantity: file.sizeBytes,
-      unit: "byte",
-      sourceResourceType: "file",
-      sourceResourceId: file.id,
-      idempotencyKey: `file.uploaded:${workspaceId}:${file.id}`,
-    });
+    const file = await completeAndRecordUsage();
     return c.json(CompleteFileUploadResponse.parse({ file }));
   });
 
@@ -179,4 +265,9 @@ function sanitizeFilename(filename: string): string {
     .replace(/\s+/g, " ")
     .trim();
   return safe || "file";
+}
+
+/** Keep the cleanup lease internal; clients only consume terminal upload states. */
+function publicFileUploadStatus(status: string): string {
+  return status === "cleanup_pending" ? "failed" : status;
 }

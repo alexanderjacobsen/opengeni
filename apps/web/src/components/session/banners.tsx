@@ -423,7 +423,7 @@ function MessageImagePreview({
           type="button"
           onClick={() => void download()}
           aria-label={`Download ${asset.filename}`}
-          className="shrink-0 rounded p-0.5 outline-none transition-colors hover:text-fg focus-visible:ring-1 focus-visible:ring-ring"
+          className="inline-flex shrink-0 items-center justify-center rounded p-0.5 outline-none transition-colors hover:text-fg focus-visible:ring-1 focus-visible:ring-ring pointer-coarse:size-10"
         >
           <DownloadIcon className="size-3" />
         </button>
@@ -486,7 +486,7 @@ export function MessageFileAttachment({
       type="button"
       onClick={() => void openFile()}
       disabled={busy}
-      className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-1 text-xs text-fg-muted hover:text-fg disabled:opacity-60"
+      className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-border bg-surface px-2 py-1 text-xs text-fg-muted hover:text-fg disabled:opacity-60 pointer-coarse:min-h-10"
     >
       {isImage ? (
         <ImageIcon className="size-3.5 shrink-0" />

@@ -107,6 +107,17 @@ for the deployed web origin. Prefer exact HTTPS origins in production; use `*`
 only for disposable private evaluation stacks where signed URLs and the
 OpenGeni access key are the real access boundaries.
 
+Do not treat a successful presign as storage acceptance. Release conformance
+must exercise the provider-native `OPTIONS` + signed browser `PUT`, API finalize
+(which performs authenticated `HEAD`), signed `GET`, and tenant-negative read.
+The worker also registers one global `opengeni-file-upload-reaper` Temporal
+Schedule. It retains unfinished uploads until the signed URL expires plus one
+hour, claims at most 100 objects per run, retries a crashed/failed delete claim
+after ten minutes, and settles the RLS row terminal only after the provider's
+idempotent delete succeeds. A healthy rollout therefore needs the same worker
+Temporal and object-storage access used by normal uploads; disabling or
+skipping storage conformance leaves both upload and orphan cleanup unproven.
+
 The conformance command verifies API health, Prometheus metrics exposure, a real session run, event replay, SSE replay, manual scheduled-task dispatch, and file upload/download unless the corresponding `--skip-observability`, `--skip-agent`, `--skip-scheduled-tasks`, or `--skip-storage` flag is set. Skipped checks are explicit verification gaps, not proof that the skipped subsystem works.
 
 For Azure Blob-backed deployments, no object host rewrite should be needed because upload/download URLs are public Azure Blob SAS URLs:

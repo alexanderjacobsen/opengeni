@@ -17,6 +17,7 @@ import {
   encryptEnvironmentValue,
   ensureCodexRotationSettings,
   heartbeatCodexCredentialLease,
+  heartbeatCodexCredentialLeaseUntil,
   listCodexAccountStatuses,
   loadCodexCredentialForRun,
   quarantineCodexCredentialForLease,
@@ -586,6 +587,17 @@ describe("OPE-21 atomic Codex credential allocation", () => {
     const renewedTtlMs = 2_000;
     const first = await acquire(dbA, ws!, turnA, originalTtlMs);
     expect(first.credentialId).not.toBeNull();
+    const renewedUntil = await heartbeatCodexCredentialLeaseUntil(
+      dbA,
+      ws!.accountId,
+      ws!.workspaceId,
+      turnA,
+      first.holderId!,
+      first.generation!,
+      renewedTtlMs,
+    );
+    expect(renewedUntil).toBeInstanceOf(Date);
+    expect(renewedUntil!.getTime()).toBeGreaterThan(first.leasedUntil!.getTime());
     expect(
       await heartbeatCodexCredentialLease(
         dbA,

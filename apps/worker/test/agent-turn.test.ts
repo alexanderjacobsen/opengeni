@@ -9,6 +9,7 @@ import {
   agentRunFailurePayload,
   classifyContextWindowOverflowError,
   classifyMcpTransportTimeoutError,
+  codexCredentialLeaseDeadlineExpired,
   computerToolModeForTurn,
   createTurnSandboxProvisioner,
   emitModelCallUsage,
@@ -757,6 +758,17 @@ describe("worker shutdown preemption", () => {
   test("resume notice tells the agent to verify in-flight side effects", () => {
     expect(WORKER_SHUTDOWN_RESUME_TEXT).toContain("TURN RESUMED AFTER WORKER RESTART");
     expect(WORKER_SHUTDOWN_RESUME_TEXT).toContain("check whether it already happened");
+  });
+});
+
+describe("Codex credential lease deadline fence", () => {
+  test("fails closed at the last database-confirmed expiry, including a missing deadline", () => {
+    const now = Date.parse("2026-07-10T08:00:00.000Z");
+    expect(codexCredentialLeaseDeadlineExpired(null, now)).toBe(true);
+    expect(codexCredentialLeaseDeadlineExpired(Number.NaN, now)).toBe(true);
+    expect(codexCredentialLeaseDeadlineExpired(now, now)).toBe(true);
+    expect(codexCredentialLeaseDeadlineExpired(now - 1, now)).toBe(true);
+    expect(codexCredentialLeaseDeadlineExpired(now + 1, now)).toBe(false);
   });
 });
 

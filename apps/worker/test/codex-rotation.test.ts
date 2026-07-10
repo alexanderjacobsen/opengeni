@@ -407,6 +407,26 @@ describe("chooseRotationActive — round_robin / drain_then_next", () => {
     ).toEqual({ kind: "active", credentialId: "c", moved: true });
   });
 
+  test("round_robin all-capped wake ignores allocator-disabled credentials", () => {
+    const enabledReset = new Date(NOW.getTime() + 4 * HOUR);
+    const accounts = [
+      acct("disabled-healthy", { allocatorEnabled: false }),
+      acct("enabled-capped", {
+        primaryUsedPercent: 99,
+        primaryResetAt: enabledReset,
+      }),
+    ];
+    expect(
+      chooseRotationActive({
+        ...base,
+        rotationStrategy: "round_robin",
+        activeCredentialId: "enabled-capped",
+        priorCredentialId: "enabled-capped",
+        accounts,
+      }),
+    ).toEqual({ kind: "allCapped", earliestResetAt: enabledReset });
+  });
+
   test("drain_then_next stays on the prior account while eligible, else first eligible", () => {
     const accounts = [acct("a"), acct("b")];
     expect(

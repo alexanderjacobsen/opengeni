@@ -18,7 +18,7 @@ import {
   isCodexBilledTurn,
   workspaceCodexSubscriptionActive,
   acquireCodexCredentialLease,
-  heartbeatCodexCredentialLease,
+  heartbeatCodexCredentialLeaseUntil,
   releaseCodexCredentialLease,
   CODEX_CREDENTIAL_LEASE_TTL_MS,
   getCodexRotationSettings,
@@ -1053,6 +1053,20 @@ async function refreshCappedCodexUsageRows(
   return listCodexAccountStatuses(db, workspaceId).catch(() => accounts);
 }
 
+/**
+ * True once the lifetime last confirmed by Postgres is no longer trustworthy.
+ * A missing or malformed deadline fails closed for a holder that claims to be
+ * leased; callers check this before accepting an in-flight heartbeat promise.
+ */
+export function codexCredentialLeaseDeadlineExpired(
+  confirmedUntilMs: number | null,
+  nowMs: number = performance.now(),
+): boolean {
+  return (
+    confirmedUntilMs === null || !Number.isFinite(confirmedUntilMs) || confirmedUntilMs <= nowMs
+  );
+}
+
 export function createRunAgentTurnActivity(services: () => Promise<ActivityServices>) {
   return async function runAgentTurn(input: RunAgentTurnInput): Promise<RunAgentTurnResult> {
     const {
@@ -1098,22 +1112,49 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
     let codexLeaseLost = false;
     let codexLeaseHolderId: string | null = null;
     let codexLeaseGeneration: number | null = null;
+    // Monotonic worker deadline, not a comparison between the Postgres and
+    // worker wall clocks. It is advanced only after a database renewal confirms,
+    // from the request START + TTL; slow queries therefore shorten (never extend)
+    // the conservative ownership window.
+    let codexLeaseConfirmedUntilMs: number | null = null;
     let codexLeaseHeartbeatInFlight = false;
     let codexLeaseHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
     const codexWorkspaceKey = codexWorkspaceMetricKey(input.workspaceId);
+    const markCodexLeaseLost = (reason: "deadline" | "not_found"): void => {
+      if (codexLeaseLost) return;
+      codexLeaseLost = true;
+      observability.incrementCounter({
+        name: "opengeni_codex_lease_renewals_total",
+        help: "Codex lease renewal checkpoints by outcome and reason.",
+        labels: { workspace_key: codexWorkspaceKey, outcome: "lost", reason },
+      });
+      observability.warn("Codex credential lease was lost during an active turn", {
+        workspaceId: input.workspaceId,
+        turnId,
+        reason,
+      });
+    };
     const renewCodexLease = async (reason: "timer" | "runtime_event" | "model_usage") => {
       if (
         !turnId ||
         !codexLeaseHeld ||
         !codexLeaseHolderId ||
         codexLeaseGeneration === null ||
-        codexLeaseHeartbeatInFlight ||
         codexLeaseLost
       )
         return;
+      // Check the last expiry the database actually returned BEFORE the
+      // single-flight guard. A hung heartbeat must not make later model/runtime
+      // checkpoints trust a lease whose last proven lifetime already elapsed.
+      if (codexCredentialLeaseDeadlineExpired(codexLeaseConfirmedUntilMs)) {
+        markCodexLeaseLost("deadline");
+        return;
+      }
+      if (codexLeaseHeartbeatInFlight) return;
       codexLeaseHeartbeatInFlight = true;
+      const renewalStartedAtMs = performance.now();
       try {
-        const renewed = await heartbeatCodexCredentialLease(
+        const renewedUntil = await heartbeatCodexCredentialLeaseUntil(
           db,
           input.accountId,
           input.workspaceId,
@@ -1122,19 +1163,10 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
           codexLeaseGeneration,
           CODEX_CREDENTIAL_LEASE_TTL_MS,
         );
-        if (!renewed) {
-          codexLeaseLost = true;
-          observability.incrementCounter({
-            name: "opengeni_codex_lease_renewals_total",
-            help: "Codex lease renewal checkpoints by outcome and reason.",
-            labels: { workspace_key: codexWorkspaceKey, outcome: "lost", reason },
-          });
-          observability.warn("Codex credential lease was lost during an active turn", {
-            workspaceId: input.workspaceId,
-            turnId,
-            reason,
-          });
+        if (!renewedUntil) {
+          markCodexLeaseLost("not_found");
         } else {
+          codexLeaseConfirmedUntilMs = renewalStartedAtMs + CODEX_CREDENTIAL_LEASE_TTL_MS;
           observability.incrementCounter({
             name: "opengeni_codex_lease_renewals_total",
             help: "Codex lease renewal checkpoints by outcome and reason.",
@@ -1142,9 +1174,12 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
           });
         }
       } catch (error) {
-        // A transient DB failure does not immediately abandon a still-live row;
-        // the next timer/model/tool checkpoint retries. Expiry itself returns
-        // false and fences further model progress through codexLeaseLost.
+        // A transient DB failure does not immediately abandon a still-live row,
+        // but it also cannot extend the last database-confirmed deadline.
+        if (codexCredentialLeaseDeadlineExpired(codexLeaseConfirmedUntilMs)) {
+          markCodexLeaseLost("deadline");
+          return;
+        }
         observability.warn("Codex credential lease heartbeat failed", {
           workspaceId: input.workspaceId,
           turnId,
@@ -1677,7 +1712,9 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
         // old and new workers both use legacy pin > active-pointer selection and
         // neither reads nor writes the additive lease/cursor schema.
         let leased: CodexCredentialLeaseResult<RotationDecision>;
+        let leaseAcquisitionStartedAtMs: number | null = null;
         if (settings.codexCredentialLeasingEnabled) {
+          leaseAcquisitionStartedAtMs = performance.now();
           leased = await acquireCodexCredentialLease(
             db,
             {
@@ -1726,6 +1763,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
           // Bounded self-heal of stale usage cache, then ONE new atomic selection.
           await refreshCappedCodexUsageRows(db, settings, input.workspaceId, leased.accounts);
           if (settings.codexCredentialLeasingEnabled) {
+            leaseAcquisitionStartedAtMs = performance.now();
             leased = await acquireCodexCredentialLease(
               db,
               {
@@ -1781,10 +1819,15 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
         }
         effectiveCodexCredentialId = leased.credentialId;
         codexLeaseGeneration = leased.generation;
+        codexLeaseConfirmedUntilMs =
+          leased.leasedUntil && leaseAcquisitionStartedAtMs !== null
+            ? leaseAcquisitionStartedAtMs + CODEX_CREDENTIAL_LEASE_TTL_MS
+            : null;
         codexLeaseHeld =
           effectiveCodexCredentialId !== null &&
           leased.holderId !== null &&
-          leased.generation !== null;
+          leased.generation !== null &&
+          codexLeaseConfirmedUntilMs !== null;
         if (codexLeaseHeld) startCodexLeaseHeartbeat();
 
         const eligibleCount = leased.accounts.filter((account) =>

@@ -70,8 +70,11 @@ flip allocator eligibility. OPE-24 owns toggle OCC/audit and product controls.
 
 The unique same-turn lease is idempotent. A one-minute heartbeat renews its
 five-minute TTL throughout long tool/model runs; normal completion releases it
-idempotently. A killed worker stops renewing, and expiry lets a successor turn
-reclaim capacity. If a live activity discovers that its lease was lost, a
+idempotently. The worker advances a conservative monotonic ownership deadline
+only after Postgres confirms acquisition/renewal, so a hung or repeatedly failing
+heartbeat cannot carry model progress beyond the last proven TTL. A killed worker
+stops renewing, and expiry lets a successor turn reclaim capacity. If a live
+activity discovers that its lease was lost, a
 holder/generation plus worker-redispatch-fenced transaction either requeues that
 still-current turn from its durable checkpoint or treats the activity as stale;
 it never falls through to an unfenced terminal write. Credential leases do not

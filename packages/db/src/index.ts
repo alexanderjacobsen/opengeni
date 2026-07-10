@@ -7630,8 +7630,13 @@ export async function acquireCodexCredentialLease<T>(
   );
 }
 
-/** Extend a live holder. A missing/expired/released row returns false. */
-export async function heartbeatCodexCredentialLease(
+/**
+ * Extend a live holder and return the database-confirmed expiry. A
+ * missing/expired/released row returns null. A successful result lets the worker
+ * derive a conservative monotonic deadline from the request start and configured
+ * TTL, without comparing the Postgres and worker wall clocks.
+ */
+export async function heartbeatCodexCredentialLeaseUntil(
   db: Database,
   accountId: string,
   workspaceId: string,
@@ -7639,9 +7644,9 @@ export async function heartbeatCodexCredentialLease(
   holderId: string,
   generation: number,
   leaseTtlMs: number = CODEX_CREDENTIAL_LEASE_TTL_MS,
-): Promise<boolean> {
+): Promise<Date | null> {
   return await withRlsContext(db, { accountId, workspaceId }, async (scopedDb) => {
-    const rows = await scopedDb.execute(sql<{ id: string }>`
+    const rows = await scopedDb.execute(sql<{ leased_until: Date | string }>`
       update codex_credential_leases
       set leased_until = now() + (${leaseTtlMs} * interval '1 millisecond'),
           updated_at = now()
@@ -7651,10 +7656,33 @@ export async function heartbeatCodexCredentialLease(
         and holder_id = ${holderId}
         and generation = ${generation}
         and leased_until > now()
-      returning id
+      returning leased_until
     `);
-    return rows.length > 0;
+    return codexMetadataDate(rows[0]?.leased_until);
   });
+}
+
+/** Extend a live holder. Compatibility wrapper for boolean-only callers. */
+export async function heartbeatCodexCredentialLease(
+  db: Database,
+  accountId: string,
+  workspaceId: string,
+  turnId: string,
+  holderId: string,
+  generation: number,
+  leaseTtlMs: number = CODEX_CREDENTIAL_LEASE_TTL_MS,
+): Promise<boolean> {
+  return (
+    (await heartbeatCodexCredentialLeaseUntil(
+      db,
+      accountId,
+      workspaceId,
+      turnId,
+      holderId,
+      generation,
+      leaseTtlMs,
+    )) !== null
+  );
 }
 
 /** Idempotent turn-end release. */

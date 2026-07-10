@@ -508,7 +508,7 @@ export function chooseRotationActive(args: {
     if (eligibles.length === 0) {
       return {
         kind: "allCapped",
-        earliestResetAt: earliestReset(accounts, nearExhaustionPct, now),
+        earliestResetAt: earliestReset(allocatableAccounts, nearExhaustionPct, now),
       };
     }
     const priorIdx = priorCredentialId

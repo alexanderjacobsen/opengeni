@@ -3,13 +3,18 @@ import type { CodexAccountStatus } from "@opengeni/db";
 import {
   availableAt,
   chooseRotationActive,
+  chooseShardedHome,
+  classifyCodexPin,
   computeIdleDelayMs,
   computeReactiveRotationResume,
   DEFAULT_RESET_COOLDOWN_MS,
+  isCodexAccountEligible,
   MIN_IDLE_MS,
   REACTIVE_CIRCUIT_BREAKER_IDLE_MS,
   REACTIVE_PERSISTENCE_FAULT_FLOOR_MS,
   REACTIVE_ROTATION_MARGIN,
+  shardCredentialForSession,
+  type CodexRotationStrategy,
 } from "../src/activities/codex-rotation";
 
 // Multi-account P3 — the PURE rotation ranker. All rotation correctness (most_remaining
@@ -602,5 +607,332 @@ describe("computeReactiveRotationResume — the reactive failover is bounded", (
         connectedAccountCount: accounts,
       }),
     ).toEqual({ continueDelayMs: 0, idleUntilReset: false });
+  });
+});
+
+// Sharded strategy — the PURE session→account home selection (AM-6) and the proactive
+// home decision (AM-4/AM-7). Reduces the assignment/re-shard/keep logic to functions
+// over the metadata-only account list, so it is unit-testable without a worker/db env.
+describe("shardCredentialForSession — deterministic session sharding (AM-6)", () => {
+  const pool = [acct("a"), acct("b"), acct("c"), acct("d")];
+
+  test("deterministic: the same session id always maps to the same account", () => {
+    const first = shardCredentialForSession({
+      sessionId: "session-xyz",
+      accounts: pool,
+      nearExhaustionPct: 90,
+      now: NOW,
+    });
+    for (let i = 0; i < 5; i++) {
+      expect(
+        shardCredentialForSession({
+          sessionId: "session-xyz",
+          accounts: pool,
+          nearExhaustionPct: 90,
+          now: NOW,
+        }),
+      ).toBe(first);
+    }
+  });
+
+  test("spreads distinct sessions across the whole pool (not all on one account)", () => {
+    const counts = new Map<string, number>();
+    for (let i = 0; i < 400; i++) {
+      const home = shardCredentialForSession({
+        sessionId: `s-${i}`,
+        accounts: pool,
+        nearExhaustionPct: 90,
+        now: NOW,
+      })!;
+      counts.set(home, (counts.get(home) ?? 0) + 1);
+    }
+    // every account gets a meaningful share (balanced in expectation, ~100 each of 400)
+    expect(counts.size).toBe(pool.length);
+    for (const account of pool) {
+      expect(counts.get(account.id) ?? 0).toBeGreaterThan(40);
+    }
+  });
+
+  test("excludes capped/cooling accounts from the shard set (re-shard picks a survivor)", () => {
+    // Cap every account EXCEPT 'c' → every session must shard to 'c'.
+    const oneHealthy = [
+      acct("a", { primaryUsedPercent: 95 }),
+      acct("b", { exhaustedUntil: new Date(NOW.getTime() + HOUR) }),
+      acct("c"),
+      acct("d", { secondaryUsedPercent: 99 }),
+    ];
+    for (let i = 0; i < 25; i++) {
+      expect(
+        shardCredentialForSession({
+          sessionId: `s-${i}`,
+          accounts: oneHealthy,
+          nearExhaustionPct: 90,
+          now: NOW,
+        }),
+      ).toBe("c");
+    }
+  });
+
+  test("re-shard SPREADS the survivors, never re-concentrates on one first-eligible (AM-5)", () => {
+    // 'a' capped; sessions that were on 'a' re-shard over {b,c,d}. Confirm they land on
+    // DIFFERENT survivors (a first-eligible pick would send them all to 'b').
+    const survivors = [acct("a", { primaryUsedPercent: 96 }), acct("b"), acct("c"), acct("d")];
+    const landed = new Set<string>();
+    for (let i = 0; i < 60; i++) {
+      landed.add(
+        shardCredentialForSession({
+          sessionId: `hot-${i}`,
+          accounts: survivors,
+          nearExhaustionPct: 90,
+          now: NOW,
+        })!,
+      );
+    }
+    expect(landed).not.toContain("a");
+    expect(landed.size).toBeGreaterThan(1); // spread, not re-concentrated
+  });
+
+  test("all accounts capped → null (caller idles until reset)", () => {
+    const allCapped = [
+      acct("a", { primaryUsedPercent: 95 }),
+      acct("b", { exhaustedUntil: new Date(NOW.getTime() + HOUR) }),
+    ];
+    expect(
+      shardCredentialForSession({
+        sessionId: "s",
+        accounts: allCapped,
+        nearExhaustionPct: 90,
+        now: NOW,
+      }),
+    ).toBeNull();
+  });
+
+  test("isCodexAccountEligible mirrors the ranker's eligibility (active, not cooling, under threshold)", () => {
+    expect(isCodexAccountEligible(acct("a"), 90, NOW)).toBe(true);
+    expect(isCodexAccountEligible(acct("a", { primaryUsedPercent: 95 }), 90, NOW)).toBe(false);
+    expect(
+      isCodexAccountEligible(
+        acct("a", { exhaustedUntil: new Date(NOW.getTime() + HOUR) }),
+        90,
+        NOW,
+      ),
+    ).toBe(false);
+    expect(isCodexAccountEligible(acct("a", { status: "needs_relogin" }), 90, NOW)).toBe(false);
+  });
+});
+
+describe("chooseShardedHome — proactive home decision (AM-4/AM-7)", () => {
+  const pool = [acct("a"), acct("b"), acct("c"), acct("d")];
+
+  test("first turn (no policy pin) → lazy assignment, rewrite the pin (AM-7)", () => {
+    const decision = chooseShardedHome({
+      sessionId: "s1",
+      currentPolicyPin: null,
+      accounts: pool,
+      nearExhaustionPct: 90,
+      now: NOW,
+    });
+    expect(decision.kind).toBe("home");
+    if (decision.kind === "home") {
+      expect(decision.rewritePin).toBe(true);
+      // and it is the deterministic shard for this session id
+      expect(decision.credentialId).toBe(
+        shardCredentialForSession({
+          sessionId: "s1",
+          accounts: pool,
+          nearExhaustionPct: 90,
+          now: NOW,
+        }),
+      );
+    }
+  });
+
+  test("eligible policy pin → KEEP it, no rewrite (steady-state cache warmth)", () => {
+    // Whatever 's1' shards to is, by construction, eligible → keep it.
+    const home = shardCredentialForSession({
+      sessionId: "s1",
+      accounts: pool,
+      nearExhaustionPct: 90,
+      now: NOW,
+    })!;
+    const decision = chooseShardedHome({
+      sessionId: "s1",
+      currentPolicyPin: home,
+      accounts: pool,
+      nearExhaustionPct: 90,
+      now: NOW,
+    });
+    expect(decision).toEqual({ kind: "home", credentialId: home, rewritePin: false });
+  });
+
+  test("capped policy pin → re-shard to a survivor and rewrite the pin durably (AM-4)", () => {
+    const accounts = [
+      acct("a", { primaryUsedPercent: 97 }), // the (capped) current home
+      acct("b"),
+      acct("c"),
+      acct("d"),
+    ];
+    const decision = chooseShardedHome({
+      sessionId: "s1",
+      currentPolicyPin: "a",
+      accounts,
+      nearExhaustionPct: 90,
+      now: NOW,
+    });
+    expect(decision.kind).toBe("home");
+    if (decision.kind === "home") {
+      expect(decision.rewritePin).toBe(true);
+      expect(decision.credentialId).not.toBe("a");
+      // it is the deterministic re-shard over the ELIGIBLE survivors
+      expect(decision.credentialId).toBe(
+        shardCredentialForSession({ sessionId: "s1", accounts, nearExhaustionPct: 90, now: NOW }),
+      );
+    }
+  });
+
+  test("all accounts capped → allCapped with the earliest reset (caller idles)", () => {
+    const resetAt = new Date(NOW.getTime() + HOUR);
+    const accounts = [
+      acct("a", { primaryUsedPercent: 95, primaryResetAt: resetAt }),
+      acct("b", { exhaustedUntil: resetAt }),
+    ];
+    const decision = chooseShardedHome({
+      sessionId: "s1",
+      currentPolicyPin: "a",
+      accounts,
+      nearExhaustionPct: 90,
+      now: NOW,
+    });
+    expect(decision.kind).toBe("allCapped");
+    if (decision.kind === "allCapped") {
+      expect(decision.earliestResetAt.getTime()).toBeGreaterThan(NOW.getTime());
+    }
+  });
+
+  test("a policy pin that no longer exists (disconnected) → re-shard + rewrite", () => {
+    const decision = chooseShardedHome({
+      sessionId: "s1",
+      currentPolicyPin: "gone",
+      accounts: pool,
+      nearExhaustionPct: 90,
+      now: NOW,
+    });
+    expect(decision.kind).toBe("home");
+    if (decision.kind === "home") {
+      expect(decision.rewritePin).toBe(true);
+    }
+  });
+});
+
+describe("classifyCodexPin — pin lifecycle (manual sacrosanct, policy meaningful only under sharded)", () => {
+  const NON_SHARDED: CodexRotationStrategy[] = ["most_remaining", "round_robin", "drain_then_next"];
+  const ALL: CodexRotationStrategy[] = [...NON_SHARDED, "sharded"];
+
+  test("a MANUAL pin is honored under EVERY strategy, enabled or disabled", () => {
+    for (const strategy of ALL) {
+      for (const rotationEnabled of [true, false]) {
+        expect(
+          classifyCodexPin({
+            pinnedCredentialId: "acct-1",
+            pinSource: "manual",
+            strategy,
+            rotationEnabled,
+          }),
+        ).toBe("manual");
+      }
+    }
+  });
+
+  test("DEFENSE-IN-DEPTH: a pin with NULL source is treated as MANUAL under every strategy (never policy-moved)", () => {
+    // A pre-backfill row, or any pin written without a label, must fail safe toward
+    // sacredness — an unlabeled pin is never re-sharded, only an explicit 'policy' pin is.
+    for (const strategy of ALL) {
+      for (const rotationEnabled of [true, false]) {
+        expect(
+          classifyCodexPin({
+            pinnedCredentialId: "acct-1",
+            pinSource: null,
+            strategy,
+            rotationEnabled,
+          }),
+        ).toBe("manual");
+      }
+    }
+  });
+
+  test("a leftover POLICY pin under drain_then_next → clearStale (ignore + clear, follow strategy)", () => {
+    expect(
+      classifyCodexPin({
+        pinnedCredentialId: "ex-home",
+        pinSource: "policy",
+        strategy: "drain_then_next",
+        rotationEnabled: true,
+      }),
+    ).toBe("clearStale");
+  });
+
+  test("a POLICY pin is stale under ANY non-sharded strategy (and when rotation is off)", () => {
+    for (const strategy of NON_SHARDED) {
+      expect(
+        classifyCodexPin({
+          pinnedCredentialId: "ex-home",
+          pinSource: "policy",
+          strategy,
+          rotationEnabled: true,
+        }),
+      ).toBe("clearStale");
+    }
+    // sharded strategy but rotation DISABLED → the sharded policy is not active → stale.
+    expect(
+      classifyCodexPin({
+        pinnedCredentialId: "ex-home",
+        pinSource: "policy",
+        strategy: "sharded",
+        rotationEnabled: false,
+      }),
+    ).toBe("clearStale");
+  });
+
+  test("a POLICY pin under an ACTIVE sharded policy → sharded (keep / re-shard, never clear)", () => {
+    expect(
+      classifyCodexPin({
+        pinnedCredentialId: "home",
+        pinSource: "policy",
+        strategy: "sharded",
+        rotationEnabled: true,
+      }),
+    ).toBe("sharded");
+  });
+
+  test("an UNPINNED session under active sharded → sharded (first-turn lazy assignment)", () => {
+    expect(
+      classifyCodexPin({
+        pinnedCredentialId: null,
+        pinSource: null,
+        strategy: "sharded",
+        rotationEnabled: true,
+      }),
+    ).toBe("sharded");
+  });
+
+  test("an UNPINNED session under a non-sharded strategy (or rotation off) → unpinned (follow the active strategy)", () => {
+    for (const strategy of NON_SHARDED) {
+      expect(
+        classifyCodexPin({
+          pinnedCredentialId: null,
+          pinSource: null,
+          strategy,
+          rotationEnabled: true,
+        }),
+      ).toBe("unpinned");
+    }
+    expect(
+      classifyCodexPin({
+        pinnedCredentialId: null,
+        pinSource: null,
+        strategy: "sharded",
+        rotationEnabled: false,
+      }),
+    ).toBe("unpinned");
   });
 });

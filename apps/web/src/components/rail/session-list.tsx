@@ -32,6 +32,13 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useAppContext } from "@/context";
+import {
+  activeSessionContinuation,
+  advanceSessionPageIdentity,
+  emptySessionContinuation,
+  mergeSessionContinuation,
+  sessionPageKey,
+} from "@/lib/session-pagination";
 import { SESSION_TITLE_MAX_LENGTH, useInlineRename } from "@/lib/session-rename";
 import { applySessionPinProjection, subscribeToSessionPinChanges } from "@/lib/session-pins";
 import {
@@ -67,16 +74,22 @@ export function SessionList() {
   // Ordinary rows page independently of the complete pinned section. The
   // polled hook owns page one; additional pages are appended and deduplicated.
   // A filter change starts a fresh cursor chain rather than mixing snapshots.
-  const [extraSessions, setExtraSessions] = useState<Session[]>([]);
-  const [extraNextCursor, setExtraNextCursor] = useState<string | null | undefined>(undefined);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [loadMoreError, setLoadMoreError] = useState(false);
-  useEffect(() => {
-    setExtraSessions([]);
-    setExtraNextCursor(undefined);
-    setLoadMoreError(false);
-  }, [search, rail.workspaceId]);
-  const continuationCursor = extraNextCursor === undefined ? nextCursor : extraNextCursor;
+  const paginationKey = sessionPageKey(rail.workspaceId, search);
+  const paginationIdentity = useRef({ key: paginationKey, generation: 0 });
+  paginationIdentity.current = advanceSessionPageIdentity(
+    paginationIdentity.current,
+    paginationKey,
+  );
+  const pageGeneration = paginationIdentity.current.generation;
+  const [continuation, setContinuation] = useState(() => emptySessionContinuation(pageGeneration));
+  const activeContinuation = activeSessionContinuation(continuation, pageGeneration);
+  const extraSessions = activeContinuation.sessions;
+  const continuationCursor =
+    activeContinuation.nextCursor === undefined ? nextCursor : activeContinuation.nextCursor;
+  const [loadingMoreGeneration, setLoadingMoreGeneration] = useState<number | null>(null);
+  const loadingMore = loadingMoreGeneration === pageGeneration;
+  const loadMoreAttempt = useRef(0);
+  const loadMoreError = activeContinuation.failed;
   // Short-lived optimistic projections only. The page returned by the server
   // remains canonical; after each mutation we replace the projection with that
   // returned row and refresh once to reconcile tabs/devices/offline recovery.
@@ -243,28 +256,50 @@ export function SessionList() {
 
   const loadMore = useCallback(async () => {
     if (!continuationCursor || loadingMore) return;
-    setLoadingMore(true);
-    setLoadMoreError(false);
+    const requestGeneration = pageGeneration;
+    const attempt = ++loadMoreAttempt.current;
+    setLoadingMoreGeneration(requestGeneration);
+    setContinuation((current) => ({
+      ...activeSessionContinuation(current, requestGeneration),
+      failed: false,
+    }));
     try {
       const page = await context.client.listSessionPage(rail.workspaceId, {
         limit: 50,
         cursor: continuationCursor,
         ...(search ? { search } : {}),
       });
-      setExtraSessions((current) => {
-        const rows = new Map(current.map((session) => [session.id, session]));
-        for (const session of page.sessions) rows.set(session.id, session);
-        return [...rows.values()];
-      });
-      setExtraNextCursor(page.nextCursor);
+      if (
+        paginationIdentity.current.generation !== requestGeneration ||
+        loadMoreAttempt.current !== attempt
+      ) {
+        return;
+      }
+      setContinuation((current) =>
+        mergeSessionContinuation(current, pageGeneration, requestGeneration, page),
+      );
     } catch {
+      if (
+        paginationIdentity.current.generation !== requestGeneration ||
+        loadMoreAttempt.current !== attempt
+      ) {
+        return;
+      }
       // Keep already loaded rows and make this bounded page explicitly
       // retryable; a silent no-op would look like pagination had ended.
-      setLoadMoreError(true);
+      setContinuation((current) => ({
+        ...activeSessionContinuation(current, requestGeneration),
+        failed: true,
+      }));
     } finally {
-      setLoadingMore(false);
+      if (
+        paginationIdentity.current.generation === requestGeneration &&
+        loadMoreAttempt.current === attempt
+      ) {
+        setLoadingMoreGeneration(null);
+      }
     }
-  }, [context.client, continuationCursor, loadingMore, rail.workspaceId, search]);
+  }, [context.client, continuationCursor, loadingMore, pageGeneration, rail.workspaceId, search]);
 
   // Cross-tab invalidation and lifecycle reconciliation. Cross-device changes
   // arrive on the 15s poll; returning to a tab or reconnecting refreshes now.
@@ -857,20 +892,16 @@ function EmptySessions({ onStart }: { onStart: () => void }) {
  */
 export function CollapsedSessionsButton() {
   const rail = useRail();
-  const { sessions, pinned, loading, error } = useWorkspaceSessions({
+  const { sessions, loading, error } = useWorkspaceSessions({
     limit: 50,
     pollIntervalMs: 15_000,
   });
-  const allSessions = useMemo(() => [...pinned, ...sessions], [pinned, sessions]);
-  const runningCount = useMemo(
-    () => groupSessionsForRail(allSessions).running.length,
-    [allSessions],
-  );
+  const runningCount = useMemo(() => groupSessionsForRail(sessions).running.length, [sessions]);
   // The collapsed rail can't render the expanded list's loading/error copy, so
   // it mirrors those states: a failed load shows a failed-tone marker + tooltip
   // (expanding reveals the retry), a first load shows a gentle pulse.
-  const failed = Boolean(error) && allSessions.length === 0;
-  const firstLoad = loading && allSessions.length === 0;
+  const failed = Boolean(error) && sessions.length === 0;
+  const firstLoad = loading && sessions.length === 0;
   const tooltip = failed ? "Session history is unavailable" : "Sessions";
   return (
     <div className="flex flex-1 flex-col items-center gap-1 px-2 pt-1">

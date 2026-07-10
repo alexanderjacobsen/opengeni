@@ -36,29 +36,36 @@ export function useWorkspaceSessions(
   const parentSessionId = options.parentSessionId;
   const cursor = options.cursor;
   const search = options.search;
+  const queryKey = JSON.stringify({ workspaceId, limit, parentSessionId, cursor, search });
   const load = useCallback(
-    async () =>
-      await client.listSessionPage(workspaceId, {
+    async () => ({
+      queryKey,
+      page: await client.listSessionPage(workspaceId, {
         ...(limit !== undefined ? { limit } : {}),
         ...(parentSessionId !== undefined ? { parentSessionId } : {}),
         ...(cursor !== undefined ? { cursor } : {}),
         ...(search !== undefined ? { search } : {}),
       }),
-    [client, workspaceId, limit, parentSessionId, cursor, search],
+    }),
+    [client, workspaceId, limit, parentSessionId, cursor, search, queryKey],
   );
   const state = usePolledValue(load, {
     pollIntervalMs: options.pollIntervalMs,
     enabled: options.enabled,
   });
-  const pinned = state.data?.pinned ?? [];
-  const ordinary = state.data?.sessions ?? [];
+  // usePolledValue drops stale async completions, while the explicit query key
+  // also prevents the previous query's cached value from painting for the one
+  // render before its loader-change effect clears state.
+  const page = state.data?.queryKey === queryKey ? state.data.page : null;
+  const pinned = page?.pinned ?? [];
+  const ordinary = page?.sessions ?? [];
   return {
     // The old hook returned every visible session. Keep that public behavior
     // while exposing `pinned` separately for the compact section. The API page
     // itself continues to paginate only `ordinary` rows via nextCursor.
     sessions: [...pinned, ...ordinary],
     pinned,
-    nextCursor: state.data?.nextCursor ?? null,
+    nextCursor: page?.nextCursor ?? null,
     loading: state.loading,
     error: state.error,
     refresh: state.refresh,

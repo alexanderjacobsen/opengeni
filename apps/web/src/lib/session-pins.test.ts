@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import type { Session } from "@/types";
-import { applySessionPinProjection } from "./session-pins";
+import { applySessionPinProjection, reconcileFailedSessionPin } from "./session-pins";
 
 const session = {
   id: "00000000-0000-4000-8000-000000000026",
@@ -98,5 +98,31 @@ describe("session pin reconciliation", () => {
       pinnedAt: "2026-07-10T00:02:59.000Z",
       pinVersion: 4,
     });
+  });
+
+  test("a failed first pin may reconcile the exact optimistic version back to absent", () => {
+    const optimistic = {
+      ...session,
+      pinned: true,
+      pinnedAt: "2026-07-10T00:04:00.000Z",
+      pinVersion: 1,
+    };
+    expect(reconcileFailedSessionPin(optimistic, optimistic, session)).toEqual(session);
+  });
+
+  test("failure reconciliation cannot regress an intervening newer projection", () => {
+    const optimistic = {
+      ...session,
+      pinned: true,
+      pinnedAt: "2026-07-10T00:04:00.000Z",
+      pinVersion: 1,
+    };
+    const newer = {
+      ...optimistic,
+      pinned: false,
+      pinnedAt: null,
+      pinVersion: 2,
+    };
+    expect(reconcileFailedSessionPin(newer, optimistic, session)).toBe(newer);
   });
 });

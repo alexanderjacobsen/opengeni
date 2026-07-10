@@ -37,7 +37,11 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { sameSessionForContext } from "@/lib/session-context";
-import { applySessionPinProjection, notifySessionPinChanged } from "@/lib/session-pins";
+import {
+  applySessionPinProjection,
+  notifySessionPinChanged,
+  reconcileFailedSessionPin,
+} from "@/lib/session-pins";
 import {
   buildResources,
   buildTools,
@@ -530,7 +534,7 @@ export function RootRouteComponent() {
       // `before` would temporarily lie and could overwrite a newer device.
       const authoritative = await client.getSession(workspaceId, sessionId).catch(() => null);
       if (authoritative) {
-        setSession((current) => applySessionPinProjection(current, authoritative));
+        setSession((current) => reconcileFailedSessionPin(current, optimistic, authoritative));
         notifySessionPinChanged(workspaceId, sessionId);
       } else if (optimistic) {
         // If reconciliation is also unavailable (for example while offline),

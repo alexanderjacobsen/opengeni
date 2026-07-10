@@ -10604,19 +10604,22 @@ export async function listSessionsForSubject(
           )
         : undefined;
       const ordinaryRows = await tx
-        .select({ session: schema.sessions })
+        .select({ session: schema.sessions, pin: schema.sessionPins })
         .from(schema.sessions)
         .leftJoin(
           schema.sessionPins,
           and(
             eq(schema.sessionPins.workspaceId, workspaceId),
             eq(schema.sessionPins.subjectId, options.subjectId),
-            eq(schema.sessionPins.pinned, true),
             eq(schema.sessionPins.sessionId, schema.sessions.id),
           ),
         )
         .where(
-          and(...filters, isNull(schema.sessionPins.id), ...(cursorFilter ? [cursorFilter] : [])),
+          and(
+            ...filters,
+            or(isNull(schema.sessionPins.id), eq(schema.sessionPins.pinned, false)),
+            ...(cursorFilter ? [cursorFilter] : []),
+          ),
         )
         .orderBy(desc(schema.sessions.updatedAt), desc(schema.sessions.id))
         .limit(limit + 1);
@@ -10632,7 +10635,7 @@ export async function listSessionsForSubject(
           mapSession(row.session, mcpServers.get(row.session.id) ?? [], mapSessionPin(row.pin)),
         ),
         sessions: pageRows.map((row) =>
-          mapSession(row.session, mcpServers.get(row.session.id) ?? [], mapSessionPin(null)),
+          mapSession(row.session, mcpServers.get(row.session.id) ?? [], mapSessionPin(row.pin)),
         ),
         nextCursor:
           ordinaryRows.length > limit && tail

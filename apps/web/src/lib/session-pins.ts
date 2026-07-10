@@ -43,6 +43,47 @@ export function applySessionPinProjection(
   return { ...current, pinned, pinnedAt, pinVersion };
 }
 
+/**
+ * Reconcile the point read performed after a failed pin request.
+ *
+ * An optimistic first pin projects version 1 before the server responds. If the
+ * request fails before commit, the authoritative point read correctly returns
+ * the absent relation at version 0. The normal monotonic merge must reject an
+ * arbitrary lower revision, but doing so here would leave the exact optimistic
+ * projection stuck forever. Allow the lower authoritative revision only while
+ * the current state is still byte-for-byte the projection installed by this
+ * operation. Any intervening poll, mutation, or device response wins instead.
+ */
+export function reconcileFailedSessionPin(
+  current: Session | null,
+  optimistic: Pick<Session, "id" | "workspaceId" | "pinned" | "pinnedAt" | "pinVersion"> | null,
+  authoritative: Pick<Session, "id" | "workspaceId" | "pinned" | "pinnedAt" | "pinVersion">,
+): Session | null {
+  if (
+    !current ||
+    !optimistic ||
+    current.id !== optimistic.id ||
+    current.workspaceId !== optimistic.workspaceId ||
+    authoritative.id !== optimistic.id ||
+    authoritative.workspaceId !== optimistic.workspaceId
+  ) {
+    return applySessionPinProjection(current, authoritative);
+  }
+  const stillExactOptimistic =
+    Boolean(current.pinned) === Boolean(optimistic.pinned) &&
+    (current.pinnedAt ?? null) === (optimistic.pinnedAt ?? null) &&
+    (current.pinVersion ?? 0) === (optimistic.pinVersion ?? 0);
+  if (!stillExactOptimistic) {
+    return applySessionPinProjection(current, authoritative);
+  }
+  return {
+    ...current,
+    pinned: Boolean(authoritative.pinned),
+    pinnedAt: authoritative.pinnedAt ?? null,
+    pinVersion: authoritative.pinVersion ?? 0,
+  };
+}
+
 export function notifySessionPinChanged(workspaceId: string, sessionId: string): void {
   if (typeof BroadcastChannel === "undefined") {
     return;

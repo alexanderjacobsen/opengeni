@@ -150,12 +150,21 @@ describe("session pins (real PostgreSQL + FORCE RLS)", () => {
       expectedVersion: 1,
     });
     expect(staleUnpinRetry).toMatchObject({ pinned: false, pinnedAt: null, pinVersion: 2 });
+    const pageAfterUnpin = await listSessionsForSubject(db, workspace.workspaceId, {
+      subjectId: subject,
+    });
+    const ordinaryProjection = pageAfterUnpin.sessions.find((row) => row.id === target.id);
+    expect(ordinaryProjection).toMatchObject({
+      pinned: false,
+      pinnedAt: null,
+      pinVersion: 2,
+    });
     const repinned = await setSessionPin(db, {
       workspaceId: workspace.workspaceId,
       subjectId: subject,
       sessionId: target.id,
       pinned: true,
-      expectedVersion: 2,
+      expectedVersion: ordinaryProjection?.pinVersion,
     });
     expect(repinned).toMatchObject({ pinned: true, pinVersion: 3 });
 

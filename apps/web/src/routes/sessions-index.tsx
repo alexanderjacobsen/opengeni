@@ -190,9 +190,11 @@ export function SessionsIndexRoute({ workspaceId }: { workspaceId: string }) {
 function RecentSessions({ workspaceId }: { workspaceId: string }) {
   const { sessions, pinned } = useWorkspaceSessions({ limit: 12, pollIntervalMs: 30_000 });
   const recent = useMemo(() => {
-    const { running, grouped } = groupSessionsForRail(sessions);
+    const ordinary = sessions.filter((session) => !session.pinned);
+    const { running, grouped } = groupSessionsForRail(ordinary);
     // Pins are server-authoritative and intentionally sit above ordinary
-    // recency rows here too; they are already deduplicated from `sessions`.
+    // recency rows here too. `sessions` retains the historical all-visible-row
+    // contract, so remove its pins before recombining the explicit section.
     return [...pinned, ...running, ...grouped.flatMap((bucket) => bucket.sessions)].slice(0, 6);
   }, [pinned, sessions]);
 

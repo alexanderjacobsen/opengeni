@@ -291,6 +291,165 @@ describe("OPE-21 atomic Codex credential allocation", () => {
     expect(await workspaceCodexSubscriptionActive(dbB, settings, ws!.workspaceId)).toBe(true);
   });
 
+  test("temporary disable affects only new leases and re-enable still honors account health", async () => {
+    if (!available) return;
+    const [ws] = await freshAccount();
+    const toggledCredential = await connectCredential(ws!, "temporary-toggle");
+    const alternateCredential = await connectCredential(ws!, "temporary-alternate");
+    expect(await setActiveCodexCredential(dbA, ws!.workspaceId, toggledCredential)).toBe(true);
+
+    // Start a real holder before the future OPE-24 status transition. Temporary
+    // disable is an eligibility-only state: it must not delete credentials or
+    // revoke/terminate a turn that already owns a fenced lease.
+    const inFlightTurn = await seedTurn(ws!, 1);
+    const inFlight = await acquire(dbA, ws!, inFlightTurn);
+    expect(inFlight.credentialId).toBe(toggledCredential);
+    const [beforeDisable] = await admin<
+      { version: number; has_secret: boolean; holder_id: string; generation: number }[]
+    >`
+      select c.version, c.credential_encrypted is not null as has_secret,
+             l.holder_id, l.generation
+      from codex_subscription_credentials c
+      join codex_credential_leases l
+        on l.workspace_id = c.workspace_id and l.credential_id = c.id
+      where c.id = ${toggledCredential} and l.turn_id = ${inFlightTurn}`;
+    expect(beforeDisable?.has_secret).toBe(true);
+
+    // OPE-24 owns the eventual toggle write/API. Exercise the allocator's
+    // existing active-allowlist contract with its reserved status value only;
+    // no entitlement, disconnect, token, or activation behavior belongs here.
+    await admin`
+      update codex_subscription_credentials
+      set status = 'temporarily_disabled', updated_at = now()
+      where workspace_id = ${ws!.workspaceId} and id = ${toggledCredential}`;
+    expect(
+      await heartbeatCodexCredentialLease(
+        dbA,
+        ws!.accountId,
+        ws!.workspaceId,
+        inFlightTurn,
+        inFlight.holderId!,
+        inFlight.generation!,
+      ),
+    ).toBe(true);
+    const [afterDisable] = await admin<
+      {
+        status: string;
+        version: number;
+        has_secret: boolean;
+        holder_id: string;
+        generation: number;
+      }[]
+    >`
+      select c.status, c.version, c.credential_encrypted is not null as has_secret,
+             l.holder_id, l.generation
+      from codex_subscription_credentials c
+      join codex_credential_leases l
+        on l.workspace_id = c.workspace_id and l.credential_id = c.id
+      where c.id = ${toggledCredential} and l.turn_id = ${inFlightTurn}`;
+    expect(afterDisable).toEqual({
+      status: "temporarily_disabled",
+      version: beforeDisable!.version,
+      has_secret: true,
+      holder_id: beforeDisable!.holder_id,
+      generation: beforeDisable!.generation,
+    });
+
+    const disabledTurn = await seedTurn(ws!, 2);
+    const disabledSelection = await acquire(dbB, ws!, disabledTurn);
+    expect(disabledSelection.credentialId).toBe(alternateCredential);
+    expect(
+      await releaseCodexCredentialLease(
+        dbB,
+        ws!.accountId,
+        ws!.workspaceId,
+        disabledTurn,
+        disabledSelection.holderId!,
+        disabledSelection.generation!,
+      ),
+    ).toBe(true);
+    expect(
+      await releaseCodexCredentialLease(
+        dbA,
+        ws!.accountId,
+        ws!.workspaceId,
+        inFlightTurn,
+        inFlight.holderId!,
+        inFlight.generation!,
+      ),
+    ).toBe(true);
+
+    const chooseWhile = async (
+      position: number,
+      mutate: () => Promise<unknown>,
+    ): Promise<string | null> => {
+      await mutate();
+      const turnId = await seedTurn(ws!, position);
+      const selected = await acquire(dbB, ws!, turnId);
+      if (selected.holderId && selected.generation !== null) {
+        expect(
+          await releaseCodexCredentialLease(
+            dbB,
+            ws!.accountId,
+            ws!.workspaceId,
+            turnId,
+            selected.holderId,
+            selected.generation,
+          ),
+        ).toBe(true);
+      }
+      return selected.credentialId;
+    };
+
+    const resetAt = new Date(Date.now() + 60 * 60_000);
+    expect(
+      await chooseWhile(
+        3,
+        () => admin`
+        update codex_subscription_credentials
+        set status = 'active', exhausted_until = ${resetAt},
+            primary_used_percent = 0, primary_reset_at = null
+        where id = ${toggledCredential}`,
+      ),
+    ).toBe(alternateCredential);
+    expect(
+      await chooseWhile(
+        4,
+        () => admin`
+        update codex_subscription_credentials
+        set status = 'needs_relogin', exhausted_until = null
+        where id = ${toggledCredential}`,
+      ),
+    ).toBe(alternateCredential);
+    expect(
+      await chooseWhile(
+        5,
+        () => admin`
+        update codex_subscription_credentials
+        set status = 'active', primary_used_percent = 99,
+            primary_reset_at = ${resetAt}
+        where id = ${toggledCredential}`,
+      ),
+    ).toBe(alternateCredential);
+
+    // Once re-enabled AND healthy, the row is immediately eligible again. Make
+    // the alternate temporarily ineligible only to make the selected id
+    // deterministic; this never consumes or activates an entitlement.
+    expect(
+      await chooseWhile(
+        6,
+        () => admin`
+        update codex_subscription_credentials
+        set status = case when id = ${toggledCredential} then 'active'
+                          else 'temporarily_disabled' end,
+            exhausted_until = null,
+            primary_used_percent = 0,
+            primary_reset_at = null
+        where workspace_id = ${ws!.workspaceId}`,
+      ),
+    ).toBe(toggledCredential);
+  });
+
   test("long-turn heartbeat renews the holder; crash expiry is reclaimed; release is idempotent", async () => {
     if (!available) return;
     const [ws] = await freshAccount();

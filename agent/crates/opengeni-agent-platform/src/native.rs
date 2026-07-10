@@ -157,6 +157,17 @@ struct ExecProcessGroup {
     child: tokio::process::Child,
     pgid: i32,
     running: bool,
+    /// Whether [`wait`](Self::wait)'s post-exit group kill already ran. The
+    /// wait future may be dropped mid-sequence and re-created (the op-engine
+    /// pump polls it inside a select that drops arm futures every iteration);
+    /// re-running the group kill on re-entry is not just redundant — on macOS
+    /// `killpg` returns EPERM once the group holds only zombies (the anchor
+    /// killed but not yet reaped), which surfaced as a spurious typed wait
+    /// failure. Explicit [`terminate`](Self::terminate) calls do NOT set this:
+    /// the post-exit kill must still run once after a cancel, closing the
+    /// fork-race window (a descendant forked between a cancel's kill scan and
+    /// the direct child's exit).
+    wait_killed_group: bool,
     /// The per-op memory leaf this exec's processes were placed in (issue #345),
     /// or `None` when isolation is unavailable. Torn down once the process tree is
     /// reaped. Always `None` off Linux (no manager is ever wired there).
@@ -216,57 +227,52 @@ impl ExecProcessGroup {
             child,
             pgid,
             running: true,
+            wait_killed_group: false,
             op_cgroup,
         })
     }
 
-    fn inner(&mut self) -> &mut tokio::process::Child {
-        &mut self.child
+    /// Removes the child's stdio handles for the streaming [`ContainedExec`]; after
+    /// this the group only tracks lifecycle (wait/terminate), the caller owns I/O.
+    fn take_pipes(&mut self) -> ContainedPipes {
+        (
+            self.child.stdin.take(),
+            self.child.stdout.take(),
+            self.child.stderr.take(),
+        )
     }
 
     fn terminate(&mut self) -> std::io::Result<()> {
         terminate_unix_process_group(self.pgid)
     }
 
-    async fn wait_with_output(&mut self) -> std::io::Result<ExecOutput> {
-        let (stdin, stdout, stderr) = (
-            self.child.stdin.take(),
-            self.child.stdout.take(),
-            self.child.stderr.take(),
-        );
-        drop(stdin);
-
-        // Poll both pipes while the command runs so full output cannot deadlock it.
-        // As soon as the direct command exits, kill the anchored group before
-        // waiting for pipe EOF; this also catches an early leader exit whose
-        // ordinary descendants inherited the pipes or closed them deliberately.
-        let status_and_cleanup = async {
-            let status = self.child.wait().await?;
+    /// Waits for the DIRECT command to exit, then tears the group down in the #344
+    /// order: kill the process group (so descendants that inherited the pipes are
+    /// gone before the caller drains to EOF), THEN reap the stopped anchor fence.
+    /// `running` flips false only after the reap, so a cancellation at any earlier
+    /// point still fences the PGID via [`Drop`].
+    ///
+    /// RESUMABLE: every await point is cancel-safe and the group kill runs
+    /// exactly once (`wait_killed_group`), so a caller may drop this future at
+    /// any point and call `wait` again — the op-engine pump does exactly that
+    /// every select iteration.
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await?;
+        if !self.wait_killed_group {
             self.terminate()?;
-            Ok::<_, std::io::Error>(status)
-        };
-        let (status, stdout, stderr) = tokio::try_join!(
-            status_and_cleanup,
-            read_optional_pipe(stdout),
-            read_optional_pipe(stderr),
-        )?;
-
-        // Reap the fence only after the group kill and output drain. Tokio wait is
-        // cancel-safe; if this future is dropped after reaping, anchor.id() is None
-        // and Drop will not signal the now-recyclable numeric PGID.
+            self.wait_killed_group = true;
+        }
+        // Reap the fence only after the group kill. Tokio wait is cancel-safe; if
+        // this future is dropped after reaping, anchor.id() is None and Drop will
+        // not signal the now-recyclable numeric PGID.
         let _ = self.anchor.wait().await?;
         self.running = false;
-        let output = ExecOutput {
-            exit_code: status.code().unwrap_or(-1),
-            stdout,
-            stderr,
-        };
         // The process tree is reaped, so the op leaf can be removed now (bounded
         // EBUSY retry). Taking the handle here means Drop below won't touch it.
         if let Some(handle) = self.op_cgroup.take() {
             handle.teardown().await;
         }
-        Ok(output)
+        Ok(status)
     }
 }
 
@@ -288,7 +294,7 @@ impl Drop for ExecProcessGroup {
         // group was just SIGKILL'd but its processes reap asynchronously, so this
         // best-effort rmdir usually leaves an (eventually empty) leaf that the next
         // unit stop reclaims. On the normal path the handle was already taken and
-        // torn down in wait_with_output, so this is a no-op there.
+        // torn down in wait(), so this is a no-op there.
         if let Some(handle) = self.op_cgroup.take() {
             handle.teardown_best_effort();
         }
@@ -303,6 +309,21 @@ fn terminate_unix_process_group(pgid: i32) -> std::io::Result<()> {
 
     match killpg(Pid::from_raw(pgid), Signal::SIGKILL) {
         Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        // POSIX delivers the signal to every member the caller has permission
+        // for and reports EPERM only about the rest — members we could never
+        // kill under ANY handling. macOS raises it when the group holds a
+        // transiently unsignalable member (e.g. a zombie mid-reparent from a
+        // child git itself forked — seen live on macOS CI the moment git
+        // gained containment), where Linux reports success. The kill has done
+        // all it can either way; failing the op over it turned a SUCCESSFUL
+        // git commit into a typed error.
+        Err(Errno::EPERM) => {
+            tracing::debug!(
+                group_id = pgid,
+                "group kill reported EPERM (unsignalable member); owned members were signaled"
+            );
+            Ok(())
+        }
         Err(error) => Err(std::io::Error::from(error)),
     }
 }
@@ -318,35 +339,43 @@ struct ExecProcessGroup {
 
 #[cfg(windows)]
 impl ExecProcessGroup {
-    fn new(child: AsyncGroupChild) -> Self {
-        Self {
+    fn spawn(mut command: tokio::process::Command) -> std::io::Result<Self> {
+        // `command_group` wraps the spawn in a Job Object; kill-on-drop terminates
+        // the whole job (the direct child + every descendant) on cancel.
+        let child = command.group().kill_on_drop(true).spawn()?;
+        Ok(Self {
             child,
             running: true,
+        })
+    }
+
+    /// Removes the child's stdio handles for the streaming [`ContainedExec`].
+    fn take_pipes(&mut self) -> ContainedPipes {
+        let child = self.child.inner();
+        (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    }
+
+    /// Terminates the whole Job Object (idempotent — a repeat kill, or a kill after
+    /// the job already exited, is InvalidInput/NotFound and treated as success).
+    fn terminate(&mut self) -> std::io::Result<()> {
+        match self.child.start_kill() {
+            Ok(()) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
     }
 
-    fn inner(&mut self) -> &mut tokio::process::Child {
-        self.child.inner()
-    }
-
-    async fn wait_with_output(&mut self) -> std::io::Result<ExecOutput> {
-        let (stdin, stdout, stderr) = {
-            let child = self.child.inner();
-            (child.stdin.take(), child.stdout.take(), child.stderr.take())
-        };
-        drop(stdin);
-
-        let (status, stdout, stderr) = tokio::try_join!(
-            self.child.wait(),
-            read_optional_pipe(stdout),
-            read_optional_pipe(stderr),
-        )?;
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await?;
         self.running = false;
-        Ok(ExecOutput {
-            exit_code: status.code().unwrap_or(-1),
-            stdout,
-            stderr,
-        })
+        Ok(status)
     }
 }
 
@@ -379,6 +408,106 @@ where
     Ok(bytes)
 }
 
+/// The three stdio handles a [`ContainedExec`] exposes — stdin (write), stdout and
+/// stderr (read), each present until the caller takes it.
+type ContainedPipes = (
+    Option<tokio::process::ChildStdin>,
+    Option<tokio::process::ChildStdout>,
+    Option<tokio::process::ChildStderr>,
+);
+
+/// A spawned command and every ordinary descendant it spawns, contained as a POSIX
+/// process group (Unix) or a Job Object (Windows), with its stdio exposed for
+/// streaming.
+///
+/// This is the shared containment primitive: the one-shot [`NativePlatform::exec`]
+/// drains the pipes to EOF and assembles a single reply over it, while the op-stream
+/// job runner reads them incrementally into sequenced frames. The #344 cancellation
+/// semantics are preserved verbatim — [`terminate`](Self::terminate) SIGKILLs the
+/// whole group (idempotent), and [`Drop`] terminates any still-running group so a
+/// dropped handle never leaks descendants.
+pub struct ContainedExec {
+    /// The child's stdin (write end). Take it to feed input; drop it to signal EOF.
+    pub stdin: Option<tokio::process::ChildStdin>,
+    /// The child's stdout (read end). Take it to stream or assemble output.
+    pub stdout: Option<tokio::process::ChildStdout>,
+    /// The child's stderr (read end).
+    pub stderr: Option<tokio::process::ChildStderr>,
+    /// The lifecycle handle (anchored process group on Unix / Job Object on Windows).
+    /// Its `Drop` terminates the group.
+    group: ExecProcessGroup,
+}
+
+impl ContainedExec {
+    /// Waits for the direct command to exit, then tears the contained group down
+    /// (Unix: SIGKILL the process group, then reap the stopped anchor fence;
+    /// Windows: the Job Object is reaped on drop). Returns the command's exit status.
+    ///
+    /// Drain the taken `stdout`/`stderr` concurrently with this call — on Unix the
+    /// group is not killed until the direct command exits, so a descendant holding a
+    /// pipe open keeps it from reaching EOF until then.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a wait/cleanup IO error.
+    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.group.wait().await
+    }
+
+    /// SIGKILLs the whole contained group NOW (for cancellation or a deadline).
+    /// Idempotent: a repeat call, or a call after the group already exited, is a
+    /// no-op.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a signal/kill IO error other than "already gone".
+    pub fn terminate(&mut self) -> std::io::Result<()> {
+        self.group.terminate()
+    }
+}
+
+/// Spawns `command` inside a fresh containment group with piped stdio, returning a
+/// [`ContainedExec`] whose stdin/stdout/stderr handles are taken for streaming.
+///
+/// `kill_on_drop` and the three piped stdio slots are configured here, so callers
+/// pass a command with only program/args/cwd/env set. The containment is the #344
+/// design: on Unix a stopped anchor owns the process-group id; on Windows a Job
+/// Object owns the tree.
+///
+/// `cgroups` is the per-op OOM-isolation root: when present (Linux with isolation
+/// available), the group's processes are placed into a fresh memory leaf so their
+/// page cache and anon memory share one OOM fate, billed away from the supervisor.
+/// Pass `None` where isolation is unavailable or not wanted (tests, non-Linux).
+///
+/// # Errors
+///
+/// Propagates the spawn IO error (e.g. the program is missing or not executable).
+pub fn spawn_contained(
+    mut command: tokio::process::Command,
+    cgroups: Option<&OpCgroups>,
+) -> std::io::Result<ContainedExec> {
+    command
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    let mut group = ExecProcessGroup::spawn(command, cgroups)?;
+    #[cfg(windows)]
+    let mut group = {
+        // Job Objects give the whole-tree kill; per-op cgroup leaves are Linux-only.
+        let _ = cgroups;
+        ExecProcessGroup::spawn(command)?
+    };
+    let (stdin, stdout, stderr) = group.take_pipes();
+    Ok(ContainedExec {
+        stdin,
+        stdout,
+        stderr,
+        group,
+    })
+}
+
 #[async_trait]
 impl Platform for NativePlatform {
     fn host_identity(&self) -> HostIdentity {
@@ -401,7 +530,11 @@ impl Platform for NativePlatform {
         self.stream_registry.clone()
     }
 
-    async fn exec(&self, req: &v1::ExecRequest) -> PlatformResult<v1::ExecResponse> {
+    /// Builds the command (shell vs argv, cwd/env resolution) and spawns it
+    /// inside the shared containment primitive — the streaming job path. The
+    /// per-op cgroup leaf (#351) rides inside the group: placed at spawn, torn
+    /// down after the anchor reap in `wait()`, best-effort in `Drop`.
+    fn spawn_exec(&self, req: &v1::ExecRequest) -> PlatformResult<ContainedExec> {
         if req.command.is_empty() {
             return Err(PlatformError::Os {
                 message: "exec: empty command".to_string(),
@@ -421,43 +554,53 @@ impl Platform for NativePlatform {
         for (k, v) in &req.env {
             cmd.env(k, v);
         }
-        // Keep the direct-child backstop in addition to the group wrapper. The
-        // builder's kill-on-drop enables Windows Job Object cleanup; on Unix the
-        // wrapper's Drop sends SIGKILL to the POSIX process group.
-        cmd.kill_on_drop(true);
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
 
+        spawn_contained(cmd, self.cgroups.as_deref())
+            .map_err(|e| PlatformError::from_io(&format!("spawn {}", req.command[0]), &e))
+    }
+
+    async fn exec(&self, req: &v1::ExecRequest) -> PlatformResult<v1::ExecResponse> {
         let started = Instant::now();
-        #[cfg(unix)]
-        let mut child = ExecProcessGroup::spawn(cmd, self.cgroups.as_deref())
-            .map_err(|e| PlatformError::from_io(&format!("spawn {}", req.command[0]), &e))?;
-        #[cfg(windows)]
-        let mut child = {
-            let child =
-                cmd.group().kill_on_drop(true).spawn().map_err(|e| {
-                    PlatformError::from_io(&format!("spawn {}", req.command[0]), &e)
-                })?;
-            ExecProcessGroup::new(child)
-        };
+        // Spawn inside the shared containment primitive. `spawn_contained` (via
+        // `spawn_exec`) configures piped stdio + kill_on_drop; the group's Drop
+        // SIGKILLs the POSIX process group (Unix) / Job Object (Windows) on any
+        // early return, incl. the timeout.
+        let mut contained = self.spawn_exec(req)?;
 
         // Feed stdin (if any) then drop the handle so the child sees EOF.
         if req.stdin.is_empty() {
             // Close stdin immediately so a child reading stdin does not hang.
-            drop(child.inner().stdin.take());
-        } else if let Some(mut stdin) = child.inner().stdin.take() {
+            drop(contained.stdin.take());
+        } else if let Some(mut stdin) = contained.stdin.take() {
             let _ = stdin.write_all(&req.stdin).await;
             let _ = stdin.shutdown().await;
         }
 
-        let wait = child.wait_with_output();
+        // Assemble the full reply: drain both pipes to EOF WHILE waiting for the
+        // command, so large output cannot deadlock the child. `ContainedExec::wait`
+        // kills the group on the direct command's exit, letting descendant-held pipes
+        // reach EOF — the #344 ordering, unchanged.
+        let stdout = contained.stdout.take();
+        let stderr = contained.stderr.take();
+        let assemble = async {
+            let (status, stdout, stderr) = tokio::try_join!(
+                contained.wait(),
+                read_optional_pipe(stdout),
+                read_optional_pipe(stderr),
+            )?;
+            Ok::<ExecOutput, std::io::Error>(ExecOutput {
+                exit_code: status.code().unwrap_or(-1),
+                stdout,
+                stderr,
+            })
+        };
+
         let output = if req.timeout_ms > 0 {
             let dur = std::time::Duration::from_millis(u64::from(req.timeout_ms));
-            match tokio::time::timeout(dur, wait).await {
+            match tokio::time::timeout(dur, assemble).await {
                 Ok(out) => out.map_err(|e| PlatformError::from_io("exec wait", &e))?,
                 Err(_) => {
-                    // Dropping `child` below synchronously initiates process-group
+                    // Dropping `contained` below synchronously initiates process-group
                     // cleanup before this typed timeout becomes unobservable work.
                     return Ok(v1::ExecResponse {
                         exit_code: -1,
@@ -469,7 +612,8 @@ impl Platform for NativePlatform {
                 }
             }
         } else {
-            wait.await
+            assemble
+                .await
                 .map_err(|e| PlatformError::from_io("exec wait", &e))?
         };
 
@@ -624,33 +768,62 @@ impl Platform for NativePlatform {
         Ok(v1::FsRemoveResponse {})
     }
 
+    /// Builds the git argv (op-aware) and spawns it inside the shared
+    /// containment primitive — the engine-job path. Descendants are contained
+    /// (process group / Job Object) and, on a delegated Linux host, placed in
+    /// a per-op OOM cgroup leaf like any exec child.
+    fn spawn_git(&self, req: &v1::GitRequest) -> PlatformResult<ContainedExec> {
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.args(git_args(req.op(), &req.args))
+            .current_dir(self.resolve_cwd(&req.cwd));
+        spawn_contained(cmd, self.cgroups.as_deref())
+            .map_err(|e| PlatformError::from_io("spawn git", &e))
+    }
+
     async fn git(&self, req: &v1::GitRequest) -> PlatformResult<v1::GitResponse> {
-        let cwd = self.resolve_cwd(&req.cwd);
-        let args = git_args(req.op(), &req.args);
+        // Spawn via the shared containment primitive (spawn_git): behaviorally
+        // the pre-engine plain spawn plus containment — a closed piped stdin
+        // reads EOF exactly like the old Stdio::null.
+        let mut contained = self.spawn_git(req)?;
+        drop(contained.stdin.take());
+        let stdout = contained.stdout.take();
+        let stderr = contained.stderr.take();
+        let (status, stdout, stderr) = tokio::try_join!(
+            contained.wait(),
+            read_optional_pipe(stdout),
+            read_optional_pipe(stderr),
+        )
+        .map_err(|e| PlatformError::from_io("git wait", &e))?;
+        Ok(assemble_git_response(
+            req.op(),
+            status.code().unwrap_or(-1),
+            stdout,
+            stderr,
+        ))
+    }
+}
 
-        let output = tokio::process::Command::new("git")
-            .args(&args)
-            .current_dir(&cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| PlatformError::from_io("spawn git", &e))?;
-
-        let exit_code = output.status.code().unwrap_or(-1);
-        let status = if req.op() == v1::GitOp::Status && exit_code == 0 {
-            Some(parse_porcelain_status(&output.stdout))
-        } else {
-            None
-        };
-
-        Ok(v1::GitResponse {
-            exit_code,
-            stdout: prost::bytes::Bytes::from(output.stdout),
-            stderr: prost::bytes::Bytes::from(output.stderr),
-            status,
-        })
+/// Assembles the wire `GitResponse` from a finished git invocation: the
+/// porcelain-v2 structured parse for a clean `GIT_OP_STATUS`, raw
+/// stdout/stderr otherwise. Shared by the one-shot [`Platform::git`] and the
+/// engine-job git adapter so the reply shape can never drift.
+#[must_use]
+pub fn assemble_git_response(
+    op: v1::GitOp,
+    exit_code: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+) -> v1::GitResponse {
+    let status = if op == v1::GitOp::Status && exit_code == 0 {
+        Some(parse_porcelain_status(&stdout))
+    } else {
+        None
+    };
+    v1::GitResponse {
+        exit_code,
+        stdout: prost::bytes::Bytes::from(stdout),
+        stderr: prost::bytes::Bytes::from(stderr),
+        status,
     }
 }
 
@@ -1089,6 +1262,31 @@ mod tests {
         // Do not signal the bare PID here: it may have been reused. The bounded
         // fixture exits by itself, so a failed assertion remains identity-safe.
         panic!("{context} descendant {pid} survived process-group cleanup");
+    }
+
+    /// The op-engine pump recreates the `wait` future every select iteration,
+    /// so `ContainedExec::wait` must be RESUMABLE: dropped at any await point
+    /// and called again, it must still return the status — and must not
+    /// re-run the post-exit group kill (on macOS a second `killpg` on the
+    /// then-zombie-only group returns EPERM, which surfaced as a spurious
+    /// typed wait failure in CI).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contained_wait_is_resumable_across_drops() {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg("exit 7");
+        let mut contained = spawn_contained(cmd, None).expect("spawn");
+        drop(contained.stdin.take());
+        // Repeatedly drop the wait future mid-flight (1ms slices) until it
+        // completes — the pump's exact usage pattern under select.
+        let status = loop {
+            let sliced =
+                tokio::time::timeout(std::time::Duration::from_millis(1), contained.wait()).await;
+            if let Ok(result) = sliced {
+                break result.expect("wait must resume cleanly, never EPERM");
+            }
+        };
+        assert_eq!(status.code(), Some(7));
     }
 
     #[tokio::test]

@@ -462,6 +462,144 @@ export function goingOfflineReasonToJSON(object: GoingOfflineReason): string {
   }
 }
 
+/** The logical byte stream an op-frame Data chunk belongs to. */
+export enum OpChannel {
+  OP_CHANNEL_UNSPECIFIED = 0,
+  OP_CHANNEL_STDOUT = 1,
+  OP_CHANNEL_STDERR = 2,
+  /** OP_CHANNEL_CONTENT - Non-exec content (fs_read bodies and similar). */
+  OP_CHANNEL_CONTENT = 3,
+}
+
+export function opChannelFromJSON(object: any): OpChannel {
+  switch (object) {
+    case 0:
+    case "OP_CHANNEL_UNSPECIFIED":
+      return OpChannel.OP_CHANNEL_UNSPECIFIED;
+    case 1:
+    case "OP_CHANNEL_STDOUT":
+      return OpChannel.OP_CHANNEL_STDOUT;
+    case 2:
+    case "OP_CHANNEL_STDERR":
+      return OpChannel.OP_CHANNEL_STDERR;
+    case 3:
+    case "OP_CHANNEL_CONTENT":
+      return OpChannel.OP_CHANNEL_CONTENT;
+    default:
+      throw new globalThis.Error("Unrecognized enum value " + object + " for enum OpChannel");
+  }
+}
+
+export function opChannelToJSON(object: OpChannel): string {
+  switch (object) {
+    case OpChannel.OP_CHANNEL_UNSPECIFIED:
+      return "OP_CHANNEL_UNSPECIFIED";
+    case OpChannel.OP_CHANNEL_STDOUT:
+      return "OP_CHANNEL_STDOUT";
+    case OpChannel.OP_CHANNEL_STDERR:
+      return "OP_CHANNEL_STDERR";
+    case OpChannel.OP_CHANNEL_CONTENT:
+      return "OP_CHANNEL_CONTENT";
+    default:
+      throw new globalThis.Error("Unrecognized enum value " + object + " for enum OpChannel");
+  }
+}
+
+/**
+ * An op's lifecycle state on the runner: accepted → running → complete(retained)
+ * → gc; or lost. `lost` is always TYPED (see OpLostReason) — never a silent gap.
+ */
+export enum OpState {
+  OP_STATE_UNSPECIFIED = 0,
+  OP_STATE_ACCEPTED = 1,
+  OP_STATE_RUNNING = 2,
+  OP_STATE_COMPLETE = 3,
+  OP_STATE_LOST = 4,
+}
+
+export function opStateFromJSON(object: any): OpState {
+  switch (object) {
+    case 0:
+    case "OP_STATE_UNSPECIFIED":
+      return OpState.OP_STATE_UNSPECIFIED;
+    case 1:
+    case "OP_STATE_ACCEPTED":
+      return OpState.OP_STATE_ACCEPTED;
+    case 2:
+    case "OP_STATE_RUNNING":
+      return OpState.OP_STATE_RUNNING;
+    case 3:
+    case "OP_STATE_COMPLETE":
+      return OpState.OP_STATE_COMPLETE;
+    case 4:
+    case "OP_STATE_LOST":
+      return OpState.OP_STATE_LOST;
+    default:
+      throw new globalThis.Error("Unrecognized enum value " + object + " for enum OpState");
+  }
+}
+
+export function opStateToJSON(object: OpState): string {
+  switch (object) {
+    case OpState.OP_STATE_UNSPECIFIED:
+      return "OP_STATE_UNSPECIFIED";
+    case OpState.OP_STATE_ACCEPTED:
+      return "OP_STATE_ACCEPTED";
+    case OpState.OP_STATE_RUNNING:
+      return "OP_STATE_RUNNING";
+    case OpState.OP_STATE_COMPLETE:
+      return "OP_STATE_COMPLETE";
+    case OpState.OP_STATE_LOST:
+      return "OP_STATE_LOST";
+    default:
+      throw new globalThis.Error("Unrecognized enum value " + object + " for enum OpState");
+  }
+}
+
+/** Why a lost op is lost (present iff OpStatus.state == OP_STATE_LOST). */
+export enum OpLostReason {
+  OP_LOST_REASON_UNSPECIFIED = 0,
+  /**
+   * OP_LOST_REASON_EVICTED - A completed op's retained result was evicted (bounded LRU registry) before a
+   * final ack arrived — a loud, counted event, surfaced honestly on a late query.
+   */
+  OP_LOST_REASON_EVICTED = 1,
+  /**
+   * OP_LOST_REASON_AGENT_RESTARTED - The runner process restarted and the op's in-memory scope did not survive
+   * (until the journal + scope re-adoption of a later milestone).
+   */
+  OP_LOST_REASON_AGENT_RESTARTED = 2,
+}
+
+export function opLostReasonFromJSON(object: any): OpLostReason {
+  switch (object) {
+    case 0:
+    case "OP_LOST_REASON_UNSPECIFIED":
+      return OpLostReason.OP_LOST_REASON_UNSPECIFIED;
+    case 1:
+    case "OP_LOST_REASON_EVICTED":
+      return OpLostReason.OP_LOST_REASON_EVICTED;
+    case 2:
+    case "OP_LOST_REASON_AGENT_RESTARTED":
+      return OpLostReason.OP_LOST_REASON_AGENT_RESTARTED;
+    default:
+      throw new globalThis.Error("Unrecognized enum value " + object + " for enum OpLostReason");
+  }
+}
+
+export function opLostReasonToJSON(object: OpLostReason): string {
+  switch (object) {
+    case OpLostReason.OP_LOST_REASON_UNSPECIFIED:
+      return "OP_LOST_REASON_UNSPECIFIED";
+    case OpLostReason.OP_LOST_REASON_EVICTED:
+      return "OP_LOST_REASON_EVICTED";
+    case OpLostReason.OP_LOST_REASON_AGENT_RESTARTED:
+      return "OP_LOST_REASON_AGENT_RESTARTED";
+    default:
+      throw new globalThis.Error("Unrecognized enum value " + object + " for enum OpLostReason");
+  }
+}
+
 export enum StreamRole {
   STREAM_ROLE_UNSPECIFIED = 0,
   /** STREAM_ROLE_AGENT - The agent producing pty/desktop bytes. */
@@ -772,6 +910,14 @@ export interface Capabilities {
    * machine that "claims a display it can't capture" bug the 0.1.3 incident exposed.
    */
   desktopUnavailableReason: string;
+  /**
+   * The runner speaks the op-stream protocol (OpStart/OpFrame/OpAck; see the
+   * op-stream section below). Advertised at Hello; the server uses the streaming
+   * path only when this is true AND its own feature flag is on, else the legacy
+   * monolithic ops run exactly as today. Additive — absent (false) on an older
+   * runner means "legacy path", no version coupling.
+   */
+  opStream: boolean;
 }
 
 /** Detail about the agent's graphical display, when one is present. */
@@ -1172,6 +1318,55 @@ export interface Heartbeat {
    * sandboxes for new work).
    */
   draining: boolean;
+  /**
+   * The runner's measured host capacity — the upward report the server paces
+   * against (LIMITS-DOCTRINE: the runner holds no concurrency policy; the
+   * swarm/scheduler reads this and decides how much to throw at the machine).
+   */
+  capacity: HostCapacitySample | undefined;
+  /**
+   * Point-in-time op-admission counts (queues only ever fill once a derived
+   * pathology breaker saturates — nonzero queued figures are telemetry-worthy).
+   */
+  admission: AdmissionTelemetry | undefined;
+}
+
+/**
+ * A point-in-time host-capacity sample: the impure sampler's reading of
+ * MemAvailable, spool-filesystem free space, fd/pid headroom, and CPUs. Every
+ * runner-side budget/breaker is a fraction of these (rule R), so this is also
+ * how the server understands what the machine can take.
+ */
+export interface HostCapacitySample {
+  memAvailableBytes: string;
+  diskFreeBytes: string;
+  fdHeadroom: string;
+  pidHeadroom: string;
+  nproc: string;
+}
+
+/** Point-in-time op-admission counts, per class. */
+export interface AdmissionTelemetry {
+  lightRunning: string;
+  lightQueued: string;
+  heavyRunning: string;
+  heavyQueued: string;
+  /**
+   * Jobs with a live mailbox (running + completed-retained awaiting final
+   * ack) — the op-engine's routing-table size.
+   */
+  liveOps: string;
+  /**
+   * Op frames dropped by the fire-and-forget publish path (bulk lane down or
+   * its channel full). Protocol-healed by replay; recorded so an undersized
+   * lane is visible before it matters (monotonic).
+   */
+  opFramesDroppedTotal: string;
+  /**
+   * Completed ops evicted before their final ack (dropped results) — the
+   * registry's loud counter (monotonic).
+   */
+  evictedUnackedTotal: string;
 }
 
 export interface HeartbeatAck {
@@ -1319,6 +1514,226 @@ export interface UpdateMayProceedResponse {
 }
 
 /**
+ * The terminal outcome of an op — carried in the Exit frame body AND echoed in
+ * OpStatus once complete. Digests/totals are keyed by channel name
+ * ("stdout"/"stderr"/"content") for a byte-exact assembly proof.
+ */
+export interface OpExit {
+  exitCode: number;
+  /** Hit the runner-enforced deadline (process-tree killed). */
+  timedOut: boolean;
+  /** Cancelled via OpCancel. */
+  cancelled: boolean;
+  durationMs: string;
+  /** channel name → blake3 hex digest of the full channel stream. */
+  digests: { [key: string]: string };
+  /** channel name → total bytes emitted on the channel. */
+  totals: { [key: string]: string };
+  /**
+   * Set iff the RUNNER failed the op with a typed reason ("OP_OVERFLOW" /
+   * "OP_SPOOL_IO" / "OP_PIPE_IO"); empty for every child-decided outcome
+   * (exit/timeout/cancel). Never an exit-code sentinel — ambiguous renderings
+   * are outlawed (FAILURE-VISIBILITY.md).
+   */
+  failureCode: string;
+  /**
+   * Structured detail for failure_code (exact counters: retained bytes, the
+   * IO error text, captured byte totals) — the out-of-band plane's food.
+   */
+  failureDetail: { [key: string]: string };
+}
+
+export interface OpExit_DigestsEntry {
+  key: string;
+  value: string;
+}
+
+export interface OpExit_TotalsEntry {
+  key: string;
+  value: string;
+}
+
+export interface OpExit_FailureDetailEntry {
+  key: string;
+  value: string;
+}
+
+/**
+ * The op-begin for a STREAMING fs_write (M7): the target is set up here; the bytes
+ * arrive as chunked, idempotent WriteChunk request/replies (no reverse streaming).
+ */
+export interface FsWriteBegin {
+  path: string;
+  /** Create parent directories as needed. */
+  createParents: boolean;
+  /** POSIX mode for a newly created file (0 => platform default). */
+  mode: number;
+  /**
+   * Editor safety (M6): the expected blake3 hex digest of the file's CURRENT
+   * content for a read-modify-write; empty for a plain write. On a re-dispatch a
+   * mismatch REFUSES rather than double-applying a diff.
+   */
+  expectedBaseDigest: string;
+}
+
+/**
+ * Start an op (server→runner). IDEMPOTENT by op_id (= ControlRequest.request_id):
+ * a known op_id returns its current status and NEVER re-runs — this closes the
+ * at-least-once re-run hazard (a re-dispatched turn re-issues OpStart{same id} and
+ * attaches).
+ */
+export interface OpStart {
+  op:
+    | { $case: "exec"; exec: ExecRequest }
+    | { $case: "fsRead"; fsRead: FsReadRequest }
+    | { $case: "fsWrite"; fsWrite: FsWriteBegin }
+    | undefined;
+  /** Initial send credit in bytes (0 => the runner default, ~4 MiB). */
+  windowBytes: string;
+  /**
+   * Absolute runner-enforced deadline, unix-epoch ms (0 = none). Runner-side
+   * enforcement is authoritative (process-tree kill + Exit{timed_out}); the
+   * server wall-clock is advisory.
+   */
+  deadlineMs: string;
+  /** The originating session id, for per-origin fair admission. */
+  originId: string;
+}
+
+export interface OpStarted {
+  accepted: boolean;
+  status: OpStatus | undefined;
+}
+
+/**
+ * Cancel an op (server→runner). Idempotent; triggers the #344 process-tree kill and
+ * a terminal frame. Reply is OpStatus.
+ */
+export interface OpCancel {
+  opId: string;
+}
+
+/** Query an op's status (server→runner). Reply is OpStatus. */
+export interface OpQuery {
+  opId: string;
+}
+
+/**
+ * Re-attach to an op after a reconnect or a missed frame (server→runner): the
+ * runner re-publishes frames ≥ from_seq from its ring/spool, then resumes live
+ * flow. Reply is OpStatus.
+ */
+export interface OpAttach {
+  opId: string;
+  /** Resume from this exclusive sequence (the consumer's cumulative-ack floor). */
+  fromSeq: string;
+  /**
+   * Attach generation (B2): monotonic (the consumer's Temporal attempt number).
+   * The runner serves replay/credit only for the HIGHEST generation seen; a
+   * lower-generation (zombie) consumer's acks are ignored.
+   */
+  attachGeneration: string;
+  /**
+   * The fresh send-credit window for the resumed attachment, in bytes
+   * (0 => reuse the window granted at OpStart). OpAck's absolute credit_bytes
+   * resizes it thereafter.
+   */
+  windowBytes: string;
+}
+
+/**
+ * The current status of an op (server←runner reply to OpCancel/OpQuery/OpAttach,
+ * and embedded in OpStarted).
+ */
+export interface OpStatus {
+  opId: string;
+  state: OpState;
+  /**
+   * The next sequence number the runner will assign (the high watermark, for gap
+   * detection).
+   */
+  nextSeq: string;
+  /** Present iff state == OP_STATE_COMPLETE. */
+  exit: OpExit | undefined;
+  /** Present iff state == OP_STATE_LOST. */
+  lostReason: OpLostReason;
+}
+
+/**
+ * One chunk of a streaming upload (server→runner): plain idempotent request/reply
+ * per chunk (≤512 KiB). A duplicate (op_id, seq) is acked WITHOUT re-applying.
+ */
+export interface WriteChunk {
+  opId: string;
+  /** The op-scoped monotonic chunk sequence. */
+  seq: string;
+  bytes: Uint8Array;
+  /** The final chunk: commit = digest-verify then atomic rename (M7). */
+  last: boolean;
+  /**
+   * Byte offset this chunk writes at (M7: writes land in an op-scoped temp file,
+   * committed on the last chunk — an aborted transfer leaves no visible file).
+   */
+  offset: string;
+}
+
+export interface WriteChunkAck {
+  seq: string;
+}
+
+/**
+ * A runner→server op frame, published fire-and-forget on the op subject
+ * (`agent.<ws>.<id>.op.<op_id>`). `seq` is a SINGLE monotonic sequence per op
+ * across ALL body kinds (Progress frames consume sequence numbers too, so gap
+ * detection is uniform).
+ */
+export interface OpFrame {
+  opId: string;
+  seq: string;
+  body:
+    | { $case: "data"; data: OpData }
+    | { $case: "progress"; progress: OpProgress }
+    | { $case: "exit"; exit: OpExit }
+    | undefined;
+}
+
+/** A chunk of op output on a channel (≤128 KiB per frame). */
+export interface OpData {
+  channel: OpChannel;
+  bytes: Uint8Array;
+}
+
+/**
+ * A liveness tick: the op is alive but produced no Data. Emitted every 5s while an
+ * op is live and quiet; consumes a sequence number like any frame.
+ */
+export interface OpProgress {}
+
+/**
+ * A server→runner cumulative ack + credit replenishment, published fire-and-forget
+ * on the ack subject (`agent.<ws>.<id>.ack`). Best-effort, healed by repetition.
+ */
+export interface OpAck {
+  opId: string;
+  /** Cumulative: every frame with seq ≤ acked_seq is acknowledged. */
+  ackedSeq: string;
+  /** The replenished ABSOLUTE send-credit window in bytes. */
+  creditBytes: string;
+  /** The server has fully consumed the terminal frame → the runner may GC the op. */
+  final: boolean;
+  /**
+   * The consumer's attach generation (matches OpAttach.attach_generation; the
+   * consumer's Temporal attempt number). The runner honors this ack — its floor
+   * advance AND its credit grant — ONLY for the HIGHEST generation it has seen for
+   * the op; a lower-generation (zombie) ack is ignored. This must ride the wire
+   * (not be inferred from monotonic acked_seq alone) because credit_bytes is an
+   * ABSOLUTE window REPLACEMENT: a stale consumer's ack could otherwise shrink the
+   * live consumer's window (stall) or grant unintended credit (B2).
+   */
+  attachGeneration: string;
+}
+
+/**
  * Wraps an op-specific request. `request_id` correlates a response to a request
  * even over fan-out; `epoch` carries the lease/active epoch the control plane
  * resolved this op against, so the agent can reject a stale op (ERROR_CODE_FENCED).
@@ -1347,7 +1762,16 @@ export interface ControlRequest {
     | { $case: "metrics"; metrics: MetricsRequest }
     | { $case: "updateMayProceed"; updateMayProceed: UpdateMayProceedRequest }
     | { $case: "desktopInput"; desktopInput: DesktopInputRequest }
-    | { $case: "desktopScreenshot"; desktopScreenshot: DesktopScreenshotRequest }
+    | { $case: "desktopScreenshot"; desktopScreenshot: DesktopScreenshotRequest } //
+    /**
+     * Op-stream (v1.1), additive. All ride the same rpc subject; each has an
+     * idempotent, typed reply in ControlResponse.result below.
+     */
+    | { $case: "opStart"; opStart: OpStart }
+    | { $case: "opCancel"; opCancel: OpCancel }
+    | { $case: "opQuery"; opQuery: OpQuery }
+    | { $case: "opAttach"; opAttach: OpAttach }
+    | { $case: "writeChunk"; writeChunk: WriteChunk }
     | undefined;
 }
 
@@ -1377,7 +1801,14 @@ export interface ControlResponse {
     | { $case: "metrics"; metrics: MetricsSample }
     | { $case: "updateMayProceed"; updateMayProceed: UpdateMayProceedResponse }
     | { $case: "desktopInput"; desktopInput: DesktopInputResponse }
-    | { $case: "desktopScreenshot"; desktopScreenshot: DesktopScreenshotResponse }
+    | { $case: "desktopScreenshot"; desktopScreenshot: DesktopScreenshotResponse } //
+    /**
+     * Op-stream (v1.1) replies, additive. OpStart → OpStarted; OpCancel / OpQuery /
+     * OpAttach all reply OpStatus (op_status); WriteChunk → WriteChunkAck.
+     */
+    | { $case: "opStart"; opStart: OpStarted }
+    | { $case: "opStatus"; opStatus: OpStatus }
+    | { $case: "writeChunk"; writeChunk: WriteChunkAck }
     | undefined;
 }
 
@@ -1988,6 +2419,7 @@ function createBaseCapabilities(): Capabilities {
     consentedScreenControl: false,
     display: undefined,
     desktopUnavailableReason: "",
+    opStream: false,
   };
 }
 
@@ -2019,6 +2451,9 @@ export const Capabilities: MessageFns<Capabilities> = {
     }
     if (message.desktopUnavailableReason !== "") {
       writer.uint32(74).string(message.desktopUnavailableReason);
+    }
+    if (message.opStream !== false) {
+      writer.uint32(80).bool(message.opStream);
     }
     return writer;
   },
@@ -2102,6 +2537,14 @@ export const Capabilities: MessageFns<Capabilities> = {
           message.desktopUnavailableReason = reader.string();
           continue;
         }
+        case 10: {
+          if (tag !== 80) {
+            break;
+          }
+
+          message.opStream = reader.bool();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -2134,6 +2577,11 @@ export const Capabilities: MessageFns<Capabilities> = {
         : isSet(object.desktop_unavailable_reason)
           ? globalThis.String(object.desktop_unavailable_reason)
           : "",
+      opStream: isSet(object.opStream)
+        ? globalThis.Boolean(object.opStream)
+        : isSet(object.op_stream)
+          ? globalThis.Boolean(object.op_stream)
+          : false,
     };
   },
 
@@ -2166,6 +2614,9 @@ export const Capabilities: MessageFns<Capabilities> = {
     if (message.desktopUnavailableReason !== "") {
       obj.desktopUnavailableReason = message.desktopUnavailableReason;
     }
+    if (message.opStream !== false) {
+      obj.opStream = message.opStream;
+    }
     return obj;
   },
 
@@ -2186,6 +2637,7 @@ export const Capabilities: MessageFns<Capabilities> = {
         ? Display.fromPartial(object.display)
         : undefined;
     message.desktopUnavailableReason = object.desktopUnavailableReason ?? "";
+    message.opStream = object.opStream ?? false;
     return message;
   },
 };
@@ -6266,7 +6718,15 @@ export const DesktopScreenshotResponse: MessageFns<DesktopScreenshotResponse> = 
 };
 
 function createBaseHeartbeat(): Heartbeat {
-  return { seq: "0", uptimeMs: "0", activeSessions: 0, metrics: undefined, draining: false };
+  return {
+    seq: "0",
+    uptimeMs: "0",
+    activeSessions: 0,
+    metrics: undefined,
+    draining: false,
+    capacity: undefined,
+    admission: undefined,
+  };
 }
 
 export const Heartbeat: MessageFns<Heartbeat> = {
@@ -6285,6 +6745,12 @@ export const Heartbeat: MessageFns<Heartbeat> = {
     }
     if (message.draining !== false) {
       writer.uint32(40).bool(message.draining);
+    }
+    if (message.capacity !== undefined) {
+      HostCapacitySample.encode(message.capacity, writer.uint32(50).fork()).join();
+    }
+    if (message.admission !== undefined) {
+      AdmissionTelemetry.encode(message.admission, writer.uint32(58).fork()).join();
     }
     return writer;
   },
@@ -6336,6 +6802,22 @@ export const Heartbeat: MessageFns<Heartbeat> = {
           message.draining = reader.bool();
           continue;
         }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.capacity = HostCapacitySample.decode(reader, reader.uint32());
+          continue;
+        }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.admission = AdmissionTelemetry.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -6360,6 +6842,10 @@ export const Heartbeat: MessageFns<Heartbeat> = {
           : 0,
       metrics: isSet(object.metrics) ? MetricsSample.fromJSON(object.metrics) : undefined,
       draining: isSet(object.draining) ? globalThis.Boolean(object.draining) : false,
+      capacity: isSet(object.capacity) ? HostCapacitySample.fromJSON(object.capacity) : undefined,
+      admission: isSet(object.admission)
+        ? AdmissionTelemetry.fromJSON(object.admission)
+        : undefined,
     };
   },
 
@@ -6380,6 +6866,12 @@ export const Heartbeat: MessageFns<Heartbeat> = {
     if (message.draining !== false) {
       obj.draining = message.draining;
     }
+    if (message.capacity !== undefined) {
+      obj.capacity = HostCapacitySample.toJSON(message.capacity);
+    }
+    if (message.admission !== undefined) {
+      obj.admission = AdmissionTelemetry.toJSON(message.admission);
+    }
     return obj;
   },
 
@@ -6396,6 +6888,352 @@ export const Heartbeat: MessageFns<Heartbeat> = {
         ? MetricsSample.fromPartial(object.metrics)
         : undefined;
     message.draining = object.draining ?? false;
+    message.capacity =
+      object.capacity !== undefined && object.capacity !== null
+        ? HostCapacitySample.fromPartial(object.capacity)
+        : undefined;
+    message.admission =
+      object.admission !== undefined && object.admission !== null
+        ? AdmissionTelemetry.fromPartial(object.admission)
+        : undefined;
+    return message;
+  },
+};
+
+function createBaseHostCapacitySample(): HostCapacitySample {
+  return {
+    memAvailableBytes: "0",
+    diskFreeBytes: "0",
+    fdHeadroom: "0",
+    pidHeadroom: "0",
+    nproc: "0",
+  };
+}
+
+export const HostCapacitySample: MessageFns<HostCapacitySample> = {
+  encode(message: HostCapacitySample, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.memAvailableBytes !== "0") {
+      writer.uint32(8).uint64(message.memAvailableBytes);
+    }
+    if (message.diskFreeBytes !== "0") {
+      writer.uint32(16).uint64(message.diskFreeBytes);
+    }
+    if (message.fdHeadroom !== "0") {
+      writer.uint32(24).uint64(message.fdHeadroom);
+    }
+    if (message.pidHeadroom !== "0") {
+      writer.uint32(32).uint64(message.pidHeadroom);
+    }
+    if (message.nproc !== "0") {
+      writer.uint32(40).uint64(message.nproc);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): HostCapacitySample {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseHostCapacitySample();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.memAvailableBytes = reader.uint64().toString();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.diskFreeBytes = reader.uint64().toString();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.fdHeadroom = reader.uint64().toString();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.pidHeadroom = reader.uint64().toString();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.nproc = reader.uint64().toString();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): HostCapacitySample {
+    return {
+      memAvailableBytes: isSet(object.memAvailableBytes)
+        ? globalThis.String(object.memAvailableBytes)
+        : isSet(object.mem_available_bytes)
+          ? globalThis.String(object.mem_available_bytes)
+          : "0",
+      diskFreeBytes: isSet(object.diskFreeBytes)
+        ? globalThis.String(object.diskFreeBytes)
+        : isSet(object.disk_free_bytes)
+          ? globalThis.String(object.disk_free_bytes)
+          : "0",
+      fdHeadroom: isSet(object.fdHeadroom)
+        ? globalThis.String(object.fdHeadroom)
+        : isSet(object.fd_headroom)
+          ? globalThis.String(object.fd_headroom)
+          : "0",
+      pidHeadroom: isSet(object.pidHeadroom)
+        ? globalThis.String(object.pidHeadroom)
+        : isSet(object.pid_headroom)
+          ? globalThis.String(object.pid_headroom)
+          : "0",
+      nproc: isSet(object.nproc) ? globalThis.String(object.nproc) : "0",
+    };
+  },
+
+  toJSON(message: HostCapacitySample): unknown {
+    const obj: any = {};
+    if (message.memAvailableBytes !== "0") {
+      obj.memAvailableBytes = message.memAvailableBytes;
+    }
+    if (message.diskFreeBytes !== "0") {
+      obj.diskFreeBytes = message.diskFreeBytes;
+    }
+    if (message.fdHeadroom !== "0") {
+      obj.fdHeadroom = message.fdHeadroom;
+    }
+    if (message.pidHeadroom !== "0") {
+      obj.pidHeadroom = message.pidHeadroom;
+    }
+    if (message.nproc !== "0") {
+      obj.nproc = message.nproc;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<HostCapacitySample>, I>>(base?: I): HostCapacitySample {
+    return HostCapacitySample.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<HostCapacitySample>, I>>(object: I): HostCapacitySample {
+    const message = createBaseHostCapacitySample();
+    message.memAvailableBytes = object.memAvailableBytes ?? "0";
+    message.diskFreeBytes = object.diskFreeBytes ?? "0";
+    message.fdHeadroom = object.fdHeadroom ?? "0";
+    message.pidHeadroom = object.pidHeadroom ?? "0";
+    message.nproc = object.nproc ?? "0";
+    return message;
+  },
+};
+
+function createBaseAdmissionTelemetry(): AdmissionTelemetry {
+  return {
+    lightRunning: "0",
+    lightQueued: "0",
+    heavyRunning: "0",
+    heavyQueued: "0",
+    liveOps: "0",
+    opFramesDroppedTotal: "0",
+    evictedUnackedTotal: "0",
+  };
+}
+
+export const AdmissionTelemetry: MessageFns<AdmissionTelemetry> = {
+  encode(message: AdmissionTelemetry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.lightRunning !== "0") {
+      writer.uint32(8).uint64(message.lightRunning);
+    }
+    if (message.lightQueued !== "0") {
+      writer.uint32(16).uint64(message.lightQueued);
+    }
+    if (message.heavyRunning !== "0") {
+      writer.uint32(24).uint64(message.heavyRunning);
+    }
+    if (message.heavyQueued !== "0") {
+      writer.uint32(32).uint64(message.heavyQueued);
+    }
+    if (message.liveOps !== "0") {
+      writer.uint32(40).uint64(message.liveOps);
+    }
+    if (message.opFramesDroppedTotal !== "0") {
+      writer.uint32(48).uint64(message.opFramesDroppedTotal);
+    }
+    if (message.evictedUnackedTotal !== "0") {
+      writer.uint32(56).uint64(message.evictedUnackedTotal);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): AdmissionTelemetry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseAdmissionTelemetry();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.lightRunning = reader.uint64().toString();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.lightQueued = reader.uint64().toString();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.heavyRunning = reader.uint64().toString();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.heavyQueued = reader.uint64().toString();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.liveOps = reader.uint64().toString();
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.opFramesDroppedTotal = reader.uint64().toString();
+          continue;
+        }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.evictedUnackedTotal = reader.uint64().toString();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): AdmissionTelemetry {
+    return {
+      lightRunning: isSet(object.lightRunning)
+        ? globalThis.String(object.lightRunning)
+        : isSet(object.light_running)
+          ? globalThis.String(object.light_running)
+          : "0",
+      lightQueued: isSet(object.lightQueued)
+        ? globalThis.String(object.lightQueued)
+        : isSet(object.light_queued)
+          ? globalThis.String(object.light_queued)
+          : "0",
+      heavyRunning: isSet(object.heavyRunning)
+        ? globalThis.String(object.heavyRunning)
+        : isSet(object.heavy_running)
+          ? globalThis.String(object.heavy_running)
+          : "0",
+      heavyQueued: isSet(object.heavyQueued)
+        ? globalThis.String(object.heavyQueued)
+        : isSet(object.heavy_queued)
+          ? globalThis.String(object.heavy_queued)
+          : "0",
+      liveOps: isSet(object.liveOps)
+        ? globalThis.String(object.liveOps)
+        : isSet(object.live_ops)
+          ? globalThis.String(object.live_ops)
+          : "0",
+      opFramesDroppedTotal: isSet(object.opFramesDroppedTotal)
+        ? globalThis.String(object.opFramesDroppedTotal)
+        : isSet(object.op_frames_dropped_total)
+          ? globalThis.String(object.op_frames_dropped_total)
+          : "0",
+      evictedUnackedTotal: isSet(object.evictedUnackedTotal)
+        ? globalThis.String(object.evictedUnackedTotal)
+        : isSet(object.evicted_unacked_total)
+          ? globalThis.String(object.evicted_unacked_total)
+          : "0",
+    };
+  },
+
+  toJSON(message: AdmissionTelemetry): unknown {
+    const obj: any = {};
+    if (message.lightRunning !== "0") {
+      obj.lightRunning = message.lightRunning;
+    }
+    if (message.lightQueued !== "0") {
+      obj.lightQueued = message.lightQueued;
+    }
+    if (message.heavyRunning !== "0") {
+      obj.heavyRunning = message.heavyRunning;
+    }
+    if (message.heavyQueued !== "0") {
+      obj.heavyQueued = message.heavyQueued;
+    }
+    if (message.liveOps !== "0") {
+      obj.liveOps = message.liveOps;
+    }
+    if (message.opFramesDroppedTotal !== "0") {
+      obj.opFramesDroppedTotal = message.opFramesDroppedTotal;
+    }
+    if (message.evictedUnackedTotal !== "0") {
+      obj.evictedUnackedTotal = message.evictedUnackedTotal;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<AdmissionTelemetry>, I>>(base?: I): AdmissionTelemetry {
+    return AdmissionTelemetry.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<AdmissionTelemetry>, I>>(object: I): AdmissionTelemetry {
+    const message = createBaseAdmissionTelemetry();
+    message.lightRunning = object.lightRunning ?? "0";
+    message.lightQueued = object.lightQueued ?? "0";
+    message.heavyRunning = object.heavyRunning ?? "0";
+    message.heavyQueued = object.heavyQueued ?? "0";
+    message.liveOps = object.liveOps ?? "0";
+    message.opFramesDroppedTotal = object.opFramesDroppedTotal ?? "0";
+    message.evictedUnackedTotal = object.evictedUnackedTotal ?? "0";
     return message;
   },
 };
@@ -8050,6 +8888,1884 @@ export const UpdateMayProceedResponse: MessageFns<UpdateMayProceedResponse> = {
   },
 };
 
+function createBaseOpExit(): OpExit {
+  return {
+    exitCode: 0,
+    timedOut: false,
+    cancelled: false,
+    durationMs: "0",
+    digests: {},
+    totals: {},
+    failureCode: "",
+    failureDetail: {},
+  };
+}
+
+export const OpExit: MessageFns<OpExit> = {
+  encode(message: OpExit, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.exitCode !== 0) {
+      writer.uint32(8).int32(message.exitCode);
+    }
+    if (message.timedOut !== false) {
+      writer.uint32(16).bool(message.timedOut);
+    }
+    if (message.cancelled !== false) {
+      writer.uint32(24).bool(message.cancelled);
+    }
+    if (message.durationMs !== "0") {
+      writer.uint32(32).uint64(message.durationMs);
+    }
+    globalThis.Object.entries(message.digests).forEach(([key, value]: [string, string]) => {
+      OpExit_DigestsEntry.encode({ key: key as any, value }, writer.uint32(42).fork()).join();
+    });
+    globalThis.Object.entries(message.totals).forEach(([key, value]: [string, string]) => {
+      OpExit_TotalsEntry.encode({ key: key as any, value }, writer.uint32(50).fork()).join();
+    });
+    if (message.failureCode !== "") {
+      writer.uint32(58).string(message.failureCode);
+    }
+    globalThis.Object.entries(message.failureDetail).forEach(([key, value]: [string, string]) => {
+      OpExit_FailureDetailEntry.encode({ key: key as any, value }, writer.uint32(66).fork()).join();
+    });
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): OpExit {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOpExit();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.exitCode = reader.int32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.timedOut = reader.bool();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.cancelled = reader.bool();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.durationMs = reader.uint64().toString();
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          const entry5 = OpExit_DigestsEntry.decode(reader, reader.uint32());
+          if (entry5.value !== undefined) {
+            message.digests[entry5.key] = entry5.value;
+          }
+          continue;
+        }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          const entry6 = OpExit_TotalsEntry.decode(reader, reader.uint32());
+          if (entry6.value !== undefined) {
+            message.totals[entry6.key] = entry6.value;
+          }
+          continue;
+        }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.failureCode = reader.string();
+          continue;
+        }
+        case 8: {
+          if (tag !== 66) {
+            break;
+          }
+
+          const entry8 = OpExit_FailureDetailEntry.decode(reader, reader.uint32());
+          if (entry8.value !== undefined) {
+            message.failureDetail[entry8.key] = entry8.value;
+          }
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): OpExit {
+    return {
+      exitCode: isSet(object.exitCode)
+        ? globalThis.Number(object.exitCode)
+        : isSet(object.exit_code)
+          ? globalThis.Number(object.exit_code)
+          : 0,
+      timedOut: isSet(object.timedOut)
+        ? globalThis.Boolean(object.timedOut)
+        : isSet(object.timed_out)
+          ? globalThis.Boolean(object.timed_out)
+          : false,
+      cancelled: isSet(object.cancelled) ? globalThis.Boolean(object.cancelled) : false,
+      durationMs: isSet(object.durationMs)
+        ? globalThis.String(object.durationMs)
+        : isSet(object.duration_ms)
+          ? globalThis.String(object.duration_ms)
+          : "0",
+      digests: isObject(object.digests)
+        ? (globalThis.Object.entries(object.digests) as [string, any][]).reduce(
+            (acc: { [key: string]: string }, [key, value]: [string, any]) => {
+              acc[key] = globalThis.String(value);
+              return acc;
+            },
+            {},
+          )
+        : {},
+      totals: isObject(object.totals)
+        ? (globalThis.Object.entries(object.totals) as [string, any][]).reduce(
+            (acc: { [key: string]: string }, [key, value]: [string, any]) => {
+              acc[key] = globalThis.String(value);
+              return acc;
+            },
+            {},
+          )
+        : {},
+      failureCode: isSet(object.failureCode)
+        ? globalThis.String(object.failureCode)
+        : isSet(object.failure_code)
+          ? globalThis.String(object.failure_code)
+          : "",
+      failureDetail: isObject(object.failureDetail)
+        ? (globalThis.Object.entries(object.failureDetail) as [string, any][]).reduce(
+            (acc: { [key: string]: string }, [key, value]: [string, any]) => {
+              acc[key] = globalThis.String(value);
+              return acc;
+            },
+            {},
+          )
+        : isObject(object.failure_detail)
+          ? (globalThis.Object.entries(object.failure_detail) as [string, any][]).reduce(
+              (acc: { [key: string]: string }, [key, value]: [string, any]) => {
+                acc[key] = globalThis.String(value);
+                return acc;
+              },
+              {},
+            )
+          : {},
+    };
+  },
+
+  toJSON(message: OpExit): unknown {
+    const obj: any = {};
+    if (message.exitCode !== 0) {
+      obj.exitCode = Math.round(message.exitCode);
+    }
+    if (message.timedOut !== false) {
+      obj.timedOut = message.timedOut;
+    }
+    if (message.cancelled !== false) {
+      obj.cancelled = message.cancelled;
+    }
+    if (message.durationMs !== "0") {
+      obj.durationMs = message.durationMs;
+    }
+    if (message.digests) {
+      const entries = globalThis.Object.entries(message.digests) as [string, string][];
+      if (entries.length > 0) {
+        obj.digests = {};
+        entries.forEach(([k, v]) => {
+          obj.digests[k] = v;
+        });
+      }
+    }
+    if (message.totals) {
+      const entries = globalThis.Object.entries(message.totals) as [string, string][];
+      if (entries.length > 0) {
+        obj.totals = {};
+        entries.forEach(([k, v]) => {
+          obj.totals[k] = v;
+        });
+      }
+    }
+    if (message.failureCode !== "") {
+      obj.failureCode = message.failureCode;
+    }
+    if (message.failureDetail) {
+      const entries = globalThis.Object.entries(message.failureDetail) as [string, string][];
+      if (entries.length > 0) {
+        obj.failureDetail = {};
+        entries.forEach(([k, v]) => {
+          obj.failureDetail[k] = v;
+        });
+      }
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<OpExit>, I>>(base?: I): OpExit {
+    return OpExit.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<OpExit>, I>>(object: I): OpExit {
+    const message = createBaseOpExit();
+    message.exitCode = object.exitCode ?? 0;
+    message.timedOut = object.timedOut ?? false;
+    message.cancelled = object.cancelled ?? false;
+    message.durationMs = object.durationMs ?? "0";
+    message.digests = (
+      globalThis.Object.entries(object.digests ?? {}) as [string, string][]
+    ).reduce((acc: { [key: string]: string }, [key, value]: [string, string]) => {
+      if (value !== undefined) {
+        acc[key] = globalThis.String(value);
+      }
+      return acc;
+    }, {});
+    message.totals = (globalThis.Object.entries(object.totals ?? {}) as [string, string][]).reduce(
+      (acc: { [key: string]: string }, [key, value]: [string, string]) => {
+        if (value !== undefined) {
+          acc[key] = globalThis.String(value);
+        }
+        return acc;
+      },
+      {},
+    );
+    message.failureCode = object.failureCode ?? "";
+    message.failureDetail = (
+      globalThis.Object.entries(object.failureDetail ?? {}) as [string, string][]
+    ).reduce((acc: { [key: string]: string }, [key, value]: [string, string]) => {
+      if (value !== undefined) {
+        acc[key] = globalThis.String(value);
+      }
+      return acc;
+    }, {});
+    return message;
+  },
+};
+
+function createBaseOpExit_DigestsEntry(): OpExit_DigestsEntry {
+  return { key: "", value: "" };
+}
+
+export const OpExit_DigestsEntry: MessageFns<OpExit_DigestsEntry> = {
+  encode(message: OpExit_DigestsEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.key !== "") {
+      writer.uint32(10).string(message.key);
+    }
+    if (message.value !== "") {
+      writer.uint32(18).string(message.value);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): OpExit_DigestsEntry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOpExit_DigestsEntry();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.key = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.value = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): OpExit_DigestsEntry {
+    return {
+      key: isSet(object.key) ? globalThis.String(object.key) : "",
+      value: isSet(object.value) ? globalThis.String(object.value) : "",
+    };
+  },
+
+  toJSON(message: OpExit_DigestsEntry): unknown {
+    const obj: any = {};
+    if (message.key !== "") {
+      obj.key = message.key;
+    }
+    if (message.value !== "") {
+      obj.value = message.value;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<OpExit_DigestsEntry>, I>>(base?: I): OpExit_DigestsEntry {
+    return OpExit_DigestsEntry.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<OpExit_DigestsEntry>, I>>(
+    object: I,
+  ): OpExit_DigestsEntry {
+    const message = createBaseOpExit_DigestsEntry();
+    message.key = object.key ?? "";
+    message.value = object.value ?? "";
+    return message;
+  },
+};
+
+function createBaseOpExit_TotalsEntry(): OpExit_TotalsEntry {
+  return { key: "", value: "0" };
+}
+
+export const OpExit_TotalsEntry: MessageFns<OpExit_TotalsEntry> = {
+  encode(message: OpExit_TotalsEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.key !== "") {
+      writer.uint32(10).string(message.key);
+    }
+    if (message.value !== "0") {
+      writer.uint32(16).uint64(message.value);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): OpExit_TotalsEntry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOpExit_TotalsEntry();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.key = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.value = reader.uint64().toString();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): OpExit_TotalsEntry {
+    return {
+      key: isSet(object.key) ? globalThis.String(object.key) : "",
+      value: isSet(object.value) ? globalThis.String(object.value) : "0",
+    };
+  },
+
+  toJSON(message: OpExit_TotalsEntry): unknown {
+    const obj: any = {};
+    if (message.key !== "") {
+      obj.key = message.key;
+    }
+    if (message.value !== "0") {
+      obj.value = message.value;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<OpExit_TotalsEntry>, I>>(base?: I): OpExit_TotalsEntry {
+    return OpExit_TotalsEntry.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<OpExit_TotalsEntry>, I>>(object: I): OpExit_TotalsEntry {
+    const message = createBaseOpExit_TotalsEntry();
+    message.key = object.key ?? "";
+    message.value = object.value ?? "0";
+    return message;
+  },
+};
+
+function createBaseOpExit_FailureDetailEntry(): OpExit_FailureDetailEntry {
+  return { key: "", value: "" };
+}
+
+export const OpExit_FailureDetailEntry: MessageFns<OpExit_FailureDetailEntry> = {
+  encode(
+    message: OpExit_FailureDetailEntry,
+    writer: BinaryWriter = new BinaryWriter(),
+  ): BinaryWriter {
+    if (message.key !== "") {
+      writer.uint32(10).string(message.key);
+    }
+    if (message.value !== "") {
+      writer.uint32(18).string(message.value);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): OpExit_FailureDetailEntry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOpExit_FailureDetailEntry();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.key = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.value = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): OpExit_FailureDetailEntry {
+    return {
+      key: isSet(object.key) ? globalThis.String(object.key) : "",
+      value: isSet(object.value) ? globalThis.String(object.value) : "",
+    };
+  },
+
+  toJSON(message: OpExit_FailureDetailEntry): unknown {
+    const obj: any = {};
+    if (message.key !== "") {
+      obj.key = message.key;
+    }
+    if (message.value !== "") {
+      obj.value = message.value;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<OpExit_FailureDetailEntry>, I>>(
+    base?: I,
+  ): OpExit_FailureDetailEntry {
+    return OpExit_FailureDetailEntry.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<OpExit_FailureDetailEntry>, I>>(
+    object: I,
+  ): OpExit_FailureDetailEntry {
+    const message = createBaseOpExit_FailureDetailEntry();
+    message.key = object.key ?? "";
+    message.value = object.value ?? "";
+    return message;
+  },
+};
+
+function createBaseFsWriteBegin(): FsWriteBegin {
+  return { path: "", createParents: false, mode: 0, expectedBaseDigest: "" };
+}
+
+export const FsWriteBegin: MessageFns<FsWriteBegin> = {
+  encode(message: FsWriteBegin, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.path !== "") {
+      writer.uint32(10).string(message.path);
+    }
+    if (message.createParents !== false) {
+      writer.uint32(16).bool(message.createParents);
+    }
+    if (message.mode !== 0) {
+      writer.uint32(24).uint32(message.mode);
+    }
+    if (message.expectedBaseDigest !== "") {
+      writer.uint32(34).string(message.expectedBaseDigest);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): FsWriteBegin {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseFsWriteBegin();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.path = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.createParents = reader.bool();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.mode = reader.uint32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.expectedBaseDigest = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): FsWriteBegin {
+    return {
+      path: isSet(object.path) ? globalThis.String(object.path) : "",
+      createParents: isSet(object.createParents)
+        ? globalThis.Boolean(object.createParents)
+        : isSet(object.create_parents)
+          ? globalThis.Boolean(object.create_parents)
+          : false,
+      mode: isSet(object.mode) ? globalThis.Number(object.mode) : 0,
+      expectedBaseDigest: isSet(object.expectedBaseDigest)
+        ? globalThis.String(object.expectedBaseDigest)
+        : isSet(object.expected_base_digest)
+          ? globalThis.String(object.expected_base_digest)
+          : "",
+    };
+  },
+
+  toJSON(message: FsWriteBegin): unknown {
+    const obj: any = {};
+    if (message.path !== "") {
+      obj.path = message.path;
+    }
+    if (message.createParents !== false) {
+      obj.createParents = message.createParents;
+    }
+    if (message.mode !== 0) {
+      obj.mode = Math.round(message.mode);
+    }
+    if (message.expectedBaseDigest !== "") {
+      obj.expectedBaseDigest = message.expectedBaseDigest;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<FsWriteBegin>, I>>(base?: I): FsWriteBegin {
+    return FsWriteBegin.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<FsWriteBegin>, I>>(object: I): FsWriteBegin {
+    const message = createBaseFsWriteBegin();
+    message.path = object.path ?? "";
+    message.createParents = object.createParents ?? false;
+    message.mode = object.mode ?? 0;
+    message.expectedBaseDigest = object.expectedBaseDigest ?? "";
+    return message;
+  },
+};
+
+function createBaseOpStart(): OpStart {
+  return { op: undefined, windowBytes: "0", deadlineMs: "0", originId: "" };
+}
+
+export const OpStart: MessageFns<OpStart> = {
+  encode(message: OpStart, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    switch (message.op?.$case) {
+      case "exec":
+        ExecRequest.encode(message.op.exec, writer.uint32(10).fork()).join();
+        break;
+      case "fsRead":
+        FsReadRequest.encode(message.op.fsRead, writer.uint32(18).fork()).join();
+        break;
+      case "fsWrite":
+        FsWriteBegin.encode(message.op.fsWrite, writer.uint32(26).fork()).join();
+        break;
+    }
+    if (message.windowBytes !== "0") {
+      writer.uint32(80).uint64(message.windowBytes);
+    }
+    if (message.deadlineMs !== "0") {
+      writer.uint32(88).int64(message.deadlineMs);
+    }
+    if (message.originId !== "") {
+      writer.uint32(98).string(message.originId);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): OpStart {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOpStart();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.op = { $case: "exec", exec: ExecRequest.decode(reader, reader.uint32()) };
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.op = { $case: "fsRead", fsRead: FsReadRequest.decode(reader, reader.uint32()) };
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.op = { $case: "fsWrite", fsWrite: FsWriteBegin.decode(reader, reader.uint32()) };
+          continue;
+        }
+        case 10: {
+          if (tag !== 80) {
+            break;
+          }
+
+          message.windowBytes = reader.uint64().toString();
+          continue;
+        }
+        case 11: {
+          if (tag !== 88) {
+            break;
+          }
+
+          message.deadlineMs = reader.int64().toString();
+          continue;
+        }
+        case 12: {
+          if (tag !== 98) {
+            break;
+          }
+
+          message.originId = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): OpStart {
+    return {
+      op: isSet(object.exec)
+        ? { $case: "exec", exec: ExecRequest.fromJSON(object.exec) }
+        : isSet(object.fsRead)
+          ? { $case: "fsRead", fsRead: FsReadRequest.fromJSON(object.fsRead) }
+          : isSet(object.fs_read)
+            ? { $case: "fsRead", fsRead: FsReadRequest.fromJSON(object.fs_read) }
+            : isSet(object.fsWrite)
+              ? { $case: "fsWrite", fsWrite: FsWriteBegin.fromJSON(object.fsWrite) }
+              : isSet(object.fs_write)
+                ? { $case: "fsWrite", fsWrite: FsWriteBegin.fromJSON(object.fs_write) }
+                : undefined,
+      windowBytes: isSet(object.windowBytes)
+        ? globalThis.String(object.windowBytes)
+        : isSet(object.window_bytes)
+          ? globalThis.String(object.window_bytes)
+          : "0",
+      deadlineMs: isSet(object.deadlineMs)
+        ? globalThis.String(object.deadlineMs)
+        : isSet(object.deadline_ms)
+          ? globalThis.String(object.deadline_ms)
+          : "0",
+      originId: isSet(object.originId)
+        ? globalThis.String(object.originId)
+        : isSet(object.origin_id)
+          ? globalThis.String(object.origin_id)
+          : "",
+    };
+  },
+
+  toJSON(message: OpStart): unknown {
+    const obj: any = {};
+    if (message.op?.$case === "exec") {
+      obj.exec = ExecRequest.toJSON(message.op.exec);
+    } else if (message.op?.$case === "fsRead") {
+      obj.fsRead = FsReadRequest.toJSON(message.op.fsRead);
+    } else if (message.op?.$case === "fsWrite") {
+      obj.fsWrite = FsWriteBegin.toJSON(message.op.fsWrite);
+    }
+    if (message.windowBytes !== "0") {
+      obj.windowBytes = message.windowBytes;
+    }
+    if (message.deadlineMs !== "0") {
+      obj.deadlineMs = message.deadlineMs;
+    }
+    if (message.originId !== "") {
+      obj.originId = message.originId;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<OpStart>, I>>(base?: I): OpStart {
+    return OpStart.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<OpStart>, I>>(object: I): OpStart {
+    const message = createBaseOpStart();
+    switch (object.op?.$case) {
+      case "exec": {
+        if (object.op?.exec !== undefined && object.op?.exec !== null) {
+          message.op = { $case: "exec", exec: ExecRequest.fromPartial(object.op.exec) };
+        }
+        break;
+      }
+      case "fsRead": {
+        if (object.op?.fsRead !== undefined && object.op?.fsRead !== null) {
+          message.op = { $case: "fsRead", fsRead: FsReadRequest.fromPartial(object.op.fsRead) };
+        }
+        break;
+      }
+      case "fsWrite": {
+        if (object.op?.fsWrite !== undefined && object.op?.fsWrite !== null) {
+          message.op = { $case: "fsWrite", fsWrite: FsWriteBegin.fromPartial(object.op.fsWrite) };
+        }
+        break;
+      }
+    }
+    message.windowBytes = object.windowBytes ?? "0";
+    message.deadlineMs = object.deadlineMs ?? "0";
+    message.originId = object.originId ?? "";
+    return message;
+  },
+};
+
+function createBaseOpStarted(): OpStarted {
+  return { accepted: false, status: undefined };
+}
+
+export const OpStarted: MessageFns<OpStarted> = {
+  encode(message: OpStarted, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.accepted !== false) {
+      writer.uint32(8).bool(message.accepted);
+    }
+    if (message.status !== undefined) {
+      OpStatus.encode(message.status, writer.uint32(18).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): OpStarted {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOpStarted();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.accepted = reader.bool();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.status = OpStatus.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): OpStarted {
+    return {
+      accepted: isSet(object.accepted) ? globalThis.Boolean(object.accepted) : false,
+      status: isSet(object.status) ? OpStatus.fromJSON(object.status) : undefined,
+    };
+  },
+
+  toJSON(message: OpStarted): unknown {
+    const obj: any = {};
+    if (message.accepted !== false) {
+      obj.accepted = message.accepted;
+    }
+    if (message.status !== undefined) {
+      obj.status = OpStatus.toJSON(message.status);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<OpStarted>, I>>(base?: I): OpStarted {
+    return OpStarted.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<OpStarted>, I>>(object: I): OpStarted {
+    const message = createBaseOpStarted();
+    message.accepted = object.accepted ?? false;
+    message.status =
+      object.status !== undefined && object.status !== null
+        ? OpStatus.fromPartial(object.status)
+        : undefined;
+    return message;
+  },
+};
+
+function createBaseOpCancel(): OpCancel {
+  return { opId: "" };
+}
+
+export const OpCancel: MessageFns<OpCancel> = {
+  encode(message: OpCancel, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.opId !== "") {
+      writer.uint32(10).string(message.opId);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): OpCancel {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOpCancel();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.opId = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): OpCancel {
+    return {
+      opId: isSet(object.opId)
+        ? globalThis.String(object.opId)
+        : isSet(object.op_id)
+          ? globalThis.String(object.op_id)
+          : "",
+    };
+  },
+
+  toJSON(message: OpCancel): unknown {
+    const obj: any = {};
+    if (message.opId !== "") {
+      obj.opId = message.opId;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<OpCancel>, I>>(base?: I): OpCancel {
+    return OpCancel.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<OpCancel>, I>>(object: I): OpCancel {
+    const message = createBaseOpCancel();
+    message.opId = object.opId ?? "";
+    return message;
+  },
+};
+
+function createBaseOpQuery(): OpQuery {
+  return { opId: "" };
+}
+
+export const OpQuery: MessageFns<OpQuery> = {
+  encode(message: OpQuery, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.opId !== "") {
+      writer.uint32(10).string(message.opId);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): OpQuery {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOpQuery();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.opId = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): OpQuery {
+    return {
+      opId: isSet(object.opId)
+        ? globalThis.String(object.opId)
+        : isSet(object.op_id)
+          ? globalThis.String(object.op_id)
+          : "",
+    };
+  },
+
+  toJSON(message: OpQuery): unknown {
+    const obj: any = {};
+    if (message.opId !== "") {
+      obj.opId = message.opId;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<OpQuery>, I>>(base?: I): OpQuery {
+    return OpQuery.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<OpQuery>, I>>(object: I): OpQuery {
+    const message = createBaseOpQuery();
+    message.opId = object.opId ?? "";
+    return message;
+  },
+};
+
+function createBaseOpAttach(): OpAttach {
+  return { opId: "", fromSeq: "0", attachGeneration: "0", windowBytes: "0" };
+}
+
+export const OpAttach: MessageFns<OpAttach> = {
+  encode(message: OpAttach, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.opId !== "") {
+      writer.uint32(10).string(message.opId);
+    }
+    if (message.fromSeq !== "0") {
+      writer.uint32(16).uint64(message.fromSeq);
+    }
+    if (message.attachGeneration !== "0") {
+      writer.uint32(24).uint64(message.attachGeneration);
+    }
+    if (message.windowBytes !== "0") {
+      writer.uint32(32).uint64(message.windowBytes);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): OpAttach {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOpAttach();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.opId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.fromSeq = reader.uint64().toString();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.attachGeneration = reader.uint64().toString();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.windowBytes = reader.uint64().toString();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): OpAttach {
+    return {
+      opId: isSet(object.opId)
+        ? globalThis.String(object.opId)
+        : isSet(object.op_id)
+          ? globalThis.String(object.op_id)
+          : "",
+      fromSeq: isSet(object.fromSeq)
+        ? globalThis.String(object.fromSeq)
+        : isSet(object.from_seq)
+          ? globalThis.String(object.from_seq)
+          : "0",
+      attachGeneration: isSet(object.attachGeneration)
+        ? globalThis.String(object.attachGeneration)
+        : isSet(object.attach_generation)
+          ? globalThis.String(object.attach_generation)
+          : "0",
+      windowBytes: isSet(object.windowBytes)
+        ? globalThis.String(object.windowBytes)
+        : isSet(object.window_bytes)
+          ? globalThis.String(object.window_bytes)
+          : "0",
+    };
+  },
+
+  toJSON(message: OpAttach): unknown {
+    const obj: any = {};
+    if (message.opId !== "") {
+      obj.opId = message.opId;
+    }
+    if (message.fromSeq !== "0") {
+      obj.fromSeq = message.fromSeq;
+    }
+    if (message.attachGeneration !== "0") {
+      obj.attachGeneration = message.attachGeneration;
+    }
+    if (message.windowBytes !== "0") {
+      obj.windowBytes = message.windowBytes;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<OpAttach>, I>>(base?: I): OpAttach {
+    return OpAttach.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<OpAttach>, I>>(object: I): OpAttach {
+    const message = createBaseOpAttach();
+    message.opId = object.opId ?? "";
+    message.fromSeq = object.fromSeq ?? "0";
+    message.attachGeneration = object.attachGeneration ?? "0";
+    message.windowBytes = object.windowBytes ?? "0";
+    return message;
+  },
+};
+
+function createBaseOpStatus(): OpStatus {
+  return { opId: "", state: 0, nextSeq: "0", exit: undefined, lostReason: 0 };
+}
+
+export const OpStatus: MessageFns<OpStatus> = {
+  encode(message: OpStatus, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.opId !== "") {
+      writer.uint32(10).string(message.opId);
+    }
+    if (message.state !== 0) {
+      writer.uint32(16).int32(message.state);
+    }
+    if (message.nextSeq !== "0") {
+      writer.uint32(24).uint64(message.nextSeq);
+    }
+    if (message.exit !== undefined) {
+      OpExit.encode(message.exit, writer.uint32(34).fork()).join();
+    }
+    if (message.lostReason !== 0) {
+      writer.uint32(40).int32(message.lostReason);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): OpStatus {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOpStatus();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.opId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.state = reader.int32() as any;
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.nextSeq = reader.uint64().toString();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.exit = OpExit.decode(reader, reader.uint32());
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.lostReason = reader.int32() as any;
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): OpStatus {
+    return {
+      opId: isSet(object.opId)
+        ? globalThis.String(object.opId)
+        : isSet(object.op_id)
+          ? globalThis.String(object.op_id)
+          : "",
+      state: isSet(object.state) ? opStateFromJSON(object.state) : 0,
+      nextSeq: isSet(object.nextSeq)
+        ? globalThis.String(object.nextSeq)
+        : isSet(object.next_seq)
+          ? globalThis.String(object.next_seq)
+          : "0",
+      exit: isSet(object.exit) ? OpExit.fromJSON(object.exit) : undefined,
+      lostReason: isSet(object.lostReason)
+        ? opLostReasonFromJSON(object.lostReason)
+        : isSet(object.lost_reason)
+          ? opLostReasonFromJSON(object.lost_reason)
+          : 0,
+    };
+  },
+
+  toJSON(message: OpStatus): unknown {
+    const obj: any = {};
+    if (message.opId !== "") {
+      obj.opId = message.opId;
+    }
+    if (message.state !== 0) {
+      obj.state = opStateToJSON(message.state);
+    }
+    if (message.nextSeq !== "0") {
+      obj.nextSeq = message.nextSeq;
+    }
+    if (message.exit !== undefined) {
+      obj.exit = OpExit.toJSON(message.exit);
+    }
+    if (message.lostReason !== 0) {
+      obj.lostReason = opLostReasonToJSON(message.lostReason);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<OpStatus>, I>>(base?: I): OpStatus {
+    return OpStatus.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<OpStatus>, I>>(object: I): OpStatus {
+    const message = createBaseOpStatus();
+    message.opId = object.opId ?? "";
+    message.state = object.state ?? 0;
+    message.nextSeq = object.nextSeq ?? "0";
+    message.exit =
+      object.exit !== undefined && object.exit !== null
+        ? OpExit.fromPartial(object.exit)
+        : undefined;
+    message.lostReason = object.lostReason ?? 0;
+    return message;
+  },
+};
+
+function createBaseWriteChunk(): WriteChunk {
+  return { opId: "", seq: "0", bytes: new Uint8Array(0), last: false, offset: "0" };
+}
+
+export const WriteChunk: MessageFns<WriteChunk> = {
+  encode(message: WriteChunk, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.opId !== "") {
+      writer.uint32(10).string(message.opId);
+    }
+    if (message.seq !== "0") {
+      writer.uint32(16).uint64(message.seq);
+    }
+    if (message.bytes.length !== 0) {
+      writer.uint32(26).bytes(message.bytes);
+    }
+    if (message.last !== false) {
+      writer.uint32(32).bool(message.last);
+    }
+    if (message.offset !== "0") {
+      writer.uint32(40).uint64(message.offset);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): WriteChunk {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseWriteChunk();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.opId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.seq = reader.uint64().toString();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.bytes = reader.bytes();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.last = reader.bool();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.offset = reader.uint64().toString();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): WriteChunk {
+    return {
+      opId: isSet(object.opId)
+        ? globalThis.String(object.opId)
+        : isSet(object.op_id)
+          ? globalThis.String(object.op_id)
+          : "",
+      seq: isSet(object.seq) ? globalThis.String(object.seq) : "0",
+      bytes: isSet(object.bytes) ? bytesFromBase64(object.bytes) : new Uint8Array(0),
+      last: isSet(object.last) ? globalThis.Boolean(object.last) : false,
+      offset: isSet(object.offset) ? globalThis.String(object.offset) : "0",
+    };
+  },
+
+  toJSON(message: WriteChunk): unknown {
+    const obj: any = {};
+    if (message.opId !== "") {
+      obj.opId = message.opId;
+    }
+    if (message.seq !== "0") {
+      obj.seq = message.seq;
+    }
+    if (message.bytes.length !== 0) {
+      obj.bytes = base64FromBytes(message.bytes);
+    }
+    if (message.last !== false) {
+      obj.last = message.last;
+    }
+    if (message.offset !== "0") {
+      obj.offset = message.offset;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<WriteChunk>, I>>(base?: I): WriteChunk {
+    return WriteChunk.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<WriteChunk>, I>>(object: I): WriteChunk {
+    const message = createBaseWriteChunk();
+    message.opId = object.opId ?? "";
+    message.seq = object.seq ?? "0";
+    message.bytes = object.bytes ?? new Uint8Array(0);
+    message.last = object.last ?? false;
+    message.offset = object.offset ?? "0";
+    return message;
+  },
+};
+
+function createBaseWriteChunkAck(): WriteChunkAck {
+  return { seq: "0" };
+}
+
+export const WriteChunkAck: MessageFns<WriteChunkAck> = {
+  encode(message: WriteChunkAck, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.seq !== "0") {
+      writer.uint32(8).uint64(message.seq);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): WriteChunkAck {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseWriteChunkAck();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.seq = reader.uint64().toString();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): WriteChunkAck {
+    return { seq: isSet(object.seq) ? globalThis.String(object.seq) : "0" };
+  },
+
+  toJSON(message: WriteChunkAck): unknown {
+    const obj: any = {};
+    if (message.seq !== "0") {
+      obj.seq = message.seq;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<WriteChunkAck>, I>>(base?: I): WriteChunkAck {
+    return WriteChunkAck.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<WriteChunkAck>, I>>(object: I): WriteChunkAck {
+    const message = createBaseWriteChunkAck();
+    message.seq = object.seq ?? "0";
+    return message;
+  },
+};
+
+function createBaseOpFrame(): OpFrame {
+  return { opId: "", seq: "0", body: undefined };
+}
+
+export const OpFrame: MessageFns<OpFrame> = {
+  encode(message: OpFrame, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.opId !== "") {
+      writer.uint32(10).string(message.opId);
+    }
+    if (message.seq !== "0") {
+      writer.uint32(16).uint64(message.seq);
+    }
+    switch (message.body?.$case) {
+      case "data":
+        OpData.encode(message.body.data, writer.uint32(82).fork()).join();
+        break;
+      case "progress":
+        OpProgress.encode(message.body.progress, writer.uint32(90).fork()).join();
+        break;
+      case "exit":
+        OpExit.encode(message.body.exit, writer.uint32(98).fork()).join();
+        break;
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): OpFrame {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOpFrame();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.opId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.seq = reader.uint64().toString();
+          continue;
+        }
+        case 10: {
+          if (tag !== 82) {
+            break;
+          }
+
+          message.body = { $case: "data", data: OpData.decode(reader, reader.uint32()) };
+          continue;
+        }
+        case 11: {
+          if (tag !== 90) {
+            break;
+          }
+
+          message.body = {
+            $case: "progress",
+            progress: OpProgress.decode(reader, reader.uint32()),
+          };
+          continue;
+        }
+        case 12: {
+          if (tag !== 98) {
+            break;
+          }
+
+          message.body = { $case: "exit", exit: OpExit.decode(reader, reader.uint32()) };
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): OpFrame {
+    return {
+      opId: isSet(object.opId)
+        ? globalThis.String(object.opId)
+        : isSet(object.op_id)
+          ? globalThis.String(object.op_id)
+          : "",
+      seq: isSet(object.seq) ? globalThis.String(object.seq) : "0",
+      body: isSet(object.data)
+        ? { $case: "data", data: OpData.fromJSON(object.data) }
+        : isSet(object.progress)
+          ? { $case: "progress", progress: OpProgress.fromJSON(object.progress) }
+          : isSet(object.exit)
+            ? { $case: "exit", exit: OpExit.fromJSON(object.exit) }
+            : undefined,
+    };
+  },
+
+  toJSON(message: OpFrame): unknown {
+    const obj: any = {};
+    if (message.opId !== "") {
+      obj.opId = message.opId;
+    }
+    if (message.seq !== "0") {
+      obj.seq = message.seq;
+    }
+    if (message.body?.$case === "data") {
+      obj.data = OpData.toJSON(message.body.data);
+    } else if (message.body?.$case === "progress") {
+      obj.progress = OpProgress.toJSON(message.body.progress);
+    } else if (message.body?.$case === "exit") {
+      obj.exit = OpExit.toJSON(message.body.exit);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<OpFrame>, I>>(base?: I): OpFrame {
+    return OpFrame.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<OpFrame>, I>>(object: I): OpFrame {
+    const message = createBaseOpFrame();
+    message.opId = object.opId ?? "";
+    message.seq = object.seq ?? "0";
+    switch (object.body?.$case) {
+      case "data": {
+        if (object.body?.data !== undefined && object.body?.data !== null) {
+          message.body = { $case: "data", data: OpData.fromPartial(object.body.data) };
+        }
+        break;
+      }
+      case "progress": {
+        if (object.body?.progress !== undefined && object.body?.progress !== null) {
+          message.body = {
+            $case: "progress",
+            progress: OpProgress.fromPartial(object.body.progress),
+          };
+        }
+        break;
+      }
+      case "exit": {
+        if (object.body?.exit !== undefined && object.body?.exit !== null) {
+          message.body = { $case: "exit", exit: OpExit.fromPartial(object.body.exit) };
+        }
+        break;
+      }
+    }
+    return message;
+  },
+};
+
+function createBaseOpData(): OpData {
+  return { channel: 0, bytes: new Uint8Array(0) };
+}
+
+export const OpData: MessageFns<OpData> = {
+  encode(message: OpData, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.channel !== 0) {
+      writer.uint32(8).int32(message.channel);
+    }
+    if (message.bytes.length !== 0) {
+      writer.uint32(18).bytes(message.bytes);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): OpData {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOpData();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.channel = reader.int32() as any;
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.bytes = reader.bytes();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): OpData {
+    return {
+      channel: isSet(object.channel) ? opChannelFromJSON(object.channel) : 0,
+      bytes: isSet(object.bytes) ? bytesFromBase64(object.bytes) : new Uint8Array(0),
+    };
+  },
+
+  toJSON(message: OpData): unknown {
+    const obj: any = {};
+    if (message.channel !== 0) {
+      obj.channel = opChannelToJSON(message.channel);
+    }
+    if (message.bytes.length !== 0) {
+      obj.bytes = base64FromBytes(message.bytes);
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<OpData>, I>>(base?: I): OpData {
+    return OpData.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<OpData>, I>>(object: I): OpData {
+    const message = createBaseOpData();
+    message.channel = object.channel ?? 0;
+    message.bytes = object.bytes ?? new Uint8Array(0);
+    return message;
+  },
+};
+
+function createBaseOpProgress(): OpProgress {
+  return {};
+}
+
+export const OpProgress: MessageFns<OpProgress> = {
+  encode(_: OpProgress, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): OpProgress {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOpProgress();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(_: any): OpProgress {
+    return {};
+  },
+
+  toJSON(_: OpProgress): unknown {
+    const obj: any = {};
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<OpProgress>, I>>(base?: I): OpProgress {
+    return OpProgress.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<OpProgress>, I>>(_: I): OpProgress {
+    const message = createBaseOpProgress();
+    return message;
+  },
+};
+
+function createBaseOpAck(): OpAck {
+  return { opId: "", ackedSeq: "0", creditBytes: "0", final: false, attachGeneration: "0" };
+}
+
+export const OpAck: MessageFns<OpAck> = {
+  encode(message: OpAck, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.opId !== "") {
+      writer.uint32(10).string(message.opId);
+    }
+    if (message.ackedSeq !== "0") {
+      writer.uint32(16).uint64(message.ackedSeq);
+    }
+    if (message.creditBytes !== "0") {
+      writer.uint32(24).uint64(message.creditBytes);
+    }
+    if (message.final !== false) {
+      writer.uint32(32).bool(message.final);
+    }
+    if (message.attachGeneration !== "0") {
+      writer.uint32(40).uint64(message.attachGeneration);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): OpAck {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseOpAck();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.opId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.ackedSeq = reader.uint64().toString();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.creditBytes = reader.uint64().toString();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.final = reader.bool();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.attachGeneration = reader.uint64().toString();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): OpAck {
+    return {
+      opId: isSet(object.opId)
+        ? globalThis.String(object.opId)
+        : isSet(object.op_id)
+          ? globalThis.String(object.op_id)
+          : "",
+      ackedSeq: isSet(object.ackedSeq)
+        ? globalThis.String(object.ackedSeq)
+        : isSet(object.acked_seq)
+          ? globalThis.String(object.acked_seq)
+          : "0",
+      creditBytes: isSet(object.creditBytes)
+        ? globalThis.String(object.creditBytes)
+        : isSet(object.credit_bytes)
+          ? globalThis.String(object.credit_bytes)
+          : "0",
+      final: isSet(object.final) ? globalThis.Boolean(object.final) : false,
+      attachGeneration: isSet(object.attachGeneration)
+        ? globalThis.String(object.attachGeneration)
+        : isSet(object.attach_generation)
+          ? globalThis.String(object.attach_generation)
+          : "0",
+    };
+  },
+
+  toJSON(message: OpAck): unknown {
+    const obj: any = {};
+    if (message.opId !== "") {
+      obj.opId = message.opId;
+    }
+    if (message.ackedSeq !== "0") {
+      obj.ackedSeq = message.ackedSeq;
+    }
+    if (message.creditBytes !== "0") {
+      obj.creditBytes = message.creditBytes;
+    }
+    if (message.final !== false) {
+      obj.final = message.final;
+    }
+    if (message.attachGeneration !== "0") {
+      obj.attachGeneration = message.attachGeneration;
+    }
+    return obj;
+  },
+
+  create<I extends Exact<DeepPartial<OpAck>, I>>(base?: I): OpAck {
+    return OpAck.fromPartial(base ?? ({} as any));
+  },
+  fromPartial<I extends Exact<DeepPartial<OpAck>, I>>(object: I): OpAck {
+    const message = createBaseOpAck();
+    message.opId = object.opId ?? "";
+    message.ackedSeq = object.ackedSeq ?? "0";
+    message.creditBytes = object.creditBytes ?? "0";
+    message.final = object.final ?? false;
+    message.attachGeneration = object.attachGeneration ?? "0";
+    return message;
+  },
+};
+
 function createBaseControlRequest(): ControlRequest {
   return { requestId: "", epoch: 0, op: undefined };
 }
@@ -8131,6 +10847,21 @@ export const ControlRequest: MessageFns<ControlRequest> = {
           message.op.desktopScreenshot,
           writer.uint32(242).fork(),
         ).join();
+        break;
+      case "opStart":
+        OpStart.encode(message.op.opStart, writer.uint32(250).fork()).join();
+        break;
+      case "opCancel":
+        OpCancel.encode(message.op.opCancel, writer.uint32(258).fork()).join();
+        break;
+      case "opQuery":
+        OpQuery.encode(message.op.opQuery, writer.uint32(266).fork()).join();
+        break;
+      case "opAttach":
+        OpAttach.encode(message.op.opAttach, writer.uint32(274).fork()).join();
+        break;
+      case "writeChunk":
+        WriteChunk.encode(message.op.writeChunk, writer.uint32(282).fork()).join();
         break;
     }
     return writer;
@@ -8363,6 +11094,49 @@ export const ControlRequest: MessageFns<ControlRequest> = {
           };
           continue;
         }
+        case 31: {
+          if (tag !== 250) {
+            break;
+          }
+
+          message.op = { $case: "opStart", opStart: OpStart.decode(reader, reader.uint32()) };
+          continue;
+        }
+        case 32: {
+          if (tag !== 258) {
+            break;
+          }
+
+          message.op = { $case: "opCancel", opCancel: OpCancel.decode(reader, reader.uint32()) };
+          continue;
+        }
+        case 33: {
+          if (tag !== 266) {
+            break;
+          }
+
+          message.op = { $case: "opQuery", opQuery: OpQuery.decode(reader, reader.uint32()) };
+          continue;
+        }
+        case 34: {
+          if (tag !== 274) {
+            break;
+          }
+
+          message.op = { $case: "opAttach", opAttach: OpAttach.decode(reader, reader.uint32()) };
+          continue;
+        }
+        case 35: {
+          if (tag !== 282) {
+            break;
+          }
+
+          message.op = {
+            $case: "writeChunk",
+            writeChunk: WriteChunk.decode(reader, reader.uint32()),
+          };
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -8572,7 +11346,117 @@ export const ControlRequest: MessageFns<ControlRequest> = {
                                                                                       object.desktop_screenshot,
                                                                                     ),
                                                                                 }
-                                                                              : undefined,
+                                                                              : isSet(
+                                                                                    object.opStart,
+                                                                                  )
+                                                                                ? {
+                                                                                    $case:
+                                                                                      "opStart",
+                                                                                    opStart:
+                                                                                      OpStart.fromJSON(
+                                                                                        object.opStart,
+                                                                                      ),
+                                                                                  }
+                                                                                : isSet(
+                                                                                      object.op_start,
+                                                                                    )
+                                                                                  ? {
+                                                                                      $case:
+                                                                                        "opStart",
+                                                                                      opStart:
+                                                                                        OpStart.fromJSON(
+                                                                                          object.op_start,
+                                                                                        ),
+                                                                                    }
+                                                                                  : isSet(
+                                                                                        object.opCancel,
+                                                                                      )
+                                                                                    ? {
+                                                                                        $case:
+                                                                                          "opCancel",
+                                                                                        opCancel:
+                                                                                          OpCancel.fromJSON(
+                                                                                            object.opCancel,
+                                                                                          ),
+                                                                                      }
+                                                                                    : isSet(
+                                                                                          object.op_cancel,
+                                                                                        )
+                                                                                      ? {
+                                                                                          $case:
+                                                                                            "opCancel",
+                                                                                          opCancel:
+                                                                                            OpCancel.fromJSON(
+                                                                                              object.op_cancel,
+                                                                                            ),
+                                                                                        }
+                                                                                      : isSet(
+                                                                                            object.opQuery,
+                                                                                          )
+                                                                                        ? {
+                                                                                            $case:
+                                                                                              "opQuery",
+                                                                                            opQuery:
+                                                                                              OpQuery.fromJSON(
+                                                                                                object.opQuery,
+                                                                                              ),
+                                                                                          }
+                                                                                        : isSet(
+                                                                                              object.op_query,
+                                                                                            )
+                                                                                          ? {
+                                                                                              $case:
+                                                                                                "opQuery",
+                                                                                              opQuery:
+                                                                                                OpQuery.fromJSON(
+                                                                                                  object.op_query,
+                                                                                                ),
+                                                                                            }
+                                                                                          : isSet(
+                                                                                                object.opAttach,
+                                                                                              )
+                                                                                            ? {
+                                                                                                $case:
+                                                                                                  "opAttach",
+                                                                                                opAttach:
+                                                                                                  OpAttach.fromJSON(
+                                                                                                    object.opAttach,
+                                                                                                  ),
+                                                                                              }
+                                                                                            : isSet(
+                                                                                                  object.op_attach,
+                                                                                                )
+                                                                                              ? {
+                                                                                                  $case:
+                                                                                                    "opAttach",
+                                                                                                  opAttach:
+                                                                                                    OpAttach.fromJSON(
+                                                                                                      object.op_attach,
+                                                                                                    ),
+                                                                                                }
+                                                                                              : isSet(
+                                                                                                    object.writeChunk,
+                                                                                                  )
+                                                                                                ? {
+                                                                                                    $case:
+                                                                                                      "writeChunk",
+                                                                                                    writeChunk:
+                                                                                                      WriteChunk.fromJSON(
+                                                                                                        object.writeChunk,
+                                                                                                      ),
+                                                                                                  }
+                                                                                                : isSet(
+                                                                                                      object.write_chunk,
+                                                                                                    )
+                                                                                                  ? {
+                                                                                                      $case:
+                                                                                                        "writeChunk",
+                                                                                                      writeChunk:
+                                                                                                        WriteChunk.fromJSON(
+                                                                                                          object.write_chunk,
+                                                                                                        ),
+                                                                                                    }
+                                                                                                  : undefined,
     };
   },
 
@@ -8626,6 +11510,16 @@ export const ControlRequest: MessageFns<ControlRequest> = {
       obj.desktopInput = DesktopInputRequest.toJSON(message.op.desktopInput);
     } else if (message.op?.$case === "desktopScreenshot") {
       obj.desktopScreenshot = DesktopScreenshotRequest.toJSON(message.op.desktopScreenshot);
+    } else if (message.op?.$case === "opStart") {
+      obj.opStart = OpStart.toJSON(message.op.opStart);
+    } else if (message.op?.$case === "opCancel") {
+      obj.opCancel = OpCancel.toJSON(message.op.opCancel);
+    } else if (message.op?.$case === "opQuery") {
+      obj.opQuery = OpQuery.toJSON(message.op.opQuery);
+    } else if (message.op?.$case === "opAttach") {
+      obj.opAttach = OpAttach.toJSON(message.op.opAttach);
+    } else if (message.op?.$case === "writeChunk") {
+      obj.writeChunk = WriteChunk.toJSON(message.op.writeChunk);
     }
     return obj;
   },
@@ -8788,6 +11682,39 @@ export const ControlRequest: MessageFns<ControlRequest> = {
         }
         break;
       }
+      case "opStart": {
+        if (object.op?.opStart !== undefined && object.op?.opStart !== null) {
+          message.op = { $case: "opStart", opStart: OpStart.fromPartial(object.op.opStart) };
+        }
+        break;
+      }
+      case "opCancel": {
+        if (object.op?.opCancel !== undefined && object.op?.opCancel !== null) {
+          message.op = { $case: "opCancel", opCancel: OpCancel.fromPartial(object.op.opCancel) };
+        }
+        break;
+      }
+      case "opQuery": {
+        if (object.op?.opQuery !== undefined && object.op?.opQuery !== null) {
+          message.op = { $case: "opQuery", opQuery: OpQuery.fromPartial(object.op.opQuery) };
+        }
+        break;
+      }
+      case "opAttach": {
+        if (object.op?.opAttach !== undefined && object.op?.opAttach !== null) {
+          message.op = { $case: "opAttach", opAttach: OpAttach.fromPartial(object.op.opAttach) };
+        }
+        break;
+      }
+      case "writeChunk": {
+        if (object.op?.writeChunk !== undefined && object.op?.writeChunk !== null) {
+          message.op = {
+            $case: "writeChunk",
+            writeChunk: WriteChunk.fromPartial(object.op.writeChunk),
+          };
+        }
+        break;
+      }
     }
     return message;
   },
@@ -8877,6 +11804,15 @@ export const ControlResponse: MessageFns<ControlResponse> = {
           message.result.desktopScreenshot,
           writer.uint32(242).fork(),
         ).join();
+        break;
+      case "opStart":
+        OpStarted.encode(message.result.opStart, writer.uint32(250).fork()).join();
+        break;
+      case "opStatus":
+        OpStatus.encode(message.result.opStatus, writer.uint32(258).fork()).join();
+        break;
+      case "writeChunk":
+        WriteChunkAck.encode(message.result.writeChunk, writer.uint32(282).fork()).join();
         break;
     }
     return writer;
@@ -9124,6 +12060,36 @@ export const ControlResponse: MessageFns<ControlResponse> = {
           };
           continue;
         }
+        case 31: {
+          if (tag !== 250) {
+            break;
+          }
+
+          message.result = { $case: "opStart", opStart: OpStarted.decode(reader, reader.uint32()) };
+          continue;
+        }
+        case 32: {
+          if (tag !== 258) {
+            break;
+          }
+
+          message.result = {
+            $case: "opStatus",
+            opStatus: OpStatus.decode(reader, reader.uint32()),
+          };
+          continue;
+        }
+        case 35: {
+          if (tag !== 282) {
+            break;
+          }
+
+          message.result = {
+            $case: "writeChunk",
+            writeChunk: WriteChunkAck.decode(reader, reader.uint32()),
+          };
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -9342,7 +12308,73 @@ export const ControlResponse: MessageFns<ControlResponse> = {
                                                                                       object.desktop_screenshot,
                                                                                     ),
                                                                                 }
-                                                                              : undefined,
+                                                                              : isSet(
+                                                                                    object.opStart,
+                                                                                  )
+                                                                                ? {
+                                                                                    $case:
+                                                                                      "opStart",
+                                                                                    opStart:
+                                                                                      OpStarted.fromJSON(
+                                                                                        object.opStart,
+                                                                                      ),
+                                                                                  }
+                                                                                : isSet(
+                                                                                      object.op_start,
+                                                                                    )
+                                                                                  ? {
+                                                                                      $case:
+                                                                                        "opStart",
+                                                                                      opStart:
+                                                                                        OpStarted.fromJSON(
+                                                                                          object.op_start,
+                                                                                        ),
+                                                                                    }
+                                                                                  : isSet(
+                                                                                        object.opStatus,
+                                                                                      )
+                                                                                    ? {
+                                                                                        $case:
+                                                                                          "opStatus",
+                                                                                        opStatus:
+                                                                                          OpStatus.fromJSON(
+                                                                                            object.opStatus,
+                                                                                          ),
+                                                                                      }
+                                                                                    : isSet(
+                                                                                          object.op_status,
+                                                                                        )
+                                                                                      ? {
+                                                                                          $case:
+                                                                                            "opStatus",
+                                                                                          opStatus:
+                                                                                            OpStatus.fromJSON(
+                                                                                              object.op_status,
+                                                                                            ),
+                                                                                        }
+                                                                                      : isSet(
+                                                                                            object.writeChunk,
+                                                                                          )
+                                                                                        ? {
+                                                                                            $case:
+                                                                                              "writeChunk",
+                                                                                            writeChunk:
+                                                                                              WriteChunkAck.fromJSON(
+                                                                                                object.writeChunk,
+                                                                                              ),
+                                                                                          }
+                                                                                        : isSet(
+                                                                                              object.write_chunk,
+                                                                                            )
+                                                                                          ? {
+                                                                                              $case:
+                                                                                                "writeChunk",
+                                                                                              writeChunk:
+                                                                                                WriteChunkAck.fromJSON(
+                                                                                                  object.write_chunk,
+                                                                                                ),
+                                                                                            }
+                                                                                          : undefined,
     };
   },
 
@@ -9396,6 +12428,12 @@ export const ControlResponse: MessageFns<ControlResponse> = {
       obj.desktopInput = DesktopInputResponse.toJSON(message.result.desktopInput);
     } else if (message.result?.$case === "desktopScreenshot") {
       obj.desktopScreenshot = DesktopScreenshotResponse.toJSON(message.result.desktopScreenshot);
+    } else if (message.result?.$case === "opStart") {
+      obj.opStart = OpStarted.toJSON(message.result.opStart);
+    } else if (message.result?.$case === "opStatus") {
+      obj.opStatus = OpStatus.toJSON(message.result.opStatus);
+    } else if (message.result?.$case === "writeChunk") {
+      obj.writeChunk = WriteChunkAck.toJSON(message.result.writeChunk);
     }
     return obj;
   },
@@ -9592,6 +12630,33 @@ export const ControlResponse: MessageFns<ControlResponse> = {
             desktopScreenshot: DesktopScreenshotResponse.fromPartial(
               object.result.desktopScreenshot,
             ),
+          };
+        }
+        break;
+      }
+      case "opStart": {
+        if (object.result?.opStart !== undefined && object.result?.opStart !== null) {
+          message.result = {
+            $case: "opStart",
+            opStart: OpStarted.fromPartial(object.result.opStart),
+          };
+        }
+        break;
+      }
+      case "opStatus": {
+        if (object.result?.opStatus !== undefined && object.result?.opStatus !== null) {
+          message.result = {
+            $case: "opStatus",
+            opStatus: OpStatus.fromPartial(object.result.opStatus),
+          };
+        }
+        break;
+      }
+      case "writeChunk": {
+        if (object.result?.writeChunk !== undefined && object.result?.writeChunk !== null) {
+          message.result = {
+            $case: "writeChunk",
+            writeChunk: WriteChunkAck.fromPartial(object.result.writeChunk),
           };
         }
         break;

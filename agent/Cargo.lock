@@ -1604,11 +1604,13 @@ dependencies = [
  "async-nats",
  "async-trait",
  "base64 0.22.1",
+ "blake3",
  "clap",
  "ed25519-dalek",
  "futures",
  "hostname",
  "nix 0.29.0",
+ "opengeni-agent-engine",
  "opengeni-agent-platform",
  "opengeni-agent-proto",
  "opengeni-agent-stream",
@@ -1626,10 +1628,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "opengeni-agent-engine"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "opengeni-agent-harness"
 version = "0.0.0"
 dependencies = [
  "async-nats",
+ "blake3",
  "clap",
  "futures",
  "hdrhistogram",

@@ -16,6 +16,8 @@
 //!   → `ControlResponse` table; a handler error is a typed `AgentError`, never a
 //!   panic.
 //! * [`backoff`] — full-jitter exponential backoff (the resiliency headline).
+//! * [`job`] — the op-stream job pump: one task per op, streaming a contained
+//!   child through the engine's retention/credit-flow to an injected frame sink.
 //! * [`metrics`] — the heartbeat metrics sample (deepened in M10).
 //! * [`supervisor`] — dial → serve → reconnect, forever, with heartbeats + the
 //!   clean going-offline.
@@ -32,12 +34,18 @@
 #![doc(html_root_url = "https://docs.rs/opengeni-agent")]
 
 mod backoff;
+mod capacity;
 mod cli;
 mod config;
 mod dispatch;
+mod engine;
 mod enrollment;
 mod instance_lock;
+mod job;
+mod legacy;
 mod metrics;
+mod ops;
+mod overrides;
 mod service;
 mod supervisor;
 mod uninstall;
@@ -249,7 +257,13 @@ async fn run(args: RunArgs, api_url: &str) -> anyhow_lite::Result {
     }
     let platform = Arc::new(platform);
 
-    let supervisor = Supervisor::new(platform.clone(), creds, env!("CARGO_PKG_VERSION"));
+    // The engine's disk spool lives under the config dir — a real filesystem
+    // (a tmpfs temp dir would spool "to disk" in RAM and defeat the budgets).
+    let supervisor = match config::config_dir() {
+        Ok(dir) => Supervisor::new(platform.clone(), creds, env!("CARGO_PKG_VERSION"))
+            .with_spool_root(dir.join("spool")),
+        Err(_) => Supervisor::new(platform.clone(), creds, env!("CARGO_PKG_VERSION")),
+    };
     let shutdown = supervisor.shutdown_handle();
 
     // Wire SIGINT/SIGTERM to a clean shutdown so the lease flips offline

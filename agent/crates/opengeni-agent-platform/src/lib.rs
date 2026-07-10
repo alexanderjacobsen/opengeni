@@ -59,7 +59,7 @@ pub use desktop::{
     fit_frame_to_budget, resolve_desktop, CapturedFrame, DesktopBackend, FittedFrame, NoDesktop,
 };
 pub use error::{PlatformError, PlatformResult};
-pub use native::NativePlatform;
+pub use native::{assemble_git_response, spawn_contained, ContainedExec, NativePlatform};
 pub use pty::{spawn_pty, PtyProcess};
 
 /// macOS TCC-grant helpers (feature `macos-desktop`, macOS-only): read the Screen
@@ -104,6 +104,46 @@ pub trait Platform: Send + Sync {
     /// [`PlatformError::Timeout`]). When `shell` is set, the command is run
     /// through the platform shell; otherwise `command[0]` is the program.
     async fn exec(&self, req: &v1::ExecRequest) -> PlatformResult<v1::ExecResponse>;
+
+    /// Spawns the command described by an `ExecRequest` inside the shared
+    /// containment primitive WITHOUT waiting or assembling a reply — the
+    /// streaming job path: the caller (the op-engine pump) owns the returned
+    /// [`ContainedExec`]'s stdio and lifecycle. Same command construction,
+    /// cwd/env resolution, and containment as [`Platform::exec`] (which is
+    /// implemented over this on the native platform).
+    ///
+    /// The default reports a typed `Unsupported` for platforms that cannot
+    /// stream (test fakes).
+    ///
+    /// # Errors
+    ///
+    /// The spawn IO failure mapped to a typed [`PlatformError`] (missing
+    /// program, empty command), or `Unsupported` from the default impl.
+    fn spawn_exec(&self, req: &v1::ExecRequest) -> PlatformResult<ContainedExec> {
+        let _ = req;
+        Err(PlatformError::Unsupported(
+            "streaming exec is not supported by this platform".to_string(),
+        ))
+    }
+
+    /// Spawns the git invocation described by a `GitRequest` inside the shared
+    /// containment primitive WITHOUT waiting or assembling a reply — the
+    /// engine-job path for git. Same argv construction and cwd resolution as
+    /// [`Platform::git`] (which is implemented over this on the native
+    /// platform), so git children get the process-group kill AND the per-op
+    /// OOM cgroup leaf (#351's flagged git-boundary follow-up: a clone's page
+    /// cache bills to the op, not the runner).
+    ///
+    /// # Errors
+    ///
+    /// The spawn IO failure mapped to a typed [`PlatformError`], or
+    /// `Unsupported` from the default impl.
+    fn spawn_git(&self, req: &v1::GitRequest) -> PlatformResult<ContainedExec> {
+        let _ = req;
+        Err(PlatformError::Unsupported(
+            "streaming git is not supported by this platform".to_string(),
+        ))
+    }
 
     // --- Channel-A: filesystem -------------------------------------------
 

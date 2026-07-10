@@ -37,6 +37,8 @@ pub struct Harness {
     pub seed: u64,
     pub no_assert: bool,
     pub agent_version: String,
+    /// The binary under test (op scenarios spawn extra override agents).
+    pub(crate) agent_binary: PathBuf,
     results_dir: PathBuf,
     /// Kept alive so the server/agent log dir is not deleted mid-run.
     _work_dir: tempfile::TempDir,
@@ -95,18 +97,19 @@ impl Harness {
             seed: cfg.seed,
             no_assert: cfg.no_assert,
             agent_version,
+            agent_binary: cfg.agent_binary,
             results_dir: cfg.results_dir,
             _work_dir: work_dir,
         })
     }
 
     /// The primary agent (scenarios 1,3,4,5,6 drive one agent).
-    fn primary(&self) -> &DisposableAgent {
+    pub(crate) fn primary(&self) -> &DisposableAgent {
         &self.agents[0]
     }
 
     /// Assembles + writes + prints a report, returning it.
-    fn finish(
+    pub(crate) fn finish(
         &self,
         scenario: &str,
         config: serde_json::Value,
@@ -221,9 +224,10 @@ impl Harness {
 
     // ---- scenario 2: flood ---------------------------------------------------
 
-    /// (a) 1 agent, 256 concurrent mixed ops (expect 8-slot saturation → DRAINING,
-    /// while a concurrent ping probe stays fast). (b) `fleet_size` agents × 16
-    /// concurrent ops each.
+    /// (a) 1 agent, 256 concurrent mixed ops — LIMITS-DOCTRINE: the runner
+    /// admits everything (no concurrency policy; breakers are pathology-scale),
+    /// so ALL ops run while a concurrent ping probe stays fast. (b)
+    /// `fleet_size` agents × 16 concurrent ops each.
     pub async fn flood(&self, fleet_size: usize) -> Report {
         let mut agg = Aggregator::new();
         let sampler = ResourceSampler::spawn(
@@ -285,8 +289,9 @@ impl Harness {
                 ),
             },
             Verdict {
-                check: "8-slot saturation observed (DRAINING returned)".to_string(),
-                pass: draining_a > 0,
+                check: "no admission refusals under the 256-op burst (runner admits everything)"
+                    .to_string(),
+                pass: draining_a == 0 && draining_b == 0,
                 detail: format!("{draining_a} DRAINING in the 256-op burst; {draining_b} across the {fleet_n}-agent fleet burst"),
             },
             Verdict {
@@ -302,7 +307,7 @@ impl Harness {
                 "single_agent_probe_pings": 100,
                 "fleet_size": fleet_n,
                 "fleet_ops_per_agent": 16,
-                "max_in_flight_control_rpcs": 8
+                "admission": "unbounded (derived breakers only)"
             }),
             agg,
             resources,
@@ -732,7 +737,7 @@ impl Harness {
     /// In `--no-assert` mode, force every verdict to `pass` (record, don't fail):
     /// the exit code then reflects only that the RUN completed, not the invariants
     /// (used for baselining current behavior).
-    fn assertable(&self, verdicts: Vec<Verdict>) -> Vec<Verdict> {
+    pub(crate) fn assertable(&self, verdicts: Vec<Verdict>) -> Vec<Verdict> {
         if self.no_assert {
             verdicts
                 .into_iter()
@@ -762,7 +767,7 @@ fn read_agent_version(agent_bin: &std::path::Path) -> String {
 }
 
 /// A per-run-unique exec marker path under `work` (also the `pgrep -f` needle).
-fn unique_marker(work: &str, tag: &str) -> String {
+pub(crate) fn unique_marker(work: &str, tag: &str) -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
@@ -852,7 +857,7 @@ fn resource_drift(
 }
 
 /// Whether a process whose command line contains `needle` is alive.
-fn pgrep_alive(needle: &str) -> bool {
+pub(crate) fn pgrep_alive(needle: &str) -> bool {
     std::process::Command::new("pgrep")
         .arg("-f")
         .arg(needle)

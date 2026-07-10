@@ -6836,9 +6836,10 @@ export async function loadCodexCredentialForRun(
  * Persist rotated tokens after a successful refresh. Caller pre-encrypts.
  *
  * COMPARE-AND-SET (P1-c): the write is guarded by the (id, version) the resolver
- * loaded. If a disconnect→reconnect replaced/rotated the row between the load and
- * this write, the guard matches 0 rows and we DO NOT clobber the freshly
- * reconnected credential with tokens from the now-defunct family. Returns true
+ * loaded and by the row still being healthy/active. If a disconnect→reconnect
+ * replaced/rotated the row, or a definitive model refusal quarantined it while
+ * the provider refresh was in flight, the guard matches 0 rows. We therefore do
+ * not clobber fresh tokens or reactivate a quarantined credential. Returns true
  * iff the guarded row was updated; false means "credential changed under me —
  * the rotation is moot, drop it."
  */
@@ -6869,6 +6870,7 @@ export async function recordCodexTokenRefresh(
         and(
           eq(schema.codexSubscriptionCredentials.id, input.id),
           eq(schema.codexSubscriptionCredentials.version, input.version),
+          eq(schema.codexSubscriptionCredentials.status, "active"),
         ),
       )
       .returning({ id: schema.codexSubscriptionCredentials.id });
@@ -6902,11 +6904,12 @@ export async function withCodexCredentialRefreshLock<T>(
  * Surface a permanent or transient failure on a SPECIFIC credential row.
  *
  * COMPARE-AND-SET (P1-c): the status is stamped only if the row STILL matches the
- * (id, version) the resolver loaded. This stops a refresh that began before a
- * disconnect→reconnect (or a manual account switch) from stamping `needs_relogin`
- * on the brand-new, good credential — with N accounts per workspace a
- * workspace-wide write would be flat-out wrong (it would scribble on every
- * account). Returns true iff the guarded row was updated.
+ * (id, version) the resolver loaded, and only while the row remains active. This
+ * stops a refresh that began before a disconnect→reconnect (or a concurrent
+ * definitive model quarantine) from stamping `needs_relogin` on the brand-new or
+ * already-quarantined credential — with N accounts per workspace a workspace-wide
+ * write would be flat-out wrong (it would scribble on every account). Returns
+ * true iff the guarded row was updated.
  */
 export async function setCodexCredentialStatus(
   db: Database,
@@ -6923,6 +6926,7 @@ export async function setCodexCredentialStatus(
         and(
           eq(schema.codexSubscriptionCredentials.id, target.id),
           eq(schema.codexSubscriptionCredentials.version, target.version),
+          eq(schema.codexSubscriptionCredentials.status, "active"),
         ),
       )
       .returning({ id: schema.codexSubscriptionCredentials.id });

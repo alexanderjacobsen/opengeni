@@ -577,6 +577,70 @@ describe("OPE-21 atomic Codex credential allocation", () => {
     ).toBe(toggledCredential);
   });
 
+  test("an in-flight refresh cannot reactivate a lease-fenced health quarantine", async () => {
+    if (!available) return;
+    const [ws] = await freshAccount();
+    const credentialId = await connectCredential(ws!, "refresh-quarantine-race");
+    const turnId = await seedTurn(ws!, 1);
+    const lease = await acquire(dbA, ws!, turnId);
+    const loaded = await loadCodexCredentialForRun(dbA, settings, ws!.workspaceId, credentialId);
+    expect(loaded?.status).toBe("active");
+    expect(
+      await quarantineCodexCredentialForLease(dbB, {
+        accountId: ws!.accountId,
+        workspaceId: ws!.workspaceId,
+        turnId,
+        credentialId,
+        holderId: lease.holderId!,
+        generation: lease.generation!,
+        quarantine: {
+          kind: "status",
+          status: "error",
+          lastError: "injected definitive refusal",
+        },
+      }),
+    ).toBe(true);
+
+    // The provider refresh began from the previously-active snapshot. Its token
+    // version still matches because health metadata intentionally does not rotate
+    // token families, but the active-health CAS must now reject the stale write.
+    expect(
+      await recordCodexTokenRefresh(dbA, {
+        id: credentialId,
+        version: loaded!.version,
+        workspaceId: ws!.workspaceId,
+        credentialEncrypted: encryptEnvironmentValue(
+          Buffer.alloc(32, 7),
+          JSON.stringify({
+            access_token: "stale-a",
+            refresh_token: "stale-r",
+            id_token: "stale-i",
+          }),
+        ),
+        expiresAt: null,
+        lastRefreshAt: new Date(),
+      }),
+    ).toBe(false);
+    const [after] = await admin<{ status: string; allocator_enabled: boolean; version: number }[]>`
+      select status, allocator_enabled, version
+      from codex_subscription_credentials where id = ${credentialId}`;
+    expect(after).toEqual({
+      status: "error",
+      allocator_enabled: true,
+      version: loaded!.version,
+    });
+    expect(
+      await releaseCodexCredentialLease(
+        dbA,
+        ws!.accountId,
+        ws!.workspaceId,
+        turnId,
+        lease.holderId!,
+        lease.generation!,
+      ),
+    ).toBe(true);
+  });
+
   test("long-turn heartbeat renews the holder; crash expiry is reclaimed; release is idempotent", async () => {
     if (!available) return;
     const [ws] = await freshAccount();
@@ -868,6 +932,82 @@ describe("OPE-21 atomic Codex credential allocation", () => {
       select count(*)::int as count from session_events
       where turn_id = ${turnId} and type = 'turn.failed'`;
     expect(failures!.count).toBe(1);
+  });
+
+  test("expiry between quarantine and failover settlement still requeues the current turn", async () => {
+    if (!available) return;
+    const [ws] = await freshAccount();
+    await connectCredential(ws!, "expiry-gap-a");
+    await connectCredential(ws!, "expiry-gap-b");
+    const turnId = await seedTurn(ws!, 1);
+    const first = await acquire(dbA, ws!, turnId);
+    const [turn] = await admin<{ session_id: string; trigger_event_id: string }[]>`
+      select session_id, trigger_event_id from session_turns where id = ${turnId}`;
+
+    expect(
+      await quarantineCodexCredentialForLease(dbA, {
+        accountId: ws!.accountId,
+        workspaceId: ws!.workspaceId,
+        turnId,
+        credentialId: first.credentialId!,
+        holderId: first.holderId!,
+        generation: first.generation!,
+        quarantine: { kind: "cooldown", until: new Date(Date.now() + 60_000) },
+      }),
+    ).toBe(true);
+    // Force the narrow race: the holder was live for quarantine, then crossed
+    // expiry before the same-turn failover transaction acquired its locks.
+    await admin`
+      update codex_credential_leases
+      set leased_until = now() - interval '1 second'
+      where workspace_id = ${ws!.workspaceId} and turn_id = ${turnId}`;
+    const failover = await settleCodexCredentialFailover(dbA, {
+      accountId: ws!.accountId,
+      workspaceId: ws!.workspaceId,
+      sessionId: turn!.session_id,
+      turnId,
+      originalTriggerEventId: turn!.trigger_event_id,
+      holderId: first.holderId!,
+      generation: first.generation!,
+      maxFailovers: 2,
+      resumeWithNotice: true,
+      preemptedPayload: { reason: "expiry-gap-failover" },
+    });
+    expect(failover.action).toBe("stale");
+
+    // This is the fallback the activity now invokes before it returns
+    // `preempted`. With no successor holder and an unchanged redispatch fence,
+    // the existing lease-loss transaction proves ownership and requeues once.
+    const recovered = await settleCodexCredentialLeaseLoss(dbB, {
+      accountId: ws!.accountId,
+      workspaceId: ws!.workspaceId,
+      sessionId: turn!.session_id,
+      turnId,
+      originalTriggerEventId: turn!.trigger_event_id,
+      holderId: first.holderId!,
+      generation: first.generation!,
+      expectedRedispatches: 0,
+      checkpointDurable: true,
+      resumeWithNotice: true,
+      preemptedPayload: { reason: "codex_lease_lost", resumeWithNotice: true },
+      failedPayload: { error: "must-not-fail" },
+    });
+    expect(recovered.action).toBe("requeued");
+    expect(recovered.events.map((event) => event.type)).toEqual([
+      "turn.preempted",
+      "session.status.changed",
+    ]);
+    const [row] = await admin<
+      { turn_status: string; session_status: string; active_turn_id: string | null }[]
+    >`
+      select t.status as turn_status, s.status as session_status, s.active_turn_id
+      from session_turns t join sessions s on s.id = t.session_id
+      where t.id = ${turnId}`;
+    expect(row).toEqual({ turn_status: "queued", session_status: "queued", active_turn_id: null });
+    const [preemptions] = await admin<{ count: number }[]>`
+      select count(*)::int as count from session_events
+      where turn_id = ${turnId} and type = 'turn.preempted'`;
+    expect(preemptions?.count).toBe(1);
   });
 
   test("lease rows remain RLS-isolated across workspaces and managed accounts", async () => {

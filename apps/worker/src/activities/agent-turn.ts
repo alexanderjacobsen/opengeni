@@ -4083,15 +4083,26 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
                   return { status: "preempted" };
                 }
                 if (settlement.action === "stale") {
-                  codexLeaseHeld = false;
                   observability.incrementCounter({
                     name: "opengeni_codex_failover_settlements_total",
                     help: "Atomic Codex failover settlements by outcome.",
                     labels: { workspace_key: codexWorkspaceKey, outcome: "stale" },
                   });
-                  activityStatus = "preempted";
-                  turnMetricOutcome = "preempted";
-                  return { status: "preempted" };
+                  // `stale` normally means a successor already owns or settled
+                  // this turn. It can also mean this exact holder crossed its
+                  // proven lease deadline between the live-holder quarantine and
+                  // the atomic failover transaction. Reconcile through the
+                  // lease-loss settlement before returning `preempted`: it
+                  // requeues a still-current expired/absent holder, while its
+                  // holder/generation + worker-redispatch fences keep a real
+                  // successor a no-op. The workflow may only interpret
+                  // `preempted` as safe after one of those outcomes is proven.
+                  return await settleLostCodexAttempt(
+                    turnId,
+                    codexLeaseHolderId,
+                    codexLeaseGeneration,
+                    true,
+                  );
                 }
               } catch (failoverError) {
                 observability.incrementCounter({

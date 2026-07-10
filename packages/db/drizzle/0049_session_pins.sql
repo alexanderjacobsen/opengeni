@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS "session_pins" (
   "workspace_id" uuid NOT NULL REFERENCES "workspaces"("id") ON DELETE CASCADE,
   "subject_id" text NOT NULL,
   "session_id" uuid NOT NULL REFERENCES "sessions"("id") ON DELETE CASCADE,
-  "pinned_at" timestamptz NOT NULL DEFAULT now(),
+  "pinned" boolean NOT NULL DEFAULT true,
+  "pinned_at" timestamptz,
   "version" integer NOT NULL DEFAULT 1,
   CONSTRAINT "session_pins_version_nonnegative" CHECK ("version" >= 1)
 );
@@ -17,7 +18,7 @@ CREATE TABLE IF NOT EXISTS "session_pins" (
 CREATE UNIQUE INDEX IF NOT EXISTS "session_pins_subject_workspace_session_idx"
   ON "session_pins" ("subject_id", "workspace_id", "session_id");
 CREATE INDEX IF NOT EXISTS "session_pins_workspace_subject_pinned_idx"
-  ON "session_pins" ("workspace_id", "subject_id", "pinned_at" DESC, "session_id" DESC);
+  ON "session_pins" ("workspace_id", "subject_id", "pinned", "pinned_at" DESC, "session_id" DESC);
 
 ALTER TABLE "session_pins" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "session_pins" FORCE ROW LEVEL SECURITY;

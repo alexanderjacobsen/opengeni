@@ -10462,13 +10462,20 @@ export class SessionPinVersionConflictError extends Error {
   }
 }
 
-type SessionPinRow = Pick<typeof schema.sessionPins.$inferSelect, "pinnedAt" | "version">;
+type SessionPinRow = Pick<
+  typeof schema.sessionPins.$inferSelect,
+  "pinned" | "pinnedAt" | "version"
+>;
 
 function mapSessionPin(
   row: SessionPinRow | null | undefined,
 ): Pick<Session, "pinned" | "pinnedAt" | "pinVersion"> {
   return row
-    ? { pinned: true, pinnedAt: row.pinnedAt.toISOString(), pinVersion: Number(row.version) }
+    ? {
+        pinned: row.pinned,
+        pinnedAt: row.pinnedAt?.toISOString() ?? null,
+        pinVersion: Number(row.version),
+      }
     : { pinned: false, pinnedAt: null, pinVersion: 0 };
 }
 
@@ -10543,6 +10550,7 @@ export async function listSessionsForSubject(
             and(
               eq(schema.sessionPins.workspaceId, workspaceId),
               eq(schema.sessionPins.subjectId, options.subjectId),
+              eq(schema.sessionPins.pinned, true),
               ...filters,
             ),
           )
@@ -10564,6 +10572,7 @@ export async function listSessionsForSubject(
             and(
               eq(schema.sessionPins.workspaceId, workspaceId),
               eq(schema.sessionPins.subjectId, options.subjectId),
+              eq(schema.sessionPins.pinned, true),
               eq(schema.sessionPins.sessionId, schema.sessions.id),
             ),
           )
@@ -10674,7 +10683,7 @@ export async function setSessionPin(
           throw new SessionPinVersionConflictError(current);
         }
         let pin = existing ?? null;
-        if (input.pinned && !existing) {
+        if (!existing) {
           const [inserted] = await tx
             .insert(schema.sessionPins)
             .values({
@@ -10682,20 +10691,28 @@ export async function setSessionPin(
               workspaceId: input.workspaceId,
               subjectId: input.subjectId,
               sessionId: input.sessionId,
+              pinned: input.pinned,
+              ...(input.pinned ? { pinnedAt: new Date() } : {}),
             })
             .returning();
           pin = inserted ?? null;
-        } else if (!input.pinned && existing) {
-          await tx
-            .delete(schema.sessionPins)
+        } else if (existing.pinned !== input.pinned) {
+          const [updated] = await tx
+            .update(schema.sessionPins)
+            .set({
+              pinned: input.pinned,
+              pinnedAt: input.pinned ? new Date() : null,
+              version: sql`${schema.sessionPins.version} + 1`,
+            })
             .where(
               and(
                 eq(schema.sessionPins.workspaceId, input.workspaceId),
                 eq(schema.sessionPins.subjectId, input.subjectId),
                 eq(schema.sessionPins.sessionId, input.sessionId),
               ),
-            );
-          pin = null;
+            )
+            .returning();
+          pin = updated ?? null;
         }
         const mcpServers = await sessionMcpServerMetadataForSessions(tx, input.workspaceId, [
           session.id,

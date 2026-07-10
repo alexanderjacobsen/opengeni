@@ -10,7 +10,7 @@
 import { SessionStatus as SessionStatusBadge } from "@opengeni/react";
 import type { SessionEventsConnectionState } from "@opengeni/react";
 import type { SessionSummary } from "@opengeni/sdk";
-import { LockIcon, PanelRightIcon, PencilIcon } from "lucide-react";
+import { LockIcon, PanelRightIcon, PencilIcon, PinIcon } from "lucide-react";
 import type { ReactNode } from "react";
 
 import { ConnectionPill } from "@/components/common";
@@ -33,6 +33,7 @@ export function SessionHeader({
   inspectorOpen,
   onToggleInspector,
   onRename,
+  onPin,
   sandboxSlot,
   codexSlot,
   agentsSlot,
@@ -48,6 +49,7 @@ export function SessionHeader({
   inspectorOpen: boolean;
   onToggleInspector: () => void;
   onRename: (workspaceId: string, sessionId: string, title: string) => Promise<Session | null>;
+  onPin: (session: Session, pinned: boolean) => Promise<Session | null>;
   /** The "Run on <machine>" control — a live component in production. */
   sandboxSlot?: ReactNode;
   /** The codex-account indicator — absent for host-credit sessions. */
@@ -86,6 +88,16 @@ export function SessionHeader({
       </div>
       <div className="flex shrink-0 items-center gap-2">
         {agentsSlot}
+        <Button
+          type="button"
+          variant={session.pinned ? "secondary" : "ghost"}
+          size="icon-sm"
+          aria-label={session.pinned ? "Unpin session" : "Pin session"}
+          aria-pressed={session.pinned}
+          onClick={() => void onPin(session, !session.pinned)}
+        >
+          <PinIcon className={session.pinned ? "size-4 fill-current" : "size-4"} />
+        </Button>
         <ConnectionPill state={connectionState} />
         <SessionStatusBadge status={status} />
         {keyAuthRequired ? (

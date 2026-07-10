@@ -188,11 +188,13 @@ export function SessionsIndexRoute({ workspaceId }: { workspaceId: string }) {
 // reuses the same useWorkspaceSessions hook the rail runs on and renders only
 // when sessions exist, so the hero stays the composer.
 function RecentSessions({ workspaceId }: { workspaceId: string }) {
-  const { sessions } = useWorkspaceSessions({ limit: 12, pollIntervalMs: 30_000 });
+  const { sessions, pinned } = useWorkspaceSessions({ limit: 12, pollIntervalMs: 30_000 });
   const recent = useMemo(() => {
     const { running, grouped } = groupSessionsForRail(sessions);
-    return [...running, ...grouped.flatMap((bucket) => bucket.sessions)].slice(0, 6);
-  }, [sessions]);
+    // Pins are server-authoritative and intentionally sit above ordinary
+    // recency rows here too; they are already deduplicated from `sessions`.
+    return [...pinned, ...running, ...grouped.flatMap((bucket) => bucket.sessions)].slice(0, 6);
+  }, [pinned, sessions]);
 
   if (recent.length === 0) {
     return null;

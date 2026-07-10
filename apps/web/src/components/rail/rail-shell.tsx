@@ -308,6 +308,9 @@ function CanvasTopStrip({ hamburgerRef }: { hamburgerRef: RefObject<HTMLButtonEl
         inspectorOpen={context.inspectorOpen}
         onToggleInspector={() => context.setInspectorOpen((open) => !open)}
         onRename={context.updateSessionTitle}
+        onPin={(target, pinned) =>
+          context.updateSessionPin(target.workspaceId, target.id, pinned, target.pinVersion)
+        }
         leading={hamburger}
         sandboxSlot={
           <SessionSandboxSwitcher workspaceId={session.workspaceId} sessionId={session.id} />

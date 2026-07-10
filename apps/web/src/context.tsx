@@ -134,6 +134,13 @@ export type AppContextValue = {
     sessionId: string,
     title: string,
   ) => Promise<Session | null>;
+  /** Optimistically set the current member's personal session pin. */
+  updateSessionPin: (
+    workspaceId: string,
+    sessionId: string,
+    pinned: boolean,
+    expectedVersion?: number,
+  ) => Promise<Session | null>;
   deleteWorkspace: (workspaceId: string) => Promise<boolean>;
   refreshGitHub: (
     workspaceId: string,
@@ -481,6 +488,48 @@ export function RootRouteComponent() {
     }
   }
 
+  // Personal session pinning never changes shared session activity. Keep the
+  // header immediate on this device, use its known revision when available, and
+  // restore the authoritative prior state if the request (including a stale-tab
+  // 409) fails. The rail owns its own corresponding optimistic list projection.
+  async function updateSessionPin(
+    workspaceId: string,
+    sessionId: string,
+    pinned: boolean,
+    expectedVersion?: number,
+  ): Promise<Session | null> {
+    const before = session;
+    const optimisticVersion = (expectedVersion ?? before?.pinVersion ?? 0) + 1;
+    const optimistic: Session | null =
+      before && before.id === sessionId
+        ? {
+            ...before,
+            pinned,
+            pinnedAt: pinned ? new Date().toISOString() : null,
+            pinVersion: optimisticVersion,
+          }
+        : null;
+    if (optimistic) {
+      setSession(optimistic);
+    }
+    try {
+      const updated = await client.updateSessionPin(workspaceId, sessionId, {
+        pinned,
+        ...(expectedVersion !== undefined ? { expectedVersion } : {}),
+      });
+      setSession((current) => (current?.id === updated.id ? updated : current));
+      return updated;
+    } catch (error) {
+      if (optimistic) {
+        setSession((current) => (current?.id === sessionId ? before : current));
+      }
+      toast.error(`Couldn't ${pinned ? "pin" : "unpin"} session`, {
+        description: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
   // Delete drops the workspace from the cached list and refreshes grants (the
   // owner grant for the deleted workspace is gone). The caller navigates away.
   async function deleteWorkspace(workspaceId: string): Promise<boolean> {
@@ -799,6 +848,7 @@ export function RootRouteComponent() {
           updateWorkspaceSettings,
           setWorkspaceDefaultRig,
           updateSessionTitle,
+          updateSessionPin,
           deleteWorkspace,
           refreshGitHub,
           refreshWorkspaceMcpServers,

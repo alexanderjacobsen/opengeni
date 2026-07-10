@@ -600,7 +600,12 @@ export const sessionPins = pgTable(
     sessionId: uuid("session_id")
       .notNull()
       .references(() => sessions.id, { onDelete: "cascade" }),
-    pinnedAt: timestamp("pinned_at", { withTimezone: true }).notNull().defaultNow(),
+    // Keep an unpinned tombstone (pinned=false, pinned_at=null) rather than
+    // deleting it. That preserves a monotonic version and prevents an ABA race:
+    // a stale client that saw pin version 1 cannot silently overwrite a later
+    // unpin+re-pin that would otherwise recreate version 1.
+    pinned: boolean("pinned").notNull().default(true),
+    pinnedAt: timestamp("pinned_at", { withTimezone: true }),
     version: integer("version").notNull().default(1),
   },
   (table) => ({
@@ -612,6 +617,7 @@ export const sessionPins = pgTable(
     subjectPinned: index("session_pins_workspace_subject_pinned_idx").on(
       table.workspaceId,
       table.subjectId,
+      table.pinned,
       table.pinnedAt,
       table.sessionId,
     ),

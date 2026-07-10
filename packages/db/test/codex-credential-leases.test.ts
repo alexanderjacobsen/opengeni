@@ -27,6 +27,7 @@ import {
   settleCodexCredentialFailover,
   releaseCodexCredentialLease,
   setCodexCredentialExhausted,
+  setCodexCredentialStatus,
   setCodexCredentialStatusById,
   setActiveCodexCredential,
   updateCodexRotationSettings,
@@ -620,6 +621,18 @@ describe("OPE-21 atomic Codex credential allocation", () => {
         expiresAt: null,
         lastRefreshAt: new Date(),
       }),
+    ).toBe(false);
+    // The resolver turns failed stale-token persistence into a typed relogin
+    // failure. Its follow-up health stamp must be fenced too, rather than
+    // downgrading the already-committed definitive `error` quarantine.
+    expect(
+      await setCodexCredentialStatus(
+        dbA,
+        ws!.workspaceId,
+        "needs_relogin",
+        "stale refresh must not overwrite quarantine",
+        { id: credentialId, version: loaded!.version },
+      ),
     ).toBe(false);
     const [after] = await admin<{ status: string; allocator_enabled: boolean; version: number }[]>`
       select status, allocator_enabled, version

@@ -33,24 +33,20 @@ function mockZeroBalance(): () => void {
   return () => spy.mockRestore();
 }
 
-function mockCredentialStatus(status: string): () => void {
-  const spy = spyOn(opengeniDb, "getCodexCredentialStatus").mockResolvedValue({
-    connected: status === "active",
-    chatgptAccountId: "a",
-    scopes: null,
-    planType: "pro",
-    status,
-    expiresAt: null,
-    lastRefreshAt: null,
-    lastError: null,
-  } as Awaited<ReturnType<typeof opengeniDb.getCodexCredentialStatus>>);
+function mockCodexBilled(active: boolean): () => void {
+  // This suite owns the API credit-gate decision, not the DB allocator. Mock
+  // the canonical billed-turn seam directly so a deliberately empty DB fixture
+  // does not need to emulate the cutover-aware RLS/rotation-row transaction.
+  // Real credential status, pool admission, and cutover behavior are exercised
+  // against native Postgres in the DB suites.
+  const spy = spyOn(opengeniDb, "isCodexBilledTurn").mockResolvedValue(active);
   return () => spy.mockRestore();
 }
 
 describe("API edge credit gate — codex bypass", () => {
   test("(a) codex model + ACTIVE credential bypasses the 0-credit gate", async () => {
     const restoreBal = mockZeroBalance();
-    const restoreCred = mockCredentialStatus("active");
+    const restoreCred = mockCodexBilled(true);
     try {
       const decision = await checkLimit(deps(billedSettings()), {
         accountId: ACCOUNT,
@@ -76,7 +72,7 @@ describe("API edge credit gate — codex bypass", () => {
 
   test("(b) codex MODEL but NO active credential is still gated (402, no free bypass)", async () => {
     const restoreBal = mockZeroBalance();
-    const restoreCred = mockCredentialStatus("needs_relogin");
+    const restoreCred = mockCodexBilled(false);
     try {
       const decision = await checkLimit(deps(billedSettings()), {
         accountId: ACCOUNT,

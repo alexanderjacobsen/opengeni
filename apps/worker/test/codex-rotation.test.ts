@@ -1023,6 +1023,7 @@ describe("OPE-21 pin and rollout policy", () => {
     accounts,
     activeCredentialId: "a",
     rotationEnabled: true,
+    leaseRotationEnabled: true,
     rotationStrategy: "most_remaining",
     existingCredentialId,
   });
@@ -1069,10 +1070,81 @@ describe("OPE-21 pin and rollout policy", () => {
     expect(selected.credentialId).toBe("b");
   });
 
-  test("cutover flag off preserves legacy pin then active-pointer behavior", () => {
+  test("cutover flag off preserves the old worker's enabled rotation policy", () => {
     const selected = selectCodexCredentialLeaseForTurn({
-      context: context([leasedAcct("a"), leasedAcct("b")]),
+      context: context([
+        leasedAcct("a", { primaryUsedPercent: 60 }),
+        leasedAcct("b", { primaryUsedPercent: 0 }),
+      ]),
       leasingEnabled: false,
+      sessionPinnedCredentialId: null,
+      sessionLastCredentialId: "a",
+      nearExhaustionPct: 90,
+      now: NOW,
+    });
+    // Pre-0049 most_remaining keeps a still-eligible active pointer sticky.
+    expect(selected.credentialId).toBe("a");
+  });
+
+  test("workspace cutover false keeps leases inert while preserving legacy rotation", () => {
+    const selected = selectCodexCredentialLeaseForTurn({
+      context: {
+        ...context([
+          leasedAcct("a", { primaryUsedPercent: 60 }),
+          leasedAcct("b", { primaryUsedPercent: 0 }),
+        ]),
+        leaseRotationEnabled: false,
+      },
+      leasingEnabled: true,
+      sessionPinnedCredentialId: null,
+      sessionLastCredentialId: "a",
+      nearExhaustionPct: 90,
+      now: NOW,
+    });
+    expect(selected.credentialId).toBe("a");
+  });
+
+  test("legacy rollback ignores stale lease and fairness metadata", () => {
+    const selected = selectCodexCredentialLeaseForTurn({
+      context: {
+        ...context([
+          leasedAcct("a", {
+            primaryUsedPercent: 99,
+            primaryResetAt: new Date(NOW.getTime() + HOUR),
+          }),
+          leasedAcct("b", {
+            primaryUsedPercent: 10,
+            activeLeaseCount: 20,
+            selectionCount: 500,
+            lastSelectedAt: new Date(NOW.getTime() + HOUR),
+          }),
+          leasedAcct("c", {
+            primaryUsedPercent: 20,
+            activeLeaseCount: 0,
+            selectionCount: 0,
+            lastSelectedAt: null,
+          }),
+        ]),
+        leaseRotationEnabled: false,
+      },
+      leasingEnabled: true,
+      sessionPinnedCredentialId: null,
+      sessionLastCredentialId: "a",
+      nearExhaustionPct: 90,
+      now: NOW,
+    });
+    // The old selector knows only capacity and picks b (90% remaining), not c.
+    expect(selected.credentialId).toBe("b");
+  });
+
+  test("legacy rotation false remains sticky even when the deployment flag is on", () => {
+    const selected = selectCodexCredentialLeaseForTurn({
+      context: {
+        ...context([leasedAcct("a"), leasedAcct("b")]),
+        rotationEnabled: false,
+        leaseRotationEnabled: false,
+      },
+      leasingEnabled: true,
       sessionPinnedCredentialId: null,
       sessionLastCredentialId: "b",
       nearExhaustionPct: 90,
@@ -1092,6 +1164,7 @@ describe("OPE-21 pin and rollout policy", () => {
         })),
         activeCredentialId: "a",
         rotationEnabled: true,
+        leaseRotationEnabled: true,
         rotationStrategy: "round_robin",
         existingCredentialId: null,
       },

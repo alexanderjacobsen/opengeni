@@ -6983,10 +6983,7 @@ export async function setCodexCredentialStatusById(
  * lazily repairs the pointer so the next read is deterministic. The returned
  * `credentialId` is the active row's id (null when no credential exists at all).
  */
-export async function getCodexCredentialStatus(
-  db: Database,
-  workspaceId: string,
-): Promise<{
+export type CodexCredentialStatus = {
   connected: boolean;
   credentialId: string | null;
   chatgptAccountId: string | null;
@@ -6996,75 +6993,89 @@ export async function getCodexCredentialStatus(
   expiresAt: Date | null;
   lastRefreshAt: Date | null;
   lastError: string | null;
-} | null> {
-  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
-    await scopedDb.execute(sql`
-      select id from codex_rotation_settings
-      where workspace_id = ${workspaceId}
-      for update
-    `);
-    const cols = {
-      id: schema.codexSubscriptionCredentials.id,
-      chatgptAccountId: schema.codexSubscriptionCredentials.chatgptAccountId,
-      scopes: schema.codexSubscriptionCredentials.scopes,
-      planType: schema.codexSubscriptionCredentials.planType,
-      status: schema.codexSubscriptionCredentials.status,
-      expiresAt: schema.codexSubscriptionCredentials.expiresAt,
-      lastRefreshAt: schema.codexSubscriptionCredentials.lastRefreshAt,
-      lastError: schema.codexSubscriptionCredentials.lastError,
-    } as const;
-    const [settingsRow] = await scopedDb
-      .select({ activeCredentialId: schema.codexRotationSettings.activeCredentialId })
-      .from(schema.codexRotationSettings)
-      .where(eq(schema.codexRotationSettings.workspaceId, workspaceId))
-      .limit(1);
+};
 
-    let row:
-      | {
-          id: string;
-          chatgptAccountId: string | null;
-          scopes: string | null;
-          planType: string | null;
-          status: string;
-          expiresAt: Date | null;
-          lastRefreshAt: Date | null;
-          lastError: string | null;
-        }
-      | undefined;
-    if (settingsRow?.activeCredentialId) {
-      [row] = await scopedDb
-        .select(cols)
-        .from(schema.codexSubscriptionCredentials)
-        .where(
-          and(
-            eq(schema.codexSubscriptionCredentials.id, settingsRow.activeCredentialId),
-            eq(schema.codexSubscriptionCredentials.workspaceId, workspaceId),
-          ),
-        )
-        .limit(1);
-    }
-    if (!row) {
-      // No active pointer (or it dangles): fall back to the most-recently-connected
-      // credential and lazily repair the pointer so the active account is stable.
-      [row] = await scopedDb
-        .select(cols)
-        .from(schema.codexSubscriptionCredentials)
-        .where(eq(schema.codexSubscriptionCredentials.workspaceId, workspaceId))
-        .orderBy(desc(schema.codexSubscriptionCredentials.createdAt))
-        .limit(1);
-      if (row && settingsRow && settingsRow.activeCredentialId !== row.id) {
-        await scopedDb
-          .update(schema.codexRotationSettings)
-          .set({ activeCredentialId: row.id, updatedAt: new Date() })
-          .where(eq(schema.codexRotationSettings.workspaceId, workspaceId));
+async function getCodexCredentialStatusScoped(
+  scopedDb: Database,
+  workspaceId: string,
+): Promise<CodexCredentialStatus | null> {
+  await scopedDb.execute(sql`
+    select id from codex_rotation_settings
+    where workspace_id = ${workspaceId}
+    for update
+  `);
+  const cols = {
+    id: schema.codexSubscriptionCredentials.id,
+    chatgptAccountId: schema.codexSubscriptionCredentials.chatgptAccountId,
+    scopes: schema.codexSubscriptionCredentials.scopes,
+    planType: schema.codexSubscriptionCredentials.planType,
+    status: schema.codexSubscriptionCredentials.status,
+    expiresAt: schema.codexSubscriptionCredentials.expiresAt,
+    lastRefreshAt: schema.codexSubscriptionCredentials.lastRefreshAt,
+    lastError: schema.codexSubscriptionCredentials.lastError,
+  } as const;
+  const [settingsRow] = await scopedDb
+    .select({ activeCredentialId: schema.codexRotationSettings.activeCredentialId })
+    .from(schema.codexRotationSettings)
+    .where(eq(schema.codexRotationSettings.workspaceId, workspaceId))
+    .limit(1);
+
+  let row:
+    | {
+        id: string;
+        chatgptAccountId: string | null;
+        scopes: string | null;
+        planType: string | null;
+        status: string;
+        expiresAt: Date | null;
+        lastRefreshAt: Date | null;
+        lastError: string | null;
       }
+    | undefined;
+  if (settingsRow?.activeCredentialId) {
+    [row] = await scopedDb
+      .select(cols)
+      .from(schema.codexSubscriptionCredentials)
+      .where(
+        and(
+          eq(schema.codexSubscriptionCredentials.id, settingsRow.activeCredentialId),
+          eq(schema.codexSubscriptionCredentials.workspaceId, workspaceId),
+        ),
+      )
+      .limit(1);
+  }
+  if (!row) {
+    // No active pointer (or it dangles): fall back to the most-recently-connected
+    // credential and lazily repair the pointer so the active account is stable.
+    [row] = await scopedDb
+      .select(cols)
+      .from(schema.codexSubscriptionCredentials)
+      .where(eq(schema.codexSubscriptionCredentials.workspaceId, workspaceId))
+      .orderBy(desc(schema.codexSubscriptionCredentials.createdAt))
+      .limit(1);
+    if (row && settingsRow && settingsRow.activeCredentialId !== row.id) {
+      await scopedDb
+        .update(schema.codexRotationSettings)
+        .set({ activeCredentialId: row.id, updatedAt: new Date() })
+        .where(eq(schema.codexRotationSettings.workspaceId, workspaceId));
     }
-    if (!row) {
-      return null;
-    }
-    const { id, ...rest } = row;
-    return { connected: rest.status === "active", credentialId: id, ...rest };
-  });
+  }
+  if (!row) {
+    return null;
+  }
+  const { id, ...rest } = row;
+  return { connected: rest.status === "active", credentialId: id, ...rest };
+}
+
+export async function getCodexCredentialStatus(
+  db: Database,
+  workspaceId: string,
+): Promise<CodexCredentialStatus | null> {
+  return await withWorkspaceRls(
+    db,
+    workspaceId,
+    async (scopedDb) => await getCodexCredentialStatusScoped(scopedDb, workspaceId),
+  );
 }
 
 /**
@@ -7095,16 +7106,32 @@ export async function workspaceCodexSubscriptionActive(
   let lastError: unknown;
   for (let attempt = 0; attempt < CODEX_ACTIVE_READ_ATTEMPTS; attempt++) {
     try {
-      if (!settings.codexCredentialLeasingEnabled) {
-        // Rolling-deploy/rollback compatibility: before cutover, preserve the
-        // exact legacy active-pointer predicate used by old API/worker replicas.
-        const status = await getCodexCredentialStatus(db, workspaceId);
-        return status?.status === "active";
-      }
-      // The workspace-global pointer is a UI/manual preference, not the health
-      // of the pool. A broken active row must not hide another healthy account
-      // and prevent the worker from reaching the rotation selector.
       return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+        const [rotation] = await scopedDb
+          .select({
+            rotationEnabled: schema.codexRotationSettings.rotationEnabled,
+            leaseRotationEnabled: schema.codexRotationSettings.leaseRotationEnabled,
+          })
+          .from(schema.codexRotationSettings)
+          .where(eq(schema.codexRotationSettings.workspaceId, workspaceId))
+          .for("update")
+          .limit(1);
+        const leaseCutoverEnabled = Boolean(
+          settings.codexCredentialLeasingEnabled &&
+          rotation?.rotationEnabled &&
+          rotation.leaseRotationEnabled,
+        );
+        if (!leaseCutoverEnabled) {
+          // Process flag alone is not a cutover. Mixed old/new workers must use
+          // the exact legacy active-pointer predicate until the synchronized DB
+          // bits are true; the row lock makes this admission decision atomic
+          // with the admin settings write.
+          const status = await getCodexCredentialStatusScoped(scopedDb, workspaceId);
+          return status?.status === "active";
+        }
+        // After cutover the workspace-global pointer is a UI/manual cursor, not
+        // the health of the pool. A broken pointer must not hide another healthy
+        // account and prevent the worker from reaching the lease selector.
         const [row] = await scopedDb
           .select({ id: schema.codexSubscriptionCredentials.id })
           .from(schema.codexSubscriptionCredentials)
@@ -7226,6 +7253,8 @@ export type CodexCredentialLeaseSelectionContext = {
   accounts: CodexLeaseAccountStatus[];
   activeCredentialId: string | null;
   rotationEnabled: boolean;
+  /** Workspace cutover fence. False means the additive lease table stays inert. */
+  leaseRotationEnabled: boolean;
   rotationStrategy: string;
   /** A still-live idempotent lease for this SAME turn, if one exists. */
   existingCredentialId: string | null;
@@ -7371,7 +7400,7 @@ export async function acquireCodexCredentialLease<T>(
       await tx.execute(sql`
         insert into codex_rotation_settings
           (account_id, workspace_id, lease_rotation_enabled)
-        values (${input.accountId}, ${input.workspaceId}, true)
+        values (${input.accountId}, ${input.workspaceId}, false)
         on conflict (workspace_id) do nothing
       `);
       const settingsRows = await tx.execute(sql<{
@@ -7391,22 +7420,34 @@ export async function acquireCodexCredentialLease<T>(
         throw new Error(`Codex rotation settings not visible for workspace ${input.workspaceId}`);
       }
       const activeCredentialId = settingsRow.active_credential_id;
-      const rotationEnabled = settingsRow.rotation_enabled || settingsRow.lease_rotation_enabled;
+      const rotationEnabled = settingsRow.rotation_enabled;
+      // Fail closed on a torn/manual legacy write. The user-intent bit and the
+      // revision-aware cutover bit are synchronized by the supported API; both
+      // must remain true before the additive allocator may touch lease state.
+      const leaseRotationEnabled =
+        settingsRow.rotation_enabled && settingsRow.lease_rotation_enabled;
       const rotationStrategy = settingsRow.rotation_strategy;
 
-      await tx.execute(sql`
-        delete from codex_credential_leases
-        where workspace_id = ${input.workspaceId} and leased_until <= now()
-      `);
-      const existingRows = await tx.execute(
-        sql<{ credential_id: string; holder_id: string; generation: number }>`
-        select credential_id, holder_id, generation from codex_credential_leases
-        where workspace_id = ${input.workspaceId}
-          and turn_id = ${input.turnId}
-          and leased_until > now()
-        limit 1
-      `,
-      );
+      // The per-workspace bit is the atomic cutover fence. Until an operator or
+      // explicit settings write enables it, a migration-compatible worker keeps
+      // the lease table/cursors completely inert and follows the legacy policy.
+      if (leaseRotationEnabled) {
+        await tx.execute(sql`
+          delete from codex_credential_leases
+          where workspace_id = ${input.workspaceId} and leased_until <= now()
+        `);
+      }
+      const existingRows = leaseRotationEnabled
+        ? await tx.execute(
+            sql<{ credential_id: string; holder_id: string; generation: number }>`
+              select credential_id, holder_id, generation from codex_credential_leases
+              where workspace_id = ${input.workspaceId}
+                and turn_id = ${input.turnId}
+                and leased_until > now()
+              limit 1
+            `,
+          )
+        : [];
       const existingCredentialId = existingRows[0]?.credential_id ?? null;
 
       const rows = await tx.execute(sql<CodexLeaseCandidateRow>`
@@ -7447,11 +7488,12 @@ export async function acquireCodexCredentialLease<T>(
         accounts,
         activeCredentialId,
         rotationEnabled,
+        leaseRotationEnabled,
         rotationStrategy,
         existingCredentialId,
       });
       if (selected.credentialId === null) {
-        if (existingCredentialId !== null) {
+        if (leaseRotationEnabled && existingCredentialId !== null) {
           await tx.execute(sql`
             delete from codex_credential_leases
             where workspace_id = ${input.workspaceId} and turn_id = ${input.turnId}
@@ -7473,6 +7515,31 @@ export async function acquireCodexCredentialLease<T>(
       const selectedAccount = accounts.find((account) => account.id === selected.credentialId);
       if (!selectedAccount) {
         throw new Error("Codex lease selector returned a credential outside the workspace pool");
+      }
+
+      // Compatible-but-not-cut-over workers may still run the legacy rotation
+      // policy under this same workspace-row lock. They can advance the active
+      // pointer, but never create a lease or mutate fairness cursors.
+      if (!leaseRotationEnabled) {
+        if (input.advanceActivePointer && activeCredentialId !== selected.credentialId) {
+          await tx.execute(sql`
+            update codex_rotation_settings
+            set active_credential_id = ${selected.credentialId}, updated_at = now()
+            where account_id = ${input.accountId} and workspace_id = ${input.workspaceId}
+          `);
+        }
+        return {
+          decision: selected.decision,
+          accounts,
+          activeCredentialId,
+          rotationEnabled,
+          rotationStrategy,
+          credentialId: selected.credentialId,
+          reused: false,
+          holderId: null,
+          generation: null,
+          leasedUntil: null,
+        };
       }
 
       const reused = existingCredentialId === selected.credentialId;
@@ -7761,7 +7828,7 @@ export type CodexRotationSettings = {
   activeCredentialId: string | null;
   /** Legacy selector bit; old binaries only understand this field. */
   rotationEnabled: boolean;
-  /** New allocator-only auto/default bit; ignored safely by old binaries. */
+  /** New allocator cutover bit; ignored safely by old binaries. */
   leaseRotationEnabled: boolean;
   rotationStrategy: string; // P1: 'most_remaining' (unused)
 };
@@ -7791,7 +7858,6 @@ export async function ensureCodexRotationSettings(
   db: Database,
   accountId: string,
   workspaceId: string,
-  options: { leaseRotationEnabled?: boolean } = {},
 ): Promise<void> {
   await withRlsContext(db, { accountId, workspaceId }, async (scopedDb) => {
     await scopedDb
@@ -7799,7 +7865,7 @@ export async function ensureCodexRotationSettings(
       .values({
         accountId,
         workspaceId,
-        leaseRotationEnabled: options.leaseRotationEnabled ?? false,
+        leaseRotationEnabled: false,
       })
       .onConflictDoNothing({ target: [schema.codexRotationSettings.workspaceId] });
   });

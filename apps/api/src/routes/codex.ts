@@ -236,12 +236,11 @@ export function registerCodexRoutes(app: Hono, deps: ApiRouteDeps): void {
     // the FIRST account only. Additional new accounts do NOT auto-activate — a
     // manual switch is required (no auto-rotation in P1). A re-connect of the
     // already-active account is a no-op for the pointer.
-    await ensureCodexRotationSettings(db, grant.accountId, workspaceId, {
-      // This column is invisible to legacy binaries. It is set only by a
-      // migration-compatible API revision after the deployment flag is enabled,
-      // so schema-first rollout and binary rollback remain safe.
-      leaseRotationEnabled: settings.codexCredentialLeasingEnabled,
-    });
+    // Keep both rotation bits false on first connect. The deployment flag makes
+    // the compatible allocator available, but the workspace-local cutover bit
+    // is enabled only by an explicit settings write after every worker replica
+    // understands leasing.
+    await ensureCodexRotationSettings(db, grant.accountId, workspaceId);
     const rotation = await getCodexRotationSettings(db, workspaceId);
     let isActive = rotation?.activeCredentialId === upserted.id;
     if (!isActive && rotation?.activeCredentialId == null) {
@@ -323,11 +322,7 @@ export function registerCodexRoutes(app: Hono, deps: ApiRouteDeps): void {
       accounts: accounts.map(codexAccountJson),
       activeAccountId,
       settings: {
-        rotationEnabled:
-          rotation == null
-            ? false
-            : rotation.rotationEnabled ||
-              (settings.codexCredentialLeasingEnabled && rotation.leaseRotationEnabled),
+        rotationEnabled: rotation?.rotationEnabled ?? false,
         rotationStrategy: rotation?.rotationStrategy ?? "most_remaining",
         activeCredentialId: activeAccountId,
       },
@@ -375,9 +370,7 @@ export function registerCodexRoutes(app: Hono, deps: ApiRouteDeps): void {
       throw new HTTPException(404, { message: "codex rotation settings not found" });
     }
     return c.json({
-      rotationEnabled:
-        updated.rotationEnabled ||
-        (settings.codexCredentialLeasingEnabled && updated.leaseRotationEnabled),
+      rotationEnabled: updated.rotationEnabled,
       rotationStrategy: updated.rotationStrategy,
       activeCredentialId: updated.activeCredentialId,
     });

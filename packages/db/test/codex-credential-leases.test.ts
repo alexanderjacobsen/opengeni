@@ -27,6 +27,7 @@ import {
   setCodexCredentialExhausted,
   setCodexCredentialStatusById,
   setActiveCodexCredential,
+  updateCodexRotationSettings,
   upsertCodexSubscriptionCredential,
   withCodexCredentialRefreshLock,
   withRlsContext,
@@ -82,6 +83,7 @@ async function connectCredential(ws: Workspace, externalId: string): Promise<str
     lastRefreshAt: new Date(),
   });
   await ensureCodexRotationSettings(dbA, ws.accountId, ws.workspaceId);
+  await updateCodexRotationSettings(dbA, ws.workspaceId, { rotationEnabled: true });
   return result.id;
 }
 
@@ -180,7 +182,7 @@ afterAll(async () => {
 });
 
 describe("OPE-21 atomic Codex credential allocation", () => {
-  test("legacy default stays off while compatible code can opt into lease rotation", async () => {
+  test("legacy and lease defaults stay off until an explicit settings cutover", async () => {
     if (!available) return;
     const [ws] = await freshAccount();
     await ensureCodexRotationSettings(dbA, ws!.accountId, ws!.workspaceId);
@@ -188,26 +190,18 @@ describe("OPE-21 atomic Codex credential allocation", () => {
       select rotation_enabled, lease_rotation_enabled
       from codex_rotation_settings where workspace_id = ${ws!.workspaceId}`;
     expect(row).toEqual({ rotation_enabled: false, lease_rotation_enabled: false });
-    await ensureCodexRotationSettings(dbA, ws!.accountId, ws!.workspaceId, {
-      leaseRotationEnabled: true,
-    });
+    await ensureCodexRotationSettings(dbA, ws!.accountId, ws!.workspaceId);
     const [preserved] = await admin<
       { rotation_enabled: boolean; lease_rotation_enabled: boolean }[]
     >`
       select rotation_enabled, lease_rotation_enabled
       from codex_rotation_settings where workspace_id = ${ws!.workspaceId}`;
     expect(preserved).toEqual({ rotation_enabled: false, lease_rotation_enabled: false });
-
-    const [newWs] = await freshAccount();
-    await ensureCodexRotationSettings(dbA, newWs!.accountId, newWs!.workspaceId, {
-      leaseRotationEnabled: true,
-    });
-    const [revisionAware] = await admin<
-      { rotation_enabled: boolean; lease_rotation_enabled: boolean }[]
-    >`
+    await updateCodexRotationSettings(dbA, ws!.workspaceId, { rotationEnabled: true });
+    const [cutOver] = await admin<{ rotation_enabled: boolean; lease_rotation_enabled: boolean }[]>`
       select rotation_enabled, lease_rotation_enabled
-      from codex_rotation_settings where workspace_id = ${newWs!.workspaceId}`;
-    expect(revisionAware).toEqual({ rotation_enabled: false, lease_rotation_enabled: true });
+      from codex_rotation_settings where workspace_id = ${ws!.workspaceId}`;
+    expect(cutOver).toEqual({ rotation_enabled: true, lease_rotation_enabled: true });
   });
 
   test("40 concurrent turns across two replica pools spread evenly over four credentials", async () => {
@@ -284,6 +278,17 @@ describe("OPE-21 atomic Codex credential allocation", () => {
         ws!.workspaceId,
       ),
     ).toBe(false);
+
+    // The deployment flag alone must not change admission during a rolling
+    // update. An existing rotation-enabled row with its lease bit still false
+    // uses the exact legacy pointer predicate and therefore remains false here.
+    await admin`
+      update codex_rotation_settings
+      set rotation_enabled = true, lease_rotation_enabled = false
+      where workspace_id = ${ws!.workspaceId}`;
+    expect(await workspaceCodexSubscriptionActive(dbB, settings, ws!.workspaceId)).toBe(false);
+    await updateCodexRotationSettings(dbA, ws!.workspaceId, { rotationEnabled: true });
+    expect(await workspaceCodexSubscriptionActive(dbB, settings, ws!.workspaceId)).toBe(true);
   });
 
   test("long-turn heartbeat renews the holder; crash expiry is reclaimed; release is idempotent", async () => {
@@ -587,7 +592,7 @@ describe("OPE-21 atomic Codex credential allocation", () => {
     expect(seenAsA.some((row) => row.credentialId === credentialB)).toBe(false);
   });
 
-  test("workspace allocator and schema guards reject foreign credential references", async () => {
+  test("workspace allocator and schema guards reject malformed foreign references", async () => {
     if (!available) return;
     const [wsA, wsB] = await freshAccount(2);
     const foreignCredential = await connectCredential(wsA!, "foreign-a");
@@ -646,6 +651,24 @@ describe("OPE-21 atomic Codex credential allocation", () => {
       turnFkError = error;
     }
     expect(turnFkError).toBeDefined();
+
+    const [otherAccountWorkspace] = await freshAccount();
+    const turnA = await seedTurn(wsA!, 2);
+    let accountFkError: unknown;
+    try {
+      await admin`
+        insert into codex_credential_leases (
+          account_id, workspace_id, credential_id, turn_id,
+          holder_id, generation, leased_until
+        ) values (
+          ${otherAccountWorkspace!.accountId}, ${wsA!.workspaceId},
+          ${foreignCredential}, ${turnA}, 'foreign-account', 1,
+          now() + interval '5 minutes'
+        )`;
+    } catch (error) {
+      accountFkError = error;
+    }
+    expect(accountFkError).toBeDefined();
   });
 
   test("exhaustion reassigns the same durable turn exactly once without duplication", async () => {

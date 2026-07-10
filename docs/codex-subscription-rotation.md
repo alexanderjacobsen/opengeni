@@ -112,26 +112,41 @@ existing `(id, version)` CAS remains the stale-family write fence.
 
 Migration `0049_codex_credential_leases.sql` is additive. It creates the
 workspace-local lease table and fairness columns, strengthens workspace reference
-integrity, and adds a separate `lease_rotation_enabled` rollout bit. Both that bit
+integrity, and adds a separate `lease_rotation_enabled` cutover bit. Both that bit
 and the legacy `rotation_enabled` column keep a database default of `false`, so a
 schema-first migration or an older binary can never opt a workspace into mixed-mode
-rotation. After the deployment flag is enabled, migration-compatible API/worker
-code explicitly sets the new bit only when it creates a rotation-setting row;
-existing rows are not updated, preserving an existing false value as operator/user
-intent.
+rotation. First-connect code also leaves the new bit false. An explicit settings
+write updates both generations only after the compatible fleet is ready.
+
+The deployment flag, legacy user-intent bit, and workspace cutover bit are all
+required for leasing. With the deployment flag off, or unless both
+`rotation_enabled=true` and `lease_rotation_enabled=true`, a new worker preserves
+the old binary's exact pin/legacy-rotation policy and leaves the lease table plus
+fairness cursors inert. The supported settings write keeps both database bits in
+sync; a torn/manual legacy write fails closed. This makes the database row the
+atomic fleet-wide cutover—process-local environment changes alone never split a
+workspace between allocators.
 
 Safe rollout order:
 
 1. Apply the migration and deploy the compatible revision with
    `OPENGENI_CODEX_CREDENTIAL_LEASING_ENABLED=false`.
 2. Wait until every API/worker replica is on that revision. Mixed old/new workers
-   still use legacy pin→active selection and never touch the lease table.
-3. Enable the flag in staging, prove concurrent distribution and exhaustion
-   recovery, then enable the same revision/config in production.
+   still use the same legacy pin/rotation policy and never touch the lease table.
+3. Enable the deployment flag and wait for that same immutable revision/config to
+   finish rolling out. Workspace cutover bits remain false, so this restart is
+   still legacy-only.
+4. Through the normal workspace-admin settings path, explicitly enable rotation
+   for the controlled staging workspace. This sets `rotation_enabled` and
+   `lease_rotation_enabled` together; all compatible replicas switch atomically on
+   the database row. Prove concurrent distribution and exhaustion recovery, then
+   repeat the same controlled workspace cutover in production.
 
-Immediate rollback is setting the flag to `false`; this restores the legacy
-selection path without a schema rollback. The additive table/columns remain inert.
-An older binary is also compatible with the additive schema.
+Immediate workspace rollback is clearing `lease_rotation_enabled` (the normal
+rotation-off settings write clears both generations). Do that before rolling the
+deployment flag back to `false`; every replica immediately returns to the legacy
+path without a schema rollback. The additive table/columns remain inert. An older
+binary is also compatible with the additive schema.
 
 ## Secret-safe observability
 

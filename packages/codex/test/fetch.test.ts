@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  CODEX_TRANSPORT_ERROR_HEADER,
   type CodexRequestContext,
   type CodexTokenSnapshot,
   type CodexUsageHeaderSnapshot,
@@ -7,6 +8,7 @@ import {
   classifyCodexUsageLimitError,
   codexRequestStorage,
   codexSubscriptionFetch,
+  isCodexTransportError,
   parseCodexUsageHeaders,
 } from "../src";
 
@@ -126,6 +128,7 @@ describe("codexSubscriptionFetch", () => {
         }),
     );
     expect(response.status).toBe(401);
+    expect(response.headers.get(CODEX_TRANSPORT_ERROR_HEADER)).toBe("1");
     expect(refreshed).toBe(1);
     expect(captures).toHaveLength(2);
   });
@@ -147,6 +150,7 @@ describe("codexSubscriptionFetch", () => {
         }),
     );
     expect(response.status).toBe(403);
+    expect(response.headers.get(CODEX_TRANSPORT_ERROR_HEADER)).toBe("1");
     expect(refreshed).toBe(0);
     expect(captures).toHaveLength(1);
   });
@@ -330,6 +334,15 @@ describe("codexSubscriptionFetch", () => {
 });
 
 describe("classifyCodexUsageLimitError", () => {
+  test("recognizes only buffered Codex transport provenance through an SDK cause chain", () => {
+    const inner = Object.assign(new Error("provider refusal"), {
+      headers: new Headers({ [CODEX_TRANSPORT_ERROR_HEADER]: "1" }),
+    });
+    expect(isCodexTransportError(Object.assign(new Error("wrapped"), { cause: inner }))).toBe(true);
+    expect(
+      isCodexTransportError(Object.assign(new Error("unrelated MCP refusal"), { status: 403 })),
+    ).toBe(false);
+  });
   test("detects an OpenAI-shaped 429 usage_limit_reached and extracts the reset window", () => {
     const err = Object.assign(new Error("429 limit"), {
       status: 429,

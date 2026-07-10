@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS "codex_credential_leases" (
   "leased_until" timestamptz NOT NULL,
   "created_at" timestamptz NOT NULL DEFAULT now(),
   "updated_at" timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT "codex_credential_leases_workspace_account_fk"
+    FOREIGN KEY ("workspace_id", "account_id")
+    REFERENCES "workspaces"("id", "account_id")
+    ON DELETE CASCADE,
   CONSTRAINT "codex_credential_leases_workspace_credential_fk"
     FOREIGN KEY ("workspace_id", "credential_id")
     REFERENCES "codex_subscription_credentials"("workspace_id", "id")

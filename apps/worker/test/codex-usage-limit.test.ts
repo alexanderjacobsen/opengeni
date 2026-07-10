@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { CODEX_TRANSPORT_ERROR_HEADER, CodexReloginRequired } from "@opengeni/codex";
 import {
   agentRunFailurePayload,
   classifyCodexCredentialFailure,
@@ -7,6 +8,15 @@ import {
   codexUsageLimitFailurePayload,
   humanizeResetWindow,
 } from "../src/activities/agent-turn";
+
+function codexTransportError<T extends Error>(error: T, retryAfter?: string): T {
+  return Object.assign(error, {
+    headers: new Headers({
+      [CODEX_TRANSPORT_ERROR_HEADER]: "1",
+      ...(retryAfter ? { "retry-after": retryAfter } : {}),
+    }),
+  });
+}
 
 // P1-d: a ChatGPT/Codex usage cap (429 usage_limit_reached) must surface as a
 // precise, NON-retryable error with the reset window — not the generic retryable
@@ -26,41 +36,69 @@ describe("humanizeResetWindow", () => {
 describe("OPE-21 definitive credential failure classification", () => {
   test("classifies second 401, 403, generic 429, and quota shapes", () => {
     expect(
-      classifyCodexCredentialFailure(Object.assign(new Error("unauthorized"), { status: 401 })),
+      classifyCodexCredentialFailure(
+        codexTransportError(Object.assign(new Error("unauthorized"), { status: 401 })),
+      ),
     ).toEqual({ kind: "auth", cooldownSeconds: null });
     expect(
-      classifyCodexCredentialFailure(Object.assign(new Error("forbidden"), { status: 403 })),
+      classifyCodexCredentialFailure(
+        codexTransportError(Object.assign(new Error("forbidden"), { status: 403 })),
+      ),
     ).toEqual({ kind: "forbidden", cooldownSeconds: null });
     expect(
       classifyCodexCredentialFailure(
-        Object.assign(new Error("too many requests"), {
-          status: 429,
-          retry_after_seconds: 17,
-        }),
+        codexTransportError(
+          Object.assign(new Error("too many requests"), {
+            status: 429,
+            retry_after_seconds: 17,
+          }),
+        ),
       ),
     ).toEqual({ kind: "rate_limit", cooldownSeconds: 17 });
     expect(
       classifyCodexCredentialFailure(
-        Object.assign(new Error("insufficient quota"), { code: "insufficient_quota" }),
+        codexTransportError(
+          Object.assign(new Error("insufficient quota"), { code: "insufficient_quota" }),
+        ),
       ),
     ).toEqual({ kind: "quota", cooldownSeconds: null });
     expect(
       classifyCodexCredentialFailure(
-        Object.assign(new Error("insufficient quota"), {
-          status: 429,
-          code: "insufficient_quota",
-          retry_after_seconds: 19,
-        }),
+        codexTransportError(
+          Object.assign(new Error("insufficient quota"), {
+            status: 429,
+            code: "insufficient_quota",
+            retry_after_seconds: 19,
+          }),
+        ),
       ),
     ).toEqual({ kind: "quota", cooldownSeconds: 19 });
     expect(
       classifyCodexCredentialFailure(
-        Object.assign(new Error("weekly quota exceeded"), {
-          status: 429,
-          error: { code: "quota_exceeded" },
-        }),
+        codexTransportError(
+          Object.assign(new Error("weekly quota exceeded"), {
+            status: 429,
+            error: { code: "quota_exceeded" },
+          }),
+        ),
       ),
     ).toEqual({ kind: "quota", cooldownSeconds: null });
+    expect(classifyCodexCredentialFailure(new CodexReloginRequired("refresh rejected"))).toEqual({
+      kind: "auth",
+      cooldownSeconds: null,
+    });
+    expect(
+      classifyCodexCredentialFailure(
+        Object.assign(new Error("Connection error."), {
+          cause: new CodexReloginRequired("refresh rejected"),
+        }),
+      ),
+    ).toEqual({ kind: "auth", cooldownSeconds: null });
+    expect(
+      classifyCodexCredentialFailure(
+        codexTransportError(Object.assign(new Error("header throttled"), { status: 429 }), "23"),
+      ),
+    ).toEqual({ kind: "rate_limit", cooldownSeconds: 23 });
   });
 
   test("ambiguous network, 5xx, invalid content, and partial-stream errors never rotate", () => {
@@ -72,6 +110,8 @@ describe("OPE-21 definitive credential failure classification", () => {
       Object.assign(new Error("stream terminated before response.completed"), {
         code: "partial_stream",
       }),
+      Object.assign(new Error("sandbox forbidden"), { status: 403 }),
+      Object.assign(new Error("MCP throttled"), { status: 429, code: "rate_limit_exceeded" }),
     ];
     for (const error of ambiguous) {
       expect(classifyCodexCredentialFailure(error)).toBeNull();
@@ -160,11 +200,13 @@ describe("codexUsageLimitFailurePayload", () => {
 
 describe("agentRunFailurePayload — codex usage limit", () => {
   test("classifies a 429 usage_limit_reached as the non-retryable codex cap (NOT the generic rate-limit)", () => {
-    const err = Object.assign(new Error("429 You have hit your usage limit"), {
-      status: 429,
-      type: "usage_limit_reached",
-      error: { type: "usage_limit_reached", resets_in_seconds: 7200 },
-    });
+    const err = codexTransportError(
+      Object.assign(new Error("429 You have hit your usage limit"), {
+        status: 429,
+        type: "usage_limit_reached",
+        error: { type: "usage_limit_reached", resets_in_seconds: 7200 },
+      }),
+    );
     const payload = agentRunFailurePayload(err);
     expect(payload.code).toBe("codex_usage_limit_reached");
     expect(payload.retryable).toBe(false);

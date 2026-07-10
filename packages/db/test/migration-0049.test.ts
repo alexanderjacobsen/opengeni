@@ -146,7 +146,9 @@ describe("migration 0049 (Codex credential leases)", () => {
       });
       await admin`
         update codex_rotation_settings
-        set active_credential_id = ${credentialB}, rotation_enabled = false
+        set active_credential_id = ${credentialB},
+            rotation_enabled = true,
+            lease_rotation_enabled = false
         where workspace_id = ${workspaceId}`;
       const rollbackSelection = selectCodexCredentialLeaseForTurn({
         context: {
@@ -174,7 +176,8 @@ describe("migration 0049 (Codex credential leases)", () => {
             lastSelectedAt: null,
           })),
           activeCredentialId: credentialB,
-          rotationEnabled: false,
+          rotationEnabled: true,
+          leaseRotationEnabled: false,
           rotationStrategy: "most_remaining",
           existingCredentialId: null,
         },
@@ -189,16 +192,47 @@ describe("migration 0049 (Codex credential leases)", () => {
         select count(*)::int as count from codex_credential_leases`;
       expect(inert!.count).toBe(0);
 
-      // Full cutover explicitly enables the new bit. The current worker can
-      // then create a fenced lease while the old binary's narrow read remains
-      // valid against the same additive schema.
-      await admin`
-        update codex_rotation_settings set lease_rotation_enabled = true
-        where workspace_id = ${workspaceId}`;
       const appUrl = new URL(databaseUrl);
       appUrl.username = "opengeni_app";
       appUrl.password = "apppw";
       app = createDb(appUrl.toString(), { max: 2 });
+
+      // Even when the compatible deployment flag is on, the workspace bit is
+      // the cutover fence: legacy selection may run, but no lease/cursor write
+      // is allowed until that row is explicitly enabled.
+      const beforeWorkspaceCutover = await acquireCodexCredentialLease(
+        app.db,
+        {
+          accountId,
+          workspaceId,
+          turnId,
+          holderId: "migration-0049-pre-cutover",
+          advanceActivePointer: true,
+        },
+        (context) =>
+          selectCodexCredentialLeaseForTurn({
+            context,
+            leasingEnabled: true,
+            sessionPinnedCredentialId: null,
+            sessionLastCredentialId: credentialA,
+            nearExhaustionPct: 90,
+            now: new Date(),
+          }),
+      );
+      expect(beforeWorkspaceCutover.credentialId).toBe(credentialB);
+      expect(beforeWorkspaceCutover.holderId).toBeNull();
+      expect(beforeWorkspaceCutover.generation).toBeNull();
+      const [stillInert] = await admin<{ count: number }[]>`
+        select count(*)::int as count from codex_credential_leases`;
+      expect(stillInert!.count).toBe(0);
+
+      // Full cutover synchronizes user intent and the revision-aware bit. The
+      // current worker can then create a fenced lease while an old binary's
+      // narrow read remains valid against the same additive schema.
+      await admin`
+        update codex_rotation_settings
+        set rotation_enabled = true, lease_rotation_enabled = true
+        where workspace_id = ${workspaceId}`;
       const leased = await acquireCodexCredentialLease(
         app.db,
         {
@@ -230,16 +264,22 @@ describe("migration 0049 (Codex credential leases)", () => {
       >`
         select active_credential_id, rotation_enabled, rotation_strategy
         from codex_rotation_settings where workspace_id = ${workspaceId}`;
-      expect(oldWorkerAfterCutover?.rotation_enabled).toBe(false);
+      expect(oldWorkerAfterCutover?.rotation_enabled).toBe(true);
       expect(oldWorkerAfterCutover?.rotation_strategy).toBe("most_remaining");
 
       // Immediate rollback is configuration-only: a current/old worker with
       // leasing disabled again uses the active pointer and never needs to drop
       // the additive row/table. Re-running the real migration chain is a no-op.
+      await admin`
+        update codex_rotation_settings
+        set rotation_enabled = false, lease_rotation_enabled = false
+        where workspace_id = ${workspaceId}`;
       const featureOffAgain = selectCodexCredentialLeaseForTurn({
         context: {
           ...rollbackSelectionContext(credentialA, credentialB),
           activeCredentialId: oldWorkerAfterCutover!.active_credential_id,
+          rotationEnabled: false,
+          leaseRotationEnabled: false,
         },
         leasingEnabled: false,
         sessionPinnedCredentialId: null,
@@ -256,7 +296,7 @@ describe("migration 0049 (Codex credential leases)", () => {
         from codex_rotation_settings r
         left join codex_credential_leases l on l.workspace_id = r.workspace_id
         where r.workspace_id = ${workspaceId}`;
-      expect(afterIdempotentMigrate).toEqual({ count: 1, lease_rotation_enabled: true });
+      expect(afterIdempotentMigrate).toEqual({ count: 1, lease_rotation_enabled: false });
     } finally {
       await app?.close().catch(() => undefined);
       await admin.end();
@@ -291,6 +331,7 @@ function rollbackSelectionContext(credentialA: string, credentialB: string) {
     })),
     activeCredentialId: credentialB,
     rotationEnabled: true,
+    leaseRotationEnabled: true,
     rotationStrategy: "most_remaining",
     existingCredentialId: null,
   };

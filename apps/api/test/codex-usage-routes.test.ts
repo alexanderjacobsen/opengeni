@@ -254,6 +254,7 @@ describe("PATCH /codex/settings — rotation settings", () => {
     const update = spyOn(opengeniDb, "updateCodexRotationSettings").mockResolvedValue({
       activeCredentialId: ID_A,
       rotationEnabled: true,
+      leaseRotationEnabled: true,
       rotationStrategy: "most_remaining",
     });
     restores.push(() => ensure.mockRestore());

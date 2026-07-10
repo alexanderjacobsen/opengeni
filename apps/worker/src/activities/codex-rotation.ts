@@ -559,6 +559,38 @@ export function chooseRotationActive(args: {
 }
 
 /**
+ * Exact pre-0049 selector used while the lease cutover is off.
+ *
+ * Old workers keep a healthy `most_remaining` active pointer sticky and know
+ * nothing about lease counts or fairness cursors. A compatible worker must do
+ * the same until BOTH the deployment flag and workspace cutover are enabled;
+ * otherwise a rolling fleet would run two allocators at once. When the active
+ * pointer is no longer eligible, zeroing the additive metadata delegates to the
+ * same capacity/connector ranking that the old selector used.
+ */
+export function chooseLegacyRotationActive(
+  args: Parameters<typeof chooseRotationActive>[0],
+): RotationDecision {
+  if (args.rotationStrategy === "most_remaining") {
+    const active = args.activeCredentialId
+      ? args.accounts.find((account) => account.id === args.activeCredentialId)
+      : undefined;
+    if (active && isCodexCredentialEligible(active, args.nearExhaustionPct, args.now)) {
+      return { kind: "active", credentialId: active.id, moved: false };
+    }
+  }
+  return chooseRotationActive({
+    ...args,
+    accounts: args.accounts.map((account) => ({
+      ...account,
+      activeLeaseCount: 0,
+      selectionCount: 0,
+      lastSelectedAt: null,
+    })),
+  });
+}
+
+/**
  * Full pure policy at the transaction boundary. A live same-turn lease is
  * idempotent; the rollout-off/manual path preserves pin>pointer behavior; a
  * healthy pin wins only while eligible, so quota/auth quarantine cannot trap a
@@ -572,8 +604,15 @@ export function selectCodexCredentialLeaseForTurn(args: {
   nearExhaustionPct: number;
   now: Date;
 }): CodexTurnLeaseSelection {
-  const { accounts, activeCredentialId, rotationEnabled, rotationStrategy, existingCredentialId } =
-    args.context;
+  const {
+    accounts,
+    activeCredentialId,
+    rotationEnabled,
+    leaseRotationEnabled,
+    rotationStrategy,
+    existingCredentialId,
+  } = args.context;
+  const leasingEnabled = args.leasingEnabled && leaseRotationEnabled;
   const existing = existingCredentialId
     ? accounts.find((account) => account.id === existingCredentialId)
     : undefined;
@@ -589,7 +628,7 @@ export function selectCodexCredentialLeaseForTurn(args: {
   }
 
   const connectedIds = new Set(accounts.map((account) => account.id));
-  if (!args.leasingEnabled || !rotationEnabled) {
+  if (!rotationEnabled) {
     const credentialId =
       args.sessionPinnedCredentialId && connectedIds.has(args.sessionPinnedCredentialId)
         ? args.sessionPinnedCredentialId
@@ -602,9 +641,26 @@ export function selectCodexCredentialLeaseForTurn(args: {
     };
   }
 
-  const pinned = args.sessionPinnedCredentialId
-    ? accounts.find((account) => account.id === args.sessionPinnedCredentialId)
-    : undefined;
+  // Before the workspace cutover bit is enabled (or after the deployment kill
+  // switch is turned off), preserve the exact legacy policy used by old workers:
+  // a pin stays sticky; otherwise an enabled workspace runs the pure legacy
+  // rotation ranker without touching lease/cursor state.
+  if (!leasingEnabled && args.sessionPinnedCredentialId) {
+    const credentialId = connectedIds.has(args.sessionPinnedCredentialId)
+      ? args.sessionPinnedCredentialId
+      : activeCredentialId && connectedIds.has(activeCredentialId)
+        ? activeCredentialId
+        : null;
+    return {
+      credentialId,
+      decision: credentialId ? { kind: "active", credentialId, moved: false } : { kind: "none" },
+    };
+  }
+
+  const pinned =
+    leasingEnabled && args.sessionPinnedCredentialId
+      ? accounts.find((account) => account.id === args.sessionPinnedCredentialId)
+      : undefined;
   if (pinned && isCodexCredentialEligible(pinned, args.nearExhaustionPct, args.now)) {
     return {
       credentialId: pinned.id,
@@ -613,7 +669,8 @@ export function selectCodexCredentialLeaseForTurn(args: {
   }
 
   const priorId = args.sessionLastCredentialId ?? activeCredentialId;
-  const decision = chooseRotationActive({
+  const choose = leasingEnabled ? chooseRotationActive : chooseLegacyRotationActive;
+  const decision = choose({
     rotationStrategy: rotationStrategy as CodexRotationStrategy,
     activeCredentialId,
     // Per-session continuity is the round-robin/drain cursor. Falling back to

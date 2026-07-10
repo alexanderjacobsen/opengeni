@@ -379,8 +379,9 @@ export const codexRotationSettings = pgTable(
     // only understands this column, so a schema-first rollout or binary
     // rollback must never make it enter the non-atomic rotation path.
     rotationEnabled: boolean("rotation_enabled").notNull().default(false),
-    // Revision-aware allocator default. Only migration-compatible API/worker
-    // code reads this bit; old binaries safely ignore it and remain sticky.
+    // Revision-aware allocator cutover. Only migration-compatible API/worker
+    // code reads this bit; old binaries safely ignore it and keep the legacy
+    // pin/rotation policy.
     leaseRotationEnabled: boolean("lease_rotation_enabled").notNull().default(false),
     rotationStrategy: text("rotation_strategy").notNull().default("most_remaining"), // P3, inert
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -395,8 +396,9 @@ export const codexRotationSettings = pgTable(
 // insertion happen atomically while codex_rotation_settings is locked FOR
 // UPDATE, so concurrent replicas in the SAME workspace see one another's
 // assignments before choosing. Workspaces never share or correlate lease state.
-// The turn and composite (workspace, credential) FKs are declared in migration
-// 0049 (sessionTurns is defined later in this module).
+// The composite (workspace, account), (workspace, credential), and
+// (workspace, turn) FKs are declared in migration 0049 (sessionTurns is defined
+// later in this module).
 export const codexCredentialLeases = pgTable(
   "codex_credential_leases",
   {

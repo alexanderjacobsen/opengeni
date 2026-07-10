@@ -149,3 +149,10 @@ describe("appendAndPublishEvents is best-effort on the live fan-out", () => {
     expect(appended[0]!.sequence).toBe(1);
   });
 });
+
+// NOTE: the append/publish TIMING observer wired into `appendAndPublishEvents` is
+// exercised via `observeSince` in observe-timing.test.ts, NOT here — in the full
+// suite another test file installs a process-global `mock.module("@opengeni/events")`
+// that stubs `appendAndPublishEvents` (ignoring the observer arg), so an
+// observer assertion made THROUGH `appendAndPublishEvents` is defeated. `observeSince`
+// survives that mock because the stub spreads the real module for every other export.

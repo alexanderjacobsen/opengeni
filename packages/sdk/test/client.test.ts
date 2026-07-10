@@ -235,6 +235,9 @@ describe("OpenGeniClient", () => {
     await expect(
       client.listSessionPage(WORKSPACE_ID, { cursor: "unsupported-on-legacy" }),
     ).rejects.toThrow("does not support stable session-page cursors");
+    await expect(
+      client.listSessionPage(WORKSPACE_ID, { search: "unsupported-on-legacy" }),
+    ).rejects.toThrow("does not support session search");
   });
 
   test("streamEvents consumes the SSE endpoint end to end through fetch", async () => {

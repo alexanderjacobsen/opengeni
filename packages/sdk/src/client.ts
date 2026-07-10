@@ -300,6 +300,13 @@ export class OpenGeniClient {
       if (options.cursor) {
         throw new Error("The connected OpenGeni API does not support stable session-page cursors");
       }
+      // Older APIs ignore unknown query parameters. Treating their unfiltered
+      // array as a successful search would be worse than an explicit rolling-
+      // upgrade error (and client-side filtering cannot recover matches beyond
+      // the old endpoint's bounded first page).
+      if (options.search?.trim()) {
+        throw new Error("The connected OpenGeni API does not support session search");
+      }
       return { pinned: [], sessions: response, nextCursor: null };
     }
     return response;

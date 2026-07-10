@@ -247,12 +247,15 @@ export function registerSessionRoutes(app: Hono, deps: ApiRouteDeps): void {
   // agent writes. Returns the refreshed session, mirroring GET detail.
   app.patch("/v1/workspaces/:workspaceId/sessions/:sessionId", async (c) => {
     const workspaceId = c.req.param("workspaceId");
-    await requireAccessGrant(c, deps, workspaceId, "sessions:control");
+    const grant = await requireAccessGrant(c, deps, workspaceId, "sessions:control");
     const sessionId = c.req.param("sessionId");
     await assertSessionExists(db, workspaceId, sessionId);
     const payload = UpdateSessionRequest.parse(await c.req.json());
     await updateSessionTitle({ db, bus }, workspaceId, sessionId, payload.title, "user");
-    const session = await getSession(db, workspaceId, sessionId);
+    // A session-returning member route must preserve the caller's private pin
+    // projection. Returning the generic mapSession() default here would reset a
+    // pinned React consumer to false/version 0 after a harmless rename.
+    const session = await getSessionForSubject(db, workspaceId, sessionId, grant.subjectId);
     if (!session) {
       throw new HTTPException(404, { message: "session not found" });
     }

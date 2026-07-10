@@ -263,6 +263,36 @@ describe("API component integration", () => {
       pinVersion: 2,
       updatedAt: pinnedTarget.updatedAt,
     });
+    const afterUnpinResponse = await app.request(
+      workspacePath(workspaceId, "/sessions?view=page&search=find%20pinned%20alpha"),
+    );
+    expect(afterUnpinResponse.status).toBe(200);
+    expect(await afterUnpinResponse.json()).toMatchObject({
+      pinned: [],
+      sessions: [{ id: pinnedTarget.id, pinned: false, pinnedAt: null, pinVersion: 2 }],
+    });
+
+    const renamed = await app.request(workspacePath(workspaceId, `/sessions/${pinnedTarget.id}`), {
+      method: "PATCH",
+      body: JSON.stringify({ title: "Renamed before re-pin" }),
+      headers: { "content-type": "application/json" },
+    });
+    expect(renamed.status).toBe(200);
+    expect(await renamed.json()).toMatchObject({
+      id: pinnedTarget.id,
+      title: "Renamed before re-pin",
+      pinned: false,
+      pinVersion: 2,
+    });
+
+    const repinned = await setPin({ pinned: true, expectedVersion: 2 });
+    expect(repinned.status).toBe(200);
+    expect(await repinned.json()).toMatchObject({ pinned: true, pinVersion: 3 });
+    const staleAfterRepin = await setPin({ pinned: false, expectedVersion: 0 });
+    expect(staleAfterRepin.status).toBe(409);
+    expect(await staleAfterRepin.json()).toMatchObject({
+      current: { pinned: true, pinVersion: 3 },
+    });
   });
 
   test("create-with-instructions persists and reads back the field without leaking a timeline event", async () => {

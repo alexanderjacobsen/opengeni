@@ -3,11 +3,11 @@
 -- independently organize the same durable session rows. Deleting a session or
 -- workspace cleans pins through FKs; no session activity/history field changes.
 
--- Composite identity for the pin's workspace/session FK. The session id is
--- globally unique already; including workspace_id makes tenant integrity
--- independently enforceable for malformed internal/maintenance writes.
-CREATE UNIQUE INDEX IF NOT EXISTS "sessions_workspace_id_idx"
-  ON "sessions" ("workspace_id", "id");
+-- The large parent index is already built online by the preceding transactionless
+-- migration. Bound the remaining brief catalog/table locks so production migration
+-- contention fails closed and retries rather than blocking API writes indefinitely.
+SET lock_timeout = '5s';
+SET statement_timeout = '10min';
 
 CREATE TABLE IF NOT EXISTS "session_pins" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
@@ -79,3 +79,6 @@ BEGIN
     );
   END IF;
 END $$;
+
+RESET statement_timeout;
+RESET lock_timeout;

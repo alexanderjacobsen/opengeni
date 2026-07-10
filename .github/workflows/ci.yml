@@ -40,6 +40,10 @@ jobs:
         run: bun run format:check
 
       - name: Test
+        env:
+          # OPE-26's per-subject FORCE-RLS/OCC suite is a required security gate.
+          # Never turn a missing Docker/PostgreSQL runner into green skipped tests.
+          OPENGENI_REQUIRE_REAL_DB: "1"
         run: bun test
 
       # OPE-22 production regressions cross the activity/DB/event boundary and

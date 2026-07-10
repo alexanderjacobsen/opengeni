@@ -914,7 +914,11 @@ export async function removeWorkspaceMember(
   workspaceId: string,
   subjectId: string,
 ): Promise<boolean> {
-  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+  // A removed principal must not regain stale organization preferences if the
+  // same stable subject is invited again later. Set the target subject GUC so
+  // FORCE RLS permits deleting only that member's personal pin rows, and make
+  // the preference cleanup + membership removal one transaction.
+  return await withWorkspaceSubjectRls(db, workspaceId, subjectId, async (scopedDb) => {
     const rows = await scopedDb
       .delete(schema.workspaceMemberships)
       .where(
@@ -924,7 +928,18 @@ export async function removeWorkspaceMember(
         ),
       )
       .returning({ id: schema.workspaceMemberships.id });
-    return rows.length > 0;
+    if (rows.length === 0) {
+      return false;
+    }
+    await scopedDb
+      .delete(schema.sessionPins)
+      .where(
+        and(
+          eq(schema.sessionPins.workspaceId, workspaceId),
+          eq(schema.sessionPins.subjectId, subjectId),
+        ),
+      );
+    return true;
   });
 }
 
@@ -10527,7 +10542,14 @@ function sessionFilters(
   }
   const search = options.search?.trim();
   if (search) {
-    const pattern = `%${search.replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
+    // PostgreSQL LIKE uses backslash as its default escape. Escape it first so
+    // a literal trailing slash cannot consume our surrounding wildcard; then
+    // escape the two wildcard metacharacters. The resulting search is literal,
+    // case-insensitive substring matching rather than user-authored SQL globbing.
+    const pattern = `%${search
+      .replaceAll("\\", "\\\\")
+      .replaceAll("%", "\\%")
+      .replaceAll("_", "\\_")}%`;
     filters.push(
       or(ilike(schema.sessions.title, pattern), ilike(schema.sessions.initialMessage, pattern))!,
     );

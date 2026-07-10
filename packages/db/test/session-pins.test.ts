@@ -6,7 +6,9 @@ import {
   createSession,
   decodeSessionListCursor,
   getSessionForSubject,
+  grantWorkspaceAccess,
   listSessionsForSubject,
+  removeWorkspaceMember,
   SessionPinVersionConflictError,
   setSessionPin,
   withWorkspaceRls,
@@ -294,6 +296,56 @@ describe("session pins (real PostgreSQL + FORCE RLS)", () => {
         await scoped.execute(sql`select id from session_pins where subject_id = 'user:one'`),
     );
     expect(sameWorkspaceOtherSubject).toEqual([]);
+  }, 60_000);
+
+  test("treats percent, underscore, and backslash as literal search text", async () => {
+    if (!available) return;
+    const workspace = await freshWorkspace();
+    const percent = await session({ ...workspace, message: "literal 100% complete" });
+    const underscore = await session({ ...workspace, message: "literal under_score" });
+    const backslash = await session({ ...workspace, message: String.raw`literal back\slash` });
+
+    const matchingIds = async (search: string) =>
+      (
+        await listSessionsForSubject(db, workspace.workspaceId, {
+          subjectId: "user:literals",
+          search,
+        })
+      ).sessions.map((row) => row.id);
+    expect(await matchingIds("100%"), "percent must not become a wildcard").toEqual([percent.id]);
+    expect(await matchingIds("under_score"), "underscore must not become a wildcard").toEqual([
+      underscore.id,
+    ]);
+    expect(await matchingIds(String.raw`back\slash`), "backslash must remain literal").toEqual([
+      backslash.id,
+    ]);
+  }, 60_000);
+
+  test("removing a workspace member atomically cleans that subject's pins", async () => {
+    if (!available) return;
+    const workspace = await freshWorkspace();
+    const subjectId = "user:removed-member";
+    await grantWorkspaceAccess(db, {
+      ...workspace,
+      subjectId,
+      permissions: ["sessions:read"],
+    });
+    const target = await session({ ...workspace, message: "removed member pin" });
+    await setSessionPin(db, {
+      workspaceId: workspace.workspaceId,
+      subjectId,
+      sessionId: target.id,
+      pinned: true,
+    });
+
+    expect(await removeWorkspaceMember(db, workspace.workspaceId, subjectId)).toBe(true);
+    const [counts] = await admin<{ memberships: number; pins: number }[]>`
+      select
+        (select count(*)::int from workspace_memberships
+          where workspace_id = ${workspace.workspaceId} and subject_id = ${subjectId}) as memberships,
+        (select count(*)::int from session_pins
+          where workspace_id = ${workspace.workspaceId} and subject_id = ${subjectId}) as pins`;
+    expect(counts).toEqual({ memberships: 0, pins: 0 });
   }, 60_000);
 
   test("returns no cross-workspace target and cascades a deleted session's pins", async () => {

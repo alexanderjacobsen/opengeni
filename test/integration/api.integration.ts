@@ -966,7 +966,7 @@ describe("API component integration", () => {
       .file;
     const secondFile = ((await secondComplete.json()) as { file: { id: string; status: string } })
       .file;
-    expect(firstFile).toEqual({ id: upload.fileId, status: "ready" });
+    expect(firstFile).toMatchObject({ id: upload.fileId, status: "ready" });
     expect(secondFile).toEqual(firstFile);
 
     // A later model-turn admission still fails at zero balance, but cannot

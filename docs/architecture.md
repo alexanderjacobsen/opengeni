@@ -333,7 +333,7 @@ A Cargo workspace building the box-side binary for the `selfhosted` backend. `ag
 
 ### 6.5 Docs, scripts, test
 
-`docs/` (this map + topic docs, §14), `scripts/` (dev-stack, release mechanics, static guards, deployment CLIs, §11), `test/` (integration/e2e/live tiers + `source-hygiene.test.ts`).
+`docs/` (this map + topic docs, §14), `scripts/` (dev-stack, release mechanics, static guards, deployment CLIs, plus control-plane-only operator helpers under `scripts/operator/`, §11), `test/` (integration/e2e/live tiers + `source-hygiene.test.ts`).
 
 ### 6.6 The relay edge (BYO-compute data plane)
 
@@ -542,6 +542,7 @@ A typed `DeploymentContract` (`@opengeni/deployment`) turns an abstract profile 
 | The Rust agent / wire proto | `agent/proto/opengeni_agent.proto`, `agent/scripts/codegen.sh` | `agent/README.md` |
 | Deployment (Helm/Terraform/profiles) | `packages/deployment/src/index.ts`, `deploy/helm/opengeni/` | [`deployment.md`](deployment.md) |
 | Build / test / release tooling | `package.json`, `.changeset/config.json`, `.github/workflows/` | [`../AGENTS.md`](../AGENTS.md) Verification |
+| Operator revival of an existing failed/idle session | `scripts/operator/revive-session.ts`, `packages/core/src/domain/sessions.ts` (`acceptSessionUserMessage`) | [`operator-session-revival.md`](operator-session-revival.md) |
 | The web console | `apps/web/src/App.tsx`, `apps/web/src/context.tsx` | [`command-palette.md`](command-palette.md) |
 
 ---
@@ -566,6 +567,7 @@ A typed `DeploymentContract` (`@opengeni/deployment`) turns an abstract profile 
 | [`manager-session-robustness.md`](manager-session-robustness.md) | Manager-session failure modes and fixes (point-in-time; verification timestamps are historical). |
 | [`reliability-fixes.md`](reliability-fixes.md) | Reliability bugs/fixes (bounded Temporal history, orphan repair, scheduled-task/billing idempotency). |
 | [`deployment.md`](deployment.md) | Operator guide: profiles, preflight/stack plans, Helm/Terraform; the disposable-fixtures rule. |
+| [`operator-session-revival.md`](operator-session-revival.md) | Control-plane-only dry-run/apply procedure for reviving one exact session through shared message admission, including audit and no-delete rollback semantics. |
 | [`embedding.md`](embedding.md) | Host-app embedding guide: router mounting, direct core calls, ports/bindings, schema/RLS, worker, and EventBus. |
 | [`connected-machines.md`](connected-machines.md) | Integrator guide for targeting, swapping, enrolling, and operating Connected Machines. |
 | [`design/lazy-provisioning.md`](design/lazy-provisioning.md) | Point-in-time lazy sandbox provisioning design: first-op provisioner, synthetic manifest invariant, and failure contract. |

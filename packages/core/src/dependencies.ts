@@ -103,3 +103,18 @@ export type ApiRouteDeps = AppDependencies & {
   // resumeBoxById (it throws SandboxResumeError when sandboxBackend=none).
   resumeBoxById: (input: ResumeBoxByIdInput) => Promise<ResumedSandboxSession>;
 };
+
+/**
+ * The exact dependency slice used by `acceptSessionUserMessage`.
+ *
+ * Keeping this narrower than `ApiRouteDeps` lets control-plane callers reuse
+ * the canonical admission path without constructing unrelated HTTP, document,
+ * or sandbox services. The public API still passes its `ApiRouteDeps` superset.
+ */
+export type AcceptSessionUserMessageDependencies = Pick<
+  AppDependencies,
+  "settings" | "db" | "bus"
+> & {
+  workflowClient: Pick<SessionWorkflowClient, "wakeSessionWorkflow">;
+  objectStorage: ObjectStorageDependency;
+};

@@ -8329,6 +8329,33 @@ export async function getSessionEvent(
   });
 }
 
+/**
+ * Resolve a client-idempotent event inside one exact workspace/session scope.
+ * The three predicates are deliberate: a client event id is unique only within
+ * a session, while the workspace predicate remains the tenancy boundary.
+ */
+export async function getSessionEventByClientEventId(
+  db: Database,
+  workspaceId: string,
+  sessionId: string,
+  clientEventId: string,
+): Promise<SessionEvent | null> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const [row] = await scopedDb
+      .select()
+      .from(schema.sessionEvents)
+      .where(
+        and(
+          eq(schema.sessionEvents.workspaceId, workspaceId),
+          eq(schema.sessionEvents.sessionId, sessionId),
+          eq(schema.sessionEvents.clientEventId, clientEventId),
+        ),
+      )
+      .limit(1);
+    return row ? mapEvent(row) : null;
+  });
+}
+
 export async function getLatestRunState(
   db: Database,
   workspaceId: string,
@@ -14300,6 +14327,27 @@ export async function listSessionTurns(
   });
 }
 
+export async function listPendingSessionTurns(
+  db: Database,
+  workspaceId: string,
+  sessionId: string,
+): Promise<SessionTurn[]> {
+  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+    const rows = await scopedDb
+      .select()
+      .from(schema.sessionTurns)
+      .where(
+        and(
+          eq(schema.sessionTurns.workspaceId, workspaceId),
+          eq(schema.sessionTurns.sessionId, sessionId),
+          inArray(schema.sessionTurns.status, ["queued", "running", "requires_action"]),
+        ),
+      )
+      .orderBy(asc(schema.sessionTurns.position), asc(schema.sessionTurns.createdAt));
+    return rows.map(mapSessionTurn);
+  });
+}
+
 export async function updateQueuedSessionTurn(
   db: Database,
   workspaceId: string,
@@ -14600,6 +14648,7 @@ type LockedSessionUpdateContext = {
   updateSessionMcpServerCredentials: (
     updates: UpdateSessionMcpServerCredentialsInput[],
   ) => Promise<UpdateSessionMcpServerCredentialsResult>;
+  listPendingSessionTurns: () => Promise<SessionTurn[]>;
 };
 
 type LockedSessionUpdateResult = {
@@ -14646,6 +14695,20 @@ export async function appendSessionEventsWithLockedSessionUpdate(
               sessionId,
               updates,
             }),
+          listPendingSessionTurns: async () => {
+            const rows = await tx
+              .select()
+              .from(schema.sessionTurns)
+              .where(
+                and(
+                  eq(schema.sessionTurns.workspaceId, workspaceId),
+                  eq(schema.sessionTurns.sessionId, sessionId),
+                  inArray(schema.sessionTurns.status, ["queued", "running", "requires_action"]),
+                ),
+              )
+              .orderBy(asc(schema.sessionTurns.position), asc(schema.sessionTurns.createdAt));
+            return rows.map(mapSessionTurn);
+          },
         });
         if (built.events.length === 0) {
           return [];

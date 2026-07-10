@@ -45,7 +45,11 @@ import { appendAndPublishEvents, type EventBus } from "@opengeni/events";
 import { HTTPException } from "hono/http-exception";
 import { hasPermission, requirePermission } from "../access";
 import { recordWorkspaceUsage, requireLimit } from "../billing/limits";
-import type { ApiRouteDeps, SessionWorkflowClient } from "../dependencies";
+import type {
+  AcceptSessionUserMessageDependencies,
+  ApiRouteDeps,
+  SessionWorkflowClient,
+} from "../dependencies";
 import { swapActiveSandbox, type FleetContext } from "../sandbox/fleet";
 import { settingsWithEnabledCapabilityMcpServers } from "./capabilities";
 import { requireVariableSetEncryption, validateVariableSetAttachment } from "./environments";
@@ -603,7 +607,7 @@ export function reasoningEffortForSession(
 export async function postUserMessageTurn(input: {
   db: Database;
   bus: EventBus;
-  workflowClient: SessionWorkflowClient;
+  workflowClient: Pick<SessionWorkflowClient, "wakeSessionWorkflow">;
   settings: Settings;
   accountId: string;
   workspaceId: string;
@@ -615,6 +619,10 @@ export async function postUserMessageTurn(input: {
   reasoningEffort?: Settings["openaiReasoningEffort"] | null;
   clientEventId?: string;
   mcpCredentialUpdates?: UpdateSessionMcpServerCredentialsInput[];
+  // Default append preserves the public API/MCP queue semantics. The operator
+  // recovery helper opts into the locked reject policy so a preflight race
+  // cannot silently append behind newly-active work.
+  queuePolicy?: "append" | "reject_conflicts";
 }): Promise<{ accepted: SessionEvent; turn: SessionTurn }> {
   const { db, bus, workflowClient, settings, accountId, workspaceId, sessionId } = input;
   const requestedModel = input.model ?? null;
@@ -638,6 +646,19 @@ export async function postUserMessageTurn(input: {
         throw new HTTPException(409, {
           message: `session is ${lockedSession.status}; cannot accept a new user message`,
         });
+      }
+      if (input.queuePolicy === "reject_conflicts") {
+        const pendingTurns = await lockedUpdate.listPendingSessionTurns();
+        if (
+          pendingTurns.length > 0 ||
+          lockedSession.status === "queued" ||
+          lockedSession.status === "running" ||
+          lockedSession.status === "requires_action"
+        ) {
+          throw new HTTPException(409, {
+            message: "session has active or queued work; explicit append policy required",
+          });
+        }
       }
       const mcpCredentialUpdates = input.mcpCredentialUpdates?.length
         ? await lockedUpdate.updateSessionMcpServerCredentials(input.mcpCredentialUpdates)
@@ -1135,7 +1156,7 @@ export async function createSessionForRequest(
  * workspace's default capability MCP tools, matching an absent `tools` key.
  */
 export async function acceptSessionUserMessage(
-  deps: ApiRouteDeps,
+  deps: AcceptSessionUserMessageDependencies,
   grant: AccessGrant,
   workspaceId: string,
   sessionId: string,
@@ -1148,6 +1169,7 @@ export async function acceptSessionUserMessage(
     reasoningEffort?: ReasoningEffort | null;
     clientEventId?: string;
     mcpCredentialUpdates?: SessionMcpCredentialUpdateInput[];
+    queuePolicy?: "append" | "reject_conflicts";
   },
 ): Promise<{ accepted: SessionEvent; turn: SessionTurn }> {
   const { settings, db, bus, workflowClient, objectStorage } = deps;
@@ -1204,6 +1226,7 @@ export async function acceptSessionUserMessage(
     model: input.model ?? null,
     reasoningEffort: input.reasoningEffort ?? null,
     mcpCredentialUpdates,
+    queuePolicy: input.queuePolicy ?? "append",
     ...(input.clientEventId ? { clientEventId: input.clientEventId } : {}),
   });
   await recordWorkspaceUsage(deps, {

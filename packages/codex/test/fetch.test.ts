@@ -109,6 +109,94 @@ describe("codexSubscriptionFetch", () => {
     expect(res.status).toBe(200);
   });
 
+  test("a second 401 is returned after exactly one refresh and two requests", async () => {
+    const { base, captures } = baseRecorder([401, 401, 200]);
+    let refreshed = 0;
+    const response = await codexRequestStorage.run(
+      ctx({
+        refresh: async () => {
+          refreshed += 1;
+          return { accessToken: "AC2", chatgptAccountId: "acct_1", isFedramp: false };
+        },
+      }),
+      () =>
+        codexSubscriptionFetch(base)("https://chatgpt.com/backend-api/responses", {
+          method: "POST",
+          body: "{}",
+        }),
+    );
+    expect(response.status).toBe(401);
+    expect(refreshed).toBe(1);
+    expect(captures).toHaveLength(2);
+  });
+
+  test("403 is definitive and never spends the refresh retry", async () => {
+    const { base, captures } = baseRecorder([403, 200]);
+    let refreshed = 0;
+    const response = await codexRequestStorage.run(
+      ctx({
+        refresh: async () => {
+          refreshed += 1;
+          return { accessToken: "AC2", chatgptAccountId: "acct_1", isFedramp: false };
+        },
+      }),
+      () =>
+        codexSubscriptionFetch(base)("https://chatgpt.com/backend-api/responses", {
+          method: "POST",
+          body: "{}",
+        }),
+    );
+    expect(response.status).toBe(403);
+    expect(refreshed).toBe(0);
+    expect(captures).toHaveLength(1);
+  });
+
+  test("malformed non-streaming SSE is not replayed against another request", async () => {
+    let calls = 0;
+    const response = await codexRequestStorage.run(ctx(), () =>
+      codexSubscriptionFetch(async () => {
+        calls += 1;
+        return new Response("data: not-json\n\n", { status: 200 });
+      })("https://chatgpt.com/backend-api/responses", {
+        method: "POST",
+        body: JSON.stringify({ stream: false }),
+      }),
+    );
+    expect(await response.json()).toEqual({});
+    expect(calls).toBe(1);
+  });
+
+  test("partial streaming body failure is surfaced without a transport replay", async () => {
+    let calls = 0;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          new TextEncoder().encode(
+            'data: {"type":"response.output_item.done","item":{"type":"message"}}\n\n',
+          ),
+        );
+        controller.error(new Error("injected partial stream failure"));
+      },
+    });
+    const response = await codexRequestStorage.run(ctx(), () =>
+      codexSubscriptionFetch(async () => {
+        calls += 1;
+        return new Response(body, { status: 200 });
+      })("https://chatgpt.com/backend-api/responses", {
+        method: "POST",
+        body: JSON.stringify({ stream: true }),
+      }),
+    );
+    let observed: unknown;
+    try {
+      await response.text();
+    } catch (error) {
+      observed = error;
+    }
+    expect(String(observed)).toContain("injected partial stream failure");
+    expect(calls).toBe(1);
+  });
+
   // A realistic codex stream: the terminal response.completed leaves output EMPTY,
   // and the assistant message arrives via output_item.done (the quirk we repair).
   const CODEX_SSE = [

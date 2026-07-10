@@ -53,6 +53,10 @@ function deps(overrides: Partial<CodexAuthDeps> = {}): { deps: CodexAuthDeps; co
     },
     encrypt: () => "v1:enc",
     keyBytes: () => new Uint8Array(32),
+    // Unit seam: production supplies the Postgres advisory lock. These tests
+    // exercise resolver behavior without a database and run the callback
+    // directly; the dedicated DB concurrency suite proves cross-process locking.
+    withRefreshLock: async (lockedDb, _workspaceId, _credentialId, fn) => await fn(lockedDb),
     ...overrides,
   };
   return { deps: base, counts };
@@ -181,7 +185,9 @@ describe("buildCodexTokenResolver", () => {
     const { deps: d, counts } = deps({
       loadCredential: async () => {
         load += 1;
-        return load === 1
+        // Resolve + post-lock re-read both observe the old row; the CAS miss
+        // then reloads and sees that disconnect removed it.
+        return load <= 2
           ? makeCred({ id: "cred_old", version: 3, expiresAt: new Date(Date.now() - 1000) })
           : null; // disconnected; nothing to fall back to
       },

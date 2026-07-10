@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { CodexAccountStatus } from "@opengeni/db";
+import type { CodexAccountStatus, CodexLeaseAccountStatus } from "@opengeni/db";
 import {
   availableAt,
   chooseRotationActive,
@@ -15,6 +15,7 @@ import {
   REACTIVE_ROTATION_MARGIN,
   shardCredentialForSession,
   type CodexRotationStrategy,
+  selectCodexCredentialLeaseForTurn,
 } from "../src/activities/codex-rotation";
 
 // Multi-account P3 — the PURE rotation ranker. All rotation correctness (most_remaining
@@ -48,6 +49,19 @@ function acct(id: string, over: Partial<CodexAccountStatus> = {}): CodexAccountS
   };
 }
 
+function leasedAcct(
+  id: string,
+  over: Partial<CodexLeaseAccountStatus> = {},
+): CodexLeaseAccountStatus {
+  return {
+    ...acct(id),
+    activeLeaseCount: 0,
+    selectionCount: 0,
+    lastSelectedAt: null,
+    ...over,
+  };
+}
+
 const base = {
   rotationStrategy: "most_remaining" as const,
   priorCredentialId: null,
@@ -62,12 +76,12 @@ describe("chooseRotationActive — most_remaining", () => {
     });
   });
 
-  test("healthy active account → no rotation, no move (minimal churn)", () => {
+  test("healthy active pointer is not sticky; higher capacity wins", () => {
     const accounts = [acct("a", { primaryUsedPercent: 10 }), acct("b", { primaryUsedPercent: 5 })];
     expect(chooseRotationActive({ ...base, activeCredentialId: "a", accounts })).toEqual({
       kind: "active",
-      credentialId: "a",
-      moved: false,
+      credentialId: "b",
+      moved: true,
     });
   });
 
@@ -212,19 +226,13 @@ describe("P3 all-capped idle — POSITIVE bounded delay, never 0 (invariant 4: N
     }
   });
 
-  test("(b) all-capped with an ELAPSED resetAt → future earliestReset → positive bounded delay, never 0", () => {
+  test("(b) elapsed provider windows clear stale capped cache immediately", () => {
     const accounts = [
       acct("a", { primaryUsedPercent: 99, primaryResetAt: new Date(NOW.getTime() - HOUR) }), // 5h reset already passed
       acct("b", { secondaryUsedPercent: 99, secondaryResetAt: new Date(NOW.getTime() - 5 * HOUR) }), // weekly reset already passed
     ];
     const decision = chooseRotationActive({ ...base, activeCredentialId: "a", accounts });
-    expect(decision.kind).toBe("allCapped");
-    if (decision.kind === "allCapped") {
-      expect(decision.earliestResetAt.getTime()).toBeGreaterThan(NOW.getTime());
-      const delay = computeIdleDelayMs(decision.earliestResetAt, NOW, MAX_RESUME_MS);
-      expect(delay).toBeGreaterThanOrEqual(MIN_IDLE_MS);
-      expect(delay).toBeGreaterThan(0);
-    }
+    expect(decision.kind).toBe("active");
   });
 
   test("computeIdleDelayMs clamps into [MIN_IDLE_MS, max]: a past instant floors to MIN_IDLE_MS, never 0 or negative", () => {
@@ -476,13 +484,13 @@ describe("chooseRotationActive — connector-aware (P4, most_remaining)", () => 
     ).toEqual({ kind: "active", credentialId: "b", moved: true, droppedConnectors: ["github"] });
   });
 
-  test("healthy-active fast path is UNCHANGED by coverage (no switch for connectors)", () => {
+  test("connector coverage never restores active-pointer stickiness", () => {
     const accounts = [
       acct("a", { primaryUsedPercent: 10, connectorNamespaces: [] }), // active, healthy, lacks github
       acct("b", { primaryUsedPercent: 5, connectorNamespaces: ["github"] }), // covers github, more remaining
     ];
-    // Even though b covers github and a does not, the still-eligible active account
-    // never switches for coverage — no-thrash. No move, no dropped note.
+    // The pointer is a cursor, not a reservation; the covering, higher-capacity
+    // account wins even while the prior pointer remains healthy.
     expect(
       chooseRotationActive({
         ...base,
@@ -490,7 +498,7 @@ describe("chooseRotationActive — connector-aware (P4, most_remaining)", () => 
         accounts,
         usedConnectors: ["github"],
       }),
-    ).toEqual({ kind: "active", credentialId: "a", moved: false });
+    ).toEqual({ kind: "active", credentialId: "b", moved: true });
   });
 
   test("a covering target that is a strict SUPERSET covers (multi-connector session)", () => {
@@ -820,6 +828,79 @@ describe("chooseShardedHome — proactive home decision (AM-4/AM-7)", () => {
     expect(decision.kind).toBe("home");
     if (decision.kind === "home") {
       expect(decision.rewritePin).toBe(true);
+describe("OPE-21 deterministic fairness properties", () => {
+  test("concurrent reservation simulation chooses every idle identity before reusing one", () => {
+    const accounts = [leasedAcct("a"), leasedAcct("b"), leasedAcct("c"), leasedAcct("d")];
+    const selected: string[] = [];
+    for (let i = 0; i < accounts.length; i += 1) {
+      const decision = chooseRotationActive({
+        ...base,
+        activeCredentialId: selected.at(-1) ?? null,
+        accounts,
+      });
+      expect(decision.kind).toBe("active");
+      if (decision.kind !== "active") continue;
+      selected.push(decision.credentialId);
+      const row = accounts.find((account) => account.id === decision.credentialId)!;
+      row.activeLeaseCount += 1;
+    }
+    expect(new Set(selected).size).toBe(4);
+  });
+
+  test("1,003 sequential equal-capacity selections differ by at most one", () => {
+    const accounts = [leasedAcct("a"), leasedAcct("b"), leasedAcct("c"), leasedAcct("d")];
+    for (let i = 0; i < 1_003; i += 1) {
+      const decision = chooseRotationActive({
+        ...base,
+        activeCredentialId: null,
+        accounts,
+        now: new Date(NOW.getTime() + i),
+      });
+      expect(decision.kind).toBe("active");
+      if (decision.kind !== "active") continue;
+      const row = accounts.find((account) => account.id === decision.credentialId)!;
+      row.selectionCount += 1;
+      row.lastSelectedAt = new Date(NOW.getTime() + i);
+    }
+    const counts = accounts.map((account) => account.selectionCount);
+    expect(Math.max(...counts) - Math.min(...counts)).toBeLessThanOrEqual(1);
+  });
+
+  test("fixed-seed randomized candidates always honor lease, capacity, count, recency ordering", () => {
+    let seed = 0x5eed1234;
+    const random = () => {
+      seed = (Math.imul(seed, 1_664_525) + 1_013_904_223) >>> 0;
+      return seed / 0x1_0000_0000;
+    };
+    for (let sample = 0; sample < 500; sample += 1) {
+      const accounts = Array.from({ length: 2 + Math.floor(random() * 7) }, (_, index) =>
+        leasedAcct(`c-${sample}-${index}`, {
+          activeLeaseCount: Math.floor(random() * 5),
+          primaryUsedPercent: Math.floor(random() * 80),
+          secondaryUsedPercent: Math.floor(random() * 80),
+          selectionCount: Math.floor(random() * 30),
+          lastSelectedAt: new Date(NOW.getTime() + Math.floor(random() * 10_000)),
+          connectorNamespaces: [],
+        }),
+      );
+      const expected = [...accounts].sort((a, b) => {
+        if (a.activeLeaseCount !== b.activeLeaseCount)
+          return a.activeLeaseCount - b.activeLeaseCount;
+        const remainingA = Math.min(
+          100 - (a.primaryUsedPercent ?? 0),
+          100 - (a.secondaryUsedPercent ?? 0),
+        );
+        const remainingB = Math.min(
+          100 - (b.primaryUsedPercent ?? 0),
+          100 - (b.secondaryUsedPercent ?? 0),
+        );
+        if (remainingA !== remainingB) return remainingB - remainingA;
+        if (a.selectionCount !== b.selectionCount) return a.selectionCount - b.selectionCount;
+        return a.lastSelectedAt!.getTime() - b.lastSelectedAt!.getTime();
+      })[0]!;
+      const decision = chooseRotationActive({ ...base, activeCredentialId: null, accounts });
+      expect(decision.kind).toBe("active");
+      if (decision.kind === "active") expect(decision.credentialId).toBe(expected.id);
     }
   });
 });
@@ -934,5 +1015,92 @@ describe("classifyCodexPin — pin lifecycle (manual sacrosanct, policy meaningf
         rotationEnabled: false,
       }),
     ).toBe("unpinned");
+describe("OPE-21 pin and rollout policy", () => {
+  const context = (
+    accounts: CodexLeaseAccountStatus[],
+    existingCredentialId: string | null = null,
+  ) => ({
+    accounts,
+    activeCredentialId: "a",
+    rotationEnabled: true,
+    rotationStrategy: "most_remaining",
+    existingCredentialId,
+  });
+
+  test("a healthy explicit pin wins", () => {
+    const selected = selectCodexCredentialLeaseForTurn({
+      context: context([leasedAcct("a", { primaryUsedPercent: 60 }), leasedAcct("b")]),
+      leasingEnabled: true,
+      sessionPinnedCredentialId: "a",
+      sessionLastCredentialId: null,
+      nearExhaustionPct: 90,
+      now: NOW,
+    });
+    expect(selected.credentialId).toBe("a");
+  });
+
+  test("a capped pinned credential fails over to a healthy subscription", () => {
+    const selected = selectCodexCredentialLeaseForTurn({
+      context: context([
+        leasedAcct("a", {
+          primaryUsedPercent: 100,
+          primaryResetAt: new Date(NOW.getTime() + HOUR),
+        }),
+        leasedAcct("b"),
+      ]),
+      leasingEnabled: true,
+      sessionPinnedCredentialId: "a",
+      sessionLastCredentialId: "a",
+      nearExhaustionPct: 90,
+      now: NOW,
+    });
+    expect(selected.credentialId).toBe("b");
+  });
+
+  test("a still-live same-turn lease is reused idempotently", () => {
+    const selected = selectCodexCredentialLeaseForTurn({
+      context: context([leasedAcct("a"), leasedAcct("b")], "b"),
+      leasingEnabled: true,
+      sessionPinnedCredentialId: null,
+      sessionLastCredentialId: null,
+      nearExhaustionPct: 90,
+      now: NOW,
+    });
+    expect(selected.credentialId).toBe("b");
+  });
+
+  test("cutover flag off preserves legacy pin then active-pointer behavior", () => {
+    const selected = selectCodexCredentialLeaseForTurn({
+      context: context([leasedAcct("a"), leasedAcct("b")]),
+      leasingEnabled: false,
+      sessionPinnedCredentialId: null,
+      sessionLastCredentialId: "b",
+      nearExhaustionPct: 90,
+      now: NOW,
+    });
+    expect(selected.credentialId).toBe("a");
+  });
+
+  test("round_robin advances from session-last when it differs from workspace active", () => {
+    const decision = selectCodexCredentialLeaseForTurn({
+      context: {
+        accounts: [acct("a"), acct("b"), acct("c")].map((candidate) => ({
+          ...candidate,
+          activeLeaseCount: 0,
+          selectionCount: 0,
+          lastSelectedAt: null,
+        })),
+        activeCredentialId: "a",
+        rotationEnabled: true,
+        rotationStrategy: "round_robin",
+        existingCredentialId: null,
+      },
+      leasingEnabled: true,
+      sessionPinnedCredentialId: null,
+      sessionLastCredentialId: "b",
+      nearExhaustionPct: 90,
+      now: NOW,
+    });
+    expect(decision.credentialId).toBe("c");
   });
 });

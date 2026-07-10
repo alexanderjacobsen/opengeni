@@ -511,6 +511,8 @@ export const SESSION_EVENT_TYPES = [
   "session.title_set",
   // Multi-account Codex (P1): the session's inference account changed.
   "codex.account.switched",
+  // OPE-21 metadata-only per-turn credential selection audit.
+  "codex.credential.selected",
   // Sandbox durability observability (mirror of contracts SessionEventType):
   // box lifecycle + manifest-env drift, attributable from the DB alone.
   "sandbox.box.created",

@@ -7,6 +7,13 @@
 // decision pure makes the whole rotation correctness story unit-testable in
 // isolation (see codex-rotation.test.ts).
 import type { CodexAccountStatus, CodexPinSource } from "@opengeni/db";
+import type {
+  CodexAccountStatus,
+  CodexCredentialLeaseSelectionContext,
+  CodexLeaseAccountStatus,
+} from "@opengeni/db";
+
+export type CodexRotationAccount = CodexAccountStatus | CodexLeaseAccountStatus;
 
 export type CodexRotationStrategy =
   | "most_remaining"
@@ -73,6 +80,11 @@ export type RotationDecision =
   // No connected accounts at all (preserves today's relogin-fail path).
   | { kind: "none" };
 
+export type CodexTurnLeaseSelection = {
+  credentialId: string | null;
+  decision: RotationDecision;
+};
+
 // Invariant 4 (NO THRASH / BOUNDED) safety floors. An all-capped idle MUST be a
 // positive, bounded wait — a null / elapsed / unknown reset can NEVER collapse it
 // into a 0 or a past instant (which the caller would turn into a 0 continueDelayMs
@@ -88,9 +100,20 @@ export const MIN_IDLE_MS = 60_000; // 60s
  */
 export const DEFAULT_RESET_COOLDOWN_MS = 60_000; // 60s
 
-/** The worse-window used percent: weekly binds as hard as 5h, so take the max. null ⇒ 0. */
-function bindingUsedPct(acct: CodexAccountStatus): number {
-  return Math.max(acct.primaryUsedPercent ?? 0, acct.secondaryUsedPercent ?? 0);
+function effectiveWindowUsed(usedPercent: number | null, resetAt: Date | null, now: Date): number {
+  // A completed provider window is eligible immediately even if its last cache
+  // sample still says 100%. This is the five-hour reset boundary—not a TTL
+  // heuristic—and avoids stranding a reset subscription while another remains
+  // healthy. A future/unknown reset keeps the cached percentage authoritative.
+  return resetAt && resetAt.getTime() <= now.getTime() ? 0 : (usedPercent ?? 0);
+}
+
+/** The worse live window: weekly binds as hard as 5h. */
+function bindingUsedPct(acct: CodexRotationAccount, now: Date): number {
+  return Math.max(
+    effectiveWindowUsed(acct.primaryUsedPercent, acct.primaryResetAt, now),
+    effectiveWindowUsed(acct.secondaryUsedPercent, acct.secondaryResetAt, now),
+  );
 }
 
 /**
@@ -98,13 +121,15 @@ function bindingUsedPct(acct: CodexAccountStatus): number {
  * buildCodexUsageWindowFromCache's `remaining = 100 - percent`, taking the MIN
  * across both windows (the scarcer of 5h/weekly). null percent ⇒ 100 remaining.
  */
-function bindingRemaining(acct: CodexAccountStatus): number {
-  const primaryRemaining = 100 - (acct.primaryUsedPercent ?? 0);
-  const secondaryRemaining = 100 - (acct.secondaryUsedPercent ?? 0);
+function bindingRemaining(acct: CodexRotationAccount, now: Date): number {
+  const primaryRemaining =
+    100 - effectiveWindowUsed(acct.primaryUsedPercent, acct.primaryResetAt, now);
+  const secondaryRemaining =
+    100 - effectiveWindowUsed(acct.secondaryUsedPercent, acct.secondaryResetAt, now);
   return Math.min(primaryRemaining, secondaryRemaining);
 }
 
-function cooling(acct: CodexAccountStatus, now: Date): boolean {
+function cooling(acct: CodexRotationAccount, now: Date): boolean {
   return acct.exhaustedUntil != null && acct.exhaustedUntil.getTime() > now.getTime();
 }
 
@@ -115,7 +140,7 @@ function cooling(acct: CodexAccountStatus, now: Date): boolean {
  * A null (never-probed) set is UNKNOWN: never credited as covering (Tier 2 only),
  * but — critically — never excluded, so failover is fully preserved.
  */
-function covers(acct: CodexAccountStatus, usedConnectors: string[]): boolean {
+function covers(acct: CodexRotationAccount, usedConnectors: string[]): boolean {
   if (usedConnectors.length === 0) {
     return true;
   }
@@ -132,7 +157,7 @@ function covers(acct: CodexAccountStatus, usedConnectors: string[]): boolean {
  * connector" note). Empty when the account covers (superset) or nothing was used.
  * A null (unknown) set surfaces ALL used connectors — we can't prove it covers them.
  */
-function droppedConnectorsFor(acct: CodexAccountStatus, usedConnectors: string[]): string[] {
+function droppedConnectorsFor(acct: CodexRotationAccount, usedConnectors: string[]): string[] {
   if (usedConnectors.length === 0) {
     return [];
   }
@@ -148,9 +173,13 @@ function droppedConnectorsFor(acct: CodexAccountStatus, usedConnectors: string[]
  * Eligible = connected/usable (status "active", excludes needs_relogin/error) AND
  * not cooling AND under the near-exhaustion threshold on BOTH windows.
  */
-function eligible(acct: CodexAccountStatus, nearExhaustionPct: number, now: Date): boolean {
+export function isCodexCredentialEligible(
+  acct: CodexRotationAccount,
+  nearExhaustionPct: number,
+  now: Date,
+): boolean {
   return (
-    acct.status === "active" && !cooling(acct, now) && bindingUsedPct(acct) < nearExhaustionPct
+    acct.status === "active" && !cooling(acct, now) && bindingUsedPct(acct, now) < nearExhaustionPct
   );
 }
 
@@ -275,7 +304,11 @@ export function chooseShardedHome(args: {
  * default cooldown (now + DEFAULT_RESET_COOLDOWN_MS), so the caller always idles a
  * bounded positive time and re-checks (which refreshes usage and self-heals).
  */
-export function availableAt(acct: CodexAccountStatus, nearExhaustionPct: number, now: Date): Date {
+export function availableAt(
+  acct: CodexRotationAccount,
+  nearExhaustionPct: number,
+  now: Date,
+): Date {
   const nowMs = now.getTime();
   // An unknown/elapsed block clears after a default cooldown, never in the past.
   const defaultClear = new Date(nowMs + DEFAULT_RESET_COOLDOWN_MS);
@@ -291,8 +324,14 @@ export function availableAt(acct: CodexAccountStatus, nearExhaustionPct: number,
     // reset is unknown → default cooldown (never a past instant).
     candidates.push(resetAt != null && resetAt.getTime() > nowMs ? resetAt : defaultClear);
   };
-  windowClear((acct.primaryUsedPercent ?? 0) >= nearExhaustionPct, acct.primaryResetAt);
-  windowClear((acct.secondaryUsedPercent ?? 0) >= nearExhaustionPct, acct.secondaryResetAt);
+  windowClear(
+    effectiveWindowUsed(acct.primaryUsedPercent, acct.primaryResetAt, now) >= nearExhaustionPct,
+    acct.primaryResetAt,
+  );
+  windowClear(
+    effectiveWindowUsed(acct.secondaryUsedPercent, acct.secondaryResetAt, now) >= nearExhaustionPct,
+    acct.secondaryResetAt,
+  );
   // Ineligible for a non-quota reason (needs_relogin / error) with no known block, or
   // a cleared cooldown: still idle a bounded cooldown before re-check — never the past.
   if (candidates.length === 0) {
@@ -303,7 +342,11 @@ export function availableAt(acct: CodexAccountStatus, nearExhaustionPct: number,
 }
 
 /** earliestResetAt across ALL connected accounts (min of each account's availableAt). */
-function earliestReset(accounts: CodexAccountStatus[], nearExhaustionPct: number, now: Date): Date {
+function earliestReset(
+  accounts: CodexRotationAccount[],
+  nearExhaustionPct: number,
+  now: Date,
+): Date {
   return accounts
     .map((acct) => availableAt(acct, nearExhaustionPct, now))
     .reduce((a, b) => (b.getTime() < a.getTime() ? b : a));
@@ -397,7 +440,7 @@ export function chooseRotationActive(args: {
   rotationStrategy: CodexRotationStrategy;
   activeCredentialId: string | null;
   priorCredentialId: string | null;
-  accounts: CodexAccountStatus[];
+  accounts: CodexRotationAccount[];
   nearExhaustionPct: number;
   now: Date;
   // P4 (Part B): the connectors the leaving session has access to (the leaving
@@ -420,18 +463,16 @@ export function chooseRotationActive(args: {
     return { kind: "none" };
   }
 
-  const eligibles = accounts.filter((acct) => eligible(acct, nearExhaustionPct, now));
+  const eligibles = accounts.filter((acct) =>
+    isCodexCredentialEligible(acct, nearExhaustionPct, now),
+  );
 
-  // Healthy-active fast path (minimal churn, all strategies): a rotation-enabled
-  // session whose active account is still eligible does NOT rotate — no pointer
-  // move, no switch event. Steady-state stays as cheap as a non-rotation turn
-  // save the in-memory ranking. (Skipped for round_robin/drain which anchor on
-  // the prior account, but most_remaining is the default + correctness path.)
-  const activeRow = activeCredentialId
-    ? (accounts.find((acct) => acct.id === activeCredentialId) ?? null)
-    : null;
-
-  const decide = (chosen: CodexAccountStatus | undefined): RotationDecision => {
+  // The active pointer is a cursor/manual preference, NOT a sticky lease. In
+  // particular, most_remaining must rank the whole eligible pool every turn;
+  // keeping a healthy active account until 90% was the production monopolization
+  // defect fixed by OPE-21. drain_then_next remains the one explicitly sticky
+  // strategy, and a manual pin is handled by the caller as explicit policy.
+  const decide = (chosen: CodexRotationAccount | undefined): RotationDecision => {
     if (!chosen) {
       return {
         kind: "allCapped",
@@ -465,7 +506,7 @@ export function chooseRotationActive(args: {
       priorIdx >= 0
         ? [...accounts.slice(priorIdx + 1), ...accounts.slice(0, priorIdx + 1)]
         : accounts;
-    const chosen = ordered.find((acct) => eligible(acct, nearExhaustionPct, now));
+    const chosen = ordered.find((acct) => isCodexCredentialEligible(acct, nearExhaustionPct, now));
     return decide(chosen);
   }
 
@@ -474,33 +515,117 @@ export function chooseRotationActive(args: {
     const priorRow = priorCredentialId
       ? accounts.find((acct) => acct.id === priorCredentialId)
       : undefined;
-    if (priorRow && eligible(priorRow, nearExhaustionPct, now)) {
+    if (priorRow && isCodexCredentialEligible(priorRow, nearExhaustionPct, now)) {
       return decide(priorRow);
     }
     return decide(eligibles[0]);
   }
 
-  // most_remaining (default + the correctness path).
-  // Healthy-active fast path UNCHANGED (no-thrash): a session whose active account
-  // is still eligible never switches — not even for connector coverage. Coverage
-  // matters ONLY on the must-move branch below.
-  if (activeRow && eligible(activeRow, nearExhaustionPct, now)) {
-    return { kind: "active", credentialId: activeRow.id, moved: false };
-  }
-  // Active is capped/near-cap/cooling/missing → must move. Two-tier coverage pick
-  // over the SAME eligible set (prefer-not-require):
+  // most_remaining (default + the correctness path). Two-tier coverage pick over
+  // the SAME eligible set (prefer-not-require):
   //   Tier 1 — eligibles whose connector set COVERS the session's used set.
   //   Tier 2 — ALL eligibles, only if Tier 1 is empty (failover fully preserved).
-  // Within the chosen tier, max bindingRemaining, ties broken by list (created_at)
-  // order via a stable reduce — byte-identical to P3 when usedConnectors is empty
-  // (Tier 1 == all eligibles).
+  // Within the chosen tier:
+  //   1. least active leases (concurrent turns spread before quota metadata moves),
+  //   2. most remaining binding quota,
+  //   3. fewest historical selections,
+  //   4. least-recently selected, then stable created_at/id input order.
+  // Base CodexAccountStatus values (pure legacy tests/reactive rank) default the
+  // lease/cursor metadata to zero/null, preserving deterministic stable ties.
   const covering = eligibles.filter((acct) => covers(acct, usedConnectors));
   const pool = covering.length > 0 ? covering : eligibles;
-  const chosen = pool.reduce<CodexAccountStatus | undefined>((best, acct) => {
+  const activeLeases = (acct: CodexRotationAccount): number =>
+    "activeLeaseCount" in acct ? acct.activeLeaseCount : 0;
+  const selections = (acct: CodexRotationAccount): number =>
+    "selectionCount" in acct ? acct.selectionCount : 0;
+  const lastSelected = (acct: CodexRotationAccount): number =>
+    "lastSelectedAt" in acct && acct.lastSelectedAt ? acct.lastSelectedAt.getTime() : 0;
+  const chosen = pool.reduce<CodexRotationAccount | undefined>((best, acct) => {
     if (!best) {
       return acct;
     }
-    return bindingRemaining(acct) > bindingRemaining(best) ? acct : best;
+    if (activeLeases(acct) !== activeLeases(best)) {
+      return activeLeases(acct) < activeLeases(best) ? acct : best;
+    }
+    if (bindingRemaining(acct, now) !== bindingRemaining(best, now)) {
+      return bindingRemaining(acct, now) > bindingRemaining(best, now) ? acct : best;
+    }
+    if (selections(acct) !== selections(best)) {
+      return selections(acct) < selections(best) ? acct : best;
+    }
+    return lastSelected(acct) < lastSelected(best) ? acct : best;
   }, undefined);
   return decide(chosen);
+}
+
+/**
+ * Full pure policy at the transaction boundary. A live same-turn lease is
+ * idempotent; the rollout-off/manual path preserves pin>pointer behavior; a
+ * healthy pin wins only while eligible, so quota/auth quarantine cannot trap a
+ * session on one subscription.
+ */
+export function selectCodexCredentialLeaseForTurn(args: {
+  context: CodexCredentialLeaseSelectionContext;
+  leasingEnabled: boolean;
+  sessionPinnedCredentialId: string | null;
+  sessionLastCredentialId: string | null;
+  nearExhaustionPct: number;
+  now: Date;
+}): CodexTurnLeaseSelection {
+  const { accounts, activeCredentialId, rotationEnabled, rotationStrategy, existingCredentialId } =
+    args.context;
+  const existing = existingCredentialId
+    ? accounts.find((account) => account.id === existingCredentialId)
+    : undefined;
+  if (existing && isCodexCredentialEligible(existing, args.nearExhaustionPct, args.now)) {
+    return {
+      credentialId: existing.id,
+      decision: {
+        kind: "active",
+        credentialId: existing.id,
+        moved: existing.id !== activeCredentialId,
+      },
+    };
+  }
+
+  const connectedIds = new Set(accounts.map((account) => account.id));
+  if (!args.leasingEnabled || !rotationEnabled) {
+    const credentialId =
+      args.sessionPinnedCredentialId && connectedIds.has(args.sessionPinnedCredentialId)
+        ? args.sessionPinnedCredentialId
+        : activeCredentialId && connectedIds.has(activeCredentialId)
+          ? activeCredentialId
+          : null;
+    return {
+      credentialId,
+      decision: credentialId ? { kind: "active", credentialId, moved: false } : { kind: "none" },
+    };
+  }
+
+  const pinned = args.sessionPinnedCredentialId
+    ? accounts.find((account) => account.id === args.sessionPinnedCredentialId)
+    : undefined;
+  if (pinned && isCodexCredentialEligible(pinned, args.nearExhaustionPct, args.now)) {
+    return {
+      credentialId: pinned.id,
+      decision: { kind: "active", credentialId: pinned.id, moved: false },
+    };
+  }
+
+  const priorId = args.sessionLastCredentialId ?? activeCredentialId;
+  const decision = chooseRotationActive({
+    rotationStrategy: rotationStrategy as CodexRotationStrategy,
+    activeCredentialId,
+    // Per-session continuity is the round-robin/drain cursor. Falling back to
+    // the workspace pointer is only correct when this session has never run.
+    priorCredentialId: priorId,
+    accounts,
+    nearExhaustionPct: args.nearExhaustionPct,
+    now: args.now,
+    usedConnectors: accounts.find((account) => account.id === priorId)?.connectorNamespaces ?? [],
+  });
+  return {
+    credentialId: decision.kind === "active" ? decision.credentialId : null,
+    decision,
+  };
 }

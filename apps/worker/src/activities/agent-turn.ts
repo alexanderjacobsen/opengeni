@@ -16,6 +16,10 @@ import {
   getSessionTurn,
   isCodexBilledTurn,
   workspaceCodexSubscriptionActive,
+  acquireCodexCredentialLease,
+  heartbeatCodexCredentialLease,
+  releaseCodexCredentialLease,
+  CODEX_CREDENTIAL_LEASE_TTL_MS,
   getCodexRotationSettings,
   listCodexAccountStatuses,
   fetchCodexUsageForAccount,
@@ -25,8 +29,8 @@ import {
   recordCodexAccountUsage,
   recordCodexAccountConnectors,
   resolveWorkspaceMemoryBlock,
-  setActiveCodexCredential,
   setCodexCredentialExhausted,
+  setCodexCredentialStatusById,
   countConsecutiveReactiveRotations,
   requireSession,
   recordUsageEvent,
@@ -36,6 +40,7 @@ import {
   getActiveSessionHistoryItems,
   nextSessionHistoryPosition,
   requeuePreemptedTurn,
+  settleCodexCredentialFailover,
   saveRunState,
   upsertSandboxSessionEnvelope,
   setSessionStatus,
@@ -52,6 +57,8 @@ import {
   type AppendEventInput,
   type ActiveSandboxPointer,
   type SandboxRecord,
+  type CodexCredentialLeaseResult,
+  type CodexCredentialLeaseSelectionContext,
 } from "@opengeni/db";
 import { appendAndPublishEvents } from "@opengeni/events";
 import {
@@ -103,6 +110,8 @@ import {
   computeReactiveRotationResume,
   shardCredentialForSession,
   earliestCodexReset,
+  isCodexCredentialEligible,
+  selectCodexCredentialLeaseForTurn,
   type CodexRotationStrategy,
   type RotationDecision,
 } from "./codex-rotation";
@@ -189,6 +198,8 @@ import {
   type SessionEventType,
 } from "@opengeni/contracts";
 import { randomUUID } from "node:crypto";
+import { CAPABILITY_DESCRIPTORS, type ResourceRef } from "@opengeni/contracts";
+import { createHash, randomUUID } from "node:crypto";
 
 // How long the session workflow holds the loop after a retryable provider
 // failure before the goal continuation re-enters the model. Azure/OpenAI TPM
@@ -277,6 +288,16 @@ export const WORKER_DEATH_RESUME_TEXT = [
   "Your conversation history above, including this turn's earlier work, is preserved up to the last checkpoint; anything in flight after that checkpoint was lost.",
   "Continue the original task from where it left off. Before repeating any action with side effects, check whether it already happened.",
 ].join("\n");
+
+export const CODEX_ROTATION_RESUME_TEXT = [
+  "[TURN RESUMED AFTER CODEX ACCOUNT FAILOVER] The previous Codex subscription definitively refused the model request and was quarantined or placed in cooldown.",
+  "Continue the same task on the newly leased subscription. Earlier model/tool progress is already preserved; before repeating any external side effect, verify whether it already happened.",
+].join("\n");
+
+/** Fixed-length one-way tenant correlation for metrics/alerts; never a raw id. */
+export function codexWorkspaceMetricKey(workspaceId: string): string {
+  return createHash("sha256").update(workspaceId).digest("hex").slice(0, 12);
+}
 
 /**
  * True when this activity attempt was cancelled because its hosting worker is
@@ -1052,12 +1073,90 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
     const machineOpObserver = makeMachineOpObserver(
       runtimeMetricsHooksForObservability(observability),
     );
+    let isCodexTurn = false;
     // Worker-death redispatch counter observed when THIS dispatch claimed the
     // turn. If a dying-attempt cancel later fences on this and the turn's
     // current value differs, recovery already re-queued/re-dispatched the turn
     // and the zombie must not clobber it.
     let redispatchesAtDispatch = 0;
     let heartbeatTimer: ReturnType<typeof startActivityHeartbeat> | undefined;
+    // OPE-21: one workspace-local idempotent credential holder per running
+    // Codex turn. The DB row is the cross-replica fairness primitive; this timer
+    // only extends its short TTL. A killed worker stops heartbeating and the
+    // holder self-expires. Other workspaces never see or share this holder.
+    let codexLeaseHeld = false;
+    let codexLeaseLost = false;
+    let codexLeaseHolderId: string | null = null;
+    let codexLeaseGeneration: number | null = null;
+    let codexLeaseHeartbeatInFlight = false;
+    let codexLeaseHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
+    const codexWorkspaceKey = codexWorkspaceMetricKey(input.workspaceId);
+    const renewCodexLease = async (reason: "timer" | "runtime_event" | "model_usage") => {
+      if (
+        !turnId ||
+        !codexLeaseHeld ||
+        !codexLeaseHolderId ||
+        codexLeaseGeneration === null ||
+        codexLeaseHeartbeatInFlight ||
+        codexLeaseLost
+      )
+        return;
+      codexLeaseHeartbeatInFlight = true;
+      try {
+        const renewed = await heartbeatCodexCredentialLease(
+          db,
+          input.accountId,
+          input.workspaceId,
+          turnId,
+          codexLeaseHolderId,
+          codexLeaseGeneration,
+          CODEX_CREDENTIAL_LEASE_TTL_MS,
+        );
+        if (!renewed) {
+          codexLeaseLost = true;
+          observability.incrementCounter({
+            name: "opengeni_codex_lease_renewals_total",
+            help: "Codex lease renewal checkpoints by outcome and reason.",
+            labels: { workspace_key: codexWorkspaceKey, outcome: "lost", reason },
+          });
+          observability.warn("Codex credential lease was lost during an active turn", {
+            workspaceId: input.workspaceId,
+            turnId,
+            reason,
+          });
+        } else {
+          observability.incrementCounter({
+            name: "opengeni_codex_lease_renewals_total",
+            help: "Codex lease renewal checkpoints by outcome and reason.",
+            labels: { workspace_key: codexWorkspaceKey, outcome: "completed", reason },
+          });
+        }
+      } catch (error) {
+        // A transient DB failure does not immediately abandon a still-live row;
+        // the next timer/model/tool checkpoint retries. Expiry itself returns
+        // false and fences further model progress through codexLeaseLost.
+        observability.warn("Codex credential lease heartbeat failed", {
+          workspaceId: input.workspaceId,
+          turnId,
+          reason,
+          errorName: error instanceof Error ? error.name : "unknown",
+        });
+        observability.incrementCounter({
+          name: "opengeni_codex_lease_renewals_total",
+          help: "Codex lease renewal checkpoints by outcome and reason.",
+          labels: { workspace_key: codexWorkspaceKey, outcome: "error", reason },
+        });
+      } finally {
+        codexLeaseHeartbeatInFlight = false;
+      }
+    };
+    const startCodexLeaseHeartbeat = (): void => {
+      if (!turnId || codexLeaseHeartbeatTimer) return;
+      codexLeaseHeartbeatTimer = setInterval(() => {
+        void renewCodexLease("timer");
+      }, 60_000);
+      codexLeaseHeartbeatTimer.unref?.();
+    };
     // P1.2 ownership inversion: when sandboxOwnershipEnabled, the turn resolves
     // the one box by id from the group lease and injects it NON-OWNED into the
     // run. null when the flag is off (byte-for-byte the legacy build-and-discard
@@ -1303,7 +1402,9 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
     // inserts a fractional summary position, so total rows no longer equal
     // max(position)+1 and the slice index can no longer double as the position.
     let nextHistoryPosition = 0;
-    const reconcileConversationTruth = async (options: { skipInputOnlyRows?: boolean } = {}) => {
+    const reconcileConversationTruth = async (
+      options: { skipInputOnlyRows?: boolean; requireDurable?: boolean } = {},
+    ) => {
       if (!stream || !turnId) {
         return;
       }
@@ -1353,6 +1454,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
         }
       } catch (persistError) {
         console.error("session history dual-write failed (run unaffected)", persistError);
+        if (options.requireDurable) throw persistError;
       }
     };
     // Reassigned after the variable set loads; the publish closure is
@@ -1439,7 +1541,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       // here (before resolvedModel at the routing step) because the pre-turn gate
       // below needs it; mirrors the same active-credential read the codex provider
       // overlay uses, so billing and routing agree on what "codex" is.
-      const isCodexTurn = await isCodexBilledTurn({
+      isCodexTurn = await isCodexBilledTurn({
         db,
         settings,
         workspaceId: input.workspaceId,
@@ -1493,6 +1595,10 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       // activity retry reuses the same activityId, so its re-emitted calls keep
       // deduping (no double charge).
       const dispatchId = activityContext?.info.activityId ?? null;
+      // Local/tests have no Temporal activity id; still generate an execution-
+      // unique holder so a second dispatch of the same durable turn fences this
+      // one exactly like production.
+      codexLeaseHolderId = dispatchId ?? `local:${randomUUID()}`;
       publish = async (
         events: Array<Omit<AppendEventInput, "producerId" | "producerSeq" | "turnId">>,
         immediate = false,
@@ -1541,74 +1647,116 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       // when it changed from the prior run's account so the pill flips live.
       // Gated on the codex-billed predicate — non-codex turns never touch this.
       if (isCodexTurn) {
-        const [rotation, accounts, sessionCodex] = await Promise.all([
-          getCodexRotationSettings(db, input.workspaceId),
-          listCodexAccountStatuses(db, input.workspaceId),
-          getSessionCodexState(db, input.workspaceId, input.sessionId),
-        ]);
-        const connectedIds = new Set(accounts.map((account) => account.id));
-        // ───────────────────────────────────────────────────────────────────────────
-        // CREDENTIAL-SELECTION CONTRACT (self-contained; safe to lift wholesale into a
-        // future allocator/leasing rework). A codex turn's account is resolved as
-        // pin > workspace-active, where the session PIN carries a SOURCE:
-        //   • manual — the user's in-session account switcher. SACROSANCT: no policy
-        //     path (sharded assignment, rebalance, rotation) ever moves or clears it.
-        //   • policy — the "sharded" strategy's deterministic HOME for this session.
-        //     Assigned LAZILY at the session's first codex turn as
-        //     stableEligible[hash(sessionId) % N] over the HEALTHY (eligible) accounts;
-        //     kept while its account stays eligible (prompt-cache warmth); REBALANCED
-        //     when that account caps by a durable RE-SHARD over the healthy survivors
-        //     (capped accounts EXCLUDED). Rebalance is a PIN REWRITE, never a
-        //     workspace-active-pointer move — selectCodexCredentialForTurn returns a
-        //     pinned account with no exhaustion check, so a pointer-only move would leave
-        //     the session on the capped pin. Re-shard (not first-eligible) so a capped
-        //     account's cohort SPREADS across the pool instead of re-concentrating on one
-        //     failover. LIFECYCLE: a policy pin is meaningful ONLY while the sharded
-        //     policy is active. Under any OTHER regime (a non-sharded strategy, or
-        //     rotation disabled) it is IGNORED (never honored as a sticky pin — that would
-        //     re-introduce the no-escape trap) and CLEARED lazily on the session's next
-        //     turn, converging to the active strategy without a migration.
-        //   • null — no pin: the non-sharded strategies rank the workspace-active pointer
-        //     (chooseRotationActive), unchanged.
-        // The decision MATH is pure and orthogonal to strategy identity —
-        // shardCredentialForSession / chooseShardedHome / chooseRotationActive /
-        // isCodexAccountEligible in codex-rotation.ts — so it composes with any affinity
-        // scoring layered on later. "sharded" is only the strategy value; it does not
-        // itself imply an affinity mode.
-        // ───────────────────────────────────────────────────────────────────────────
+        const sessionCodex = await getSessionCodexState(db, input.workspaceId, input.sessionId);
         const sessionPin = sessionCodex?.pinnedCredentialId ?? null;
-        const pinSource = sessionCodex?.pinSource ?? null;
-        const strategy = (rotation?.rotationStrategy ?? "most_remaining") as CodexRotationStrategy;
-        // Classify how the pin governs this turn (pure; see classifyCodexPin). The whole
-        // pin lifecycle — manual sacrosanct, sharded assign/keep/re-shard, stale-policy
-        // clear, unpinned-follow — is decided here in one place.
-        const pinDisposition = classifyCodexPin({
-          pinnedCredentialId: sessionPin,
-          pinSource,
-          strategy,
-          rotationEnabled: Boolean(rotation?.rotationEnabled),
-        });
-        // Snapshot the session's prior serving credential BEFORE the resolve/overwrite
-        // below, for the per-call account-switch usage log (prompt-cache hypothesis).
-        priorSessionCodexCredentialId = sessionCodex?.lastCredentialId ?? null;
-        // The off-path / P1 default: today's workspace active pointer. Untouched
-        // when rotation is off or the session is pinned (byte-identical to P1).
-        let chosenActive = rotation?.activeCredentialId ?? null;
-        let rotationDecision: RotationDecision | null = null;
-        // The pin selectCodexCredentialForTurn resolves against. The sharded path
-        // overwrites it with this session's (possibly re-sharded) policy home; every
-        // other path leaves it as today's session pin.
-        let resolvedSessionPin = sessionPin;
-        // True when the ENGINE (rotation OR a sharded (re)assignment) moved this
-        // session onto a different account — drives the switch event's reason.
-        let engineMoved = false;
+        const selectForTurn = (context: CodexCredentialLeaseSelectionContext) =>
+          selectCodexCredentialLeaseForTurn({
+            context,
+            leasingEnabled: settings.codexCredentialLeasingEnabled,
+            sessionPinnedCredentialId: sessionPin,
+            sessionLastCredentialId: sessionCodex?.lastCredentialId ?? null,
+            nearExhaustionPct: settings.codexRotationNearExhaustionPct,
+            now: new Date(),
+          });
 
-        // The shared all-capped idle (invariant 4: BOUNDED, no thrash). Every eligible
-        // account is capped/cooling → idle the turn AT THE BOUNDARY (no wasted
-        // model/sandbox build) until the EARLIEST reset across all accounts. Used by
-        // BOTH the classic rotation path and the sharded path (identical rotation-wait
-        // shape). No saveRunState: no model ran, nothing to freeze.
-        const idleUntilCodexReset = async (earliestResetAt: Date): Promise<RunAgentTurnResult> => {
+        // Rollout/rollback path is intentionally table-inert. With the flag off,
+        // old and new workers both use legacy pin > active-pointer selection and
+        // neither reads nor writes the additive lease/cursor schema.
+        let leased: CodexCredentialLeaseResult<RotationDecision>;
+        if (settings.codexCredentialLeasingEnabled) {
+          leased = await acquireCodexCredentialLease(
+            db,
+            {
+              accountId: input.accountId,
+              workspaceId: input.workspaceId,
+              turnId,
+              holderId: codexLeaseHolderId,
+              advanceActivePointer: sessionPin === null,
+            },
+            selectForTurn,
+          );
+        } else {
+          const [rotation, accounts] = await Promise.all([
+            getCodexRotationSettings(db, input.workspaceId),
+            listCodexAccountStatuses(db, input.workspaceId),
+          ]);
+          const leaseAccounts = accounts.map((account) => ({
+            ...account,
+            activeLeaseCount: 0,
+            selectionCount: 0,
+            lastSelectedAt: null,
+          }));
+          const activeCredentialId = rotation?.activeCredentialId ?? null;
+          const selected = selectForTurn({
+            accounts: leaseAccounts,
+            activeCredentialId,
+            rotationEnabled: rotation?.rotationEnabled ?? false,
+            rotationStrategy: rotation?.rotationStrategy ?? "most_remaining",
+            existingCredentialId: null,
+          });
+          leased = {
+            ...selected,
+            accounts: leaseAccounts,
+            activeCredentialId,
+            rotationEnabled: rotation?.rotationEnabled ?? false,
+            rotationStrategy: rotation?.rotationStrategy ?? "most_remaining",
+            reused: false,
+            holderId: null,
+            generation: null,
+            leasedUntil: null,
+          };
+        }
+        if (settings.codexCredentialLeasingEnabled && leased.decision.kind === "allCapped") {
+          // Bounded self-heal of stale usage cache, then ONE new atomic selection.
+          await refreshCappedCodexUsageRows(db, settings, input.workspaceId, leased.accounts);
+          leased = await acquireCodexCredentialLease(
+            db,
+            {
+              accountId: input.accountId,
+              workspaceId: input.workspaceId,
+              turnId,
+              holderId: codexLeaseHolderId,
+              advanceActivePointer: sessionPin === null,
+            },
+            selectForTurn,
+          );
+        }
+        const rotationDecision = leased.decision;
+        effectiveCodexCredentialId = leased.credentialId;
+        codexLeaseGeneration = leased.generation;
+        codexLeaseHeld =
+          settings.codexCredentialLeasingEnabled && effectiveCodexCredentialId !== null;
+        if (codexLeaseHeld) startCodexLeaseHeartbeat();
+
+        const eligibleCount = leased.accounts.filter((account) =>
+          isCodexCredentialEligible(account, settings.codexRotationNearExhaustionPct, new Date()),
+        ).length;
+        const poolDepth = eligibleCount === 0 ? "zero" : eligibleCount === 1 ? "one" : "many";
+        observability.incrementCounter({
+          name: "opengeni_codex_pool_observations_total",
+          help: "Observed eligible Codex pool depth buckets at turn selection.",
+          labels: { workspace_key: codexWorkspaceKey, depth: poolDepth },
+        });
+        if (eligibleCount <= 1) {
+          observability.incrementCounter({
+            name: "opengeni_codex_pool_low_total",
+            help: "Alert signal emitted when the eligible Codex pool is zero or one.",
+            labels: { workspace_key: codexWorkspaceKey, depth: poolDepth },
+          });
+          observability.warn("Codex eligible credential pool is low", {
+            workspaceId: input.workspaceId,
+            eligibleCount,
+            connectedCount: leased.accounts.length,
+            depth: poolDepth,
+          });
+        }
+
+        if (rotationDecision.kind === "allCapped" && publish && turnId) {
+          // Every eligible account is capped/cooling (and a usage refresh did NOT
+          // surface a reset): idle the turn AT THE BOUNDARY (no wasted model/sandbox
+          // build) until the EARLIEST reset across all accounts — the multi-account
+          // generalization of #143's single-account idle-until-reset. No saveRunState:
+          // no model ran, nothing to freeze.
           const goal = await getSessionGoal(db, input.workspaceId, input.sessionId).catch(
             () => null,
           );
@@ -1617,7 +1765,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
           // reset can never yield a 0 (which session.ts would treat as "continue now",
           // re-entering this path in a tight CPU/DB-hammering loop).
           const resumeMs = computeIdleDelayMs(
-            earliestResetAt,
+            rotationDecision.earliestResetAt,
             new Date(),
             CODEX_USAGE_LIMIT_MAX_RESUME_MS,
           );
@@ -1626,7 +1774,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             "all connected Codex subscriptions are rate-limited",
             { allAccounts: true },
           );
-          await publish!(
+          await publish(
             [
               // `rotated:true` (Finding 2): the proactive all-capped wait is the SAME
               // rotation-wait state as the reactive all-capped path, so it must freeze
@@ -1646,7 +1794,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             ],
             true,
           );
-          await finishTurn(db, input.workspaceId, turnId!, "failed");
+          await finishTurn(db, input.workspaceId, turnId, "failed");
           turnMetricOutcome = "failed";
           await setSessionStatus(db, input.workspaceId, input.sessionId, "idle", null);
           activityStatus = "idle";
@@ -1655,137 +1803,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
           return goalActive
             ? { status: "idle", continueDelayMs: resumeMs, idleUntilReset: true }
             : { status: "idle" };
-        };
-
-        if (pinDisposition === "clearStale") {
-          // Lazy convergence: a policy pin outlives its policy only until the session's
-          // next turn. Clear it durably (pin + source → null) so the session is treated
-          // as UNPINNED from here on and follows whatever strategy is now active. No
-          // migration-on-switch needed — sessions converge one turn at a time.
-          await setSessionCodexPin(db, input.workspaceId, input.sessionId, null);
-          resolvedSessionPin = null;
         }
-
-        if (pinDisposition === "sharded") {
-          // === SHARDED (AM-4/AM-6/AM-7): pick/health-check this session's HOME. ===
-          // Keep an eligible POLICY pin (prompt-cache warmth); otherwise (re-)shard.
-          // First turn (no policy pin) assigns lazily; a capped policy pin re-shards
-          // and durably rewrites the pin. A MANUAL pin never reaches here.
-          const nearPct = settings.codexRotationNearExhaustionPct;
-          const currentPolicyPin = pinSource === "policy" ? sessionPin : null;
-          let shardAccounts = accounts;
-          let shardDecision = chooseShardedHome({
-            sessionId: input.sessionId,
-            currentPolicyPin,
-            accounts: shardAccounts,
-            nearExhaustionPct: nearPct,
-            now: new Date(),
-          });
-          // SELF-HEAL (invariant 4): the turn hot path never refreshes usage, so an
-          // account whose window actually reset still reads capped from the stale cache.
-          // ONLY when we're about to ABANDON an existing pin or idle (not on a clean
-          // first-turn assign) refresh the over-threshold rows ONCE and re-decide, so a
-          // genuinely-reset home is kept and the cache heals.
-          const abandoningPin =
-            currentPolicyPin != null &&
-            (shardDecision.kind === "allCapped" ||
-              (shardDecision.kind === "home" && shardDecision.credentialId !== currentPolicyPin));
-          if (shardDecision.kind === "allCapped" || abandoningPin) {
-            shardAccounts = await refreshCappedCodexUsageRows(
-              db,
-              settings,
-              input.workspaceId,
-              shardAccounts,
-            );
-            shardDecision = chooseShardedHome({
-              sessionId: input.sessionId,
-              currentPolicyPin,
-              accounts: shardAccounts,
-              nearExhaustionPct: nearPct,
-              now: new Date(),
-            });
-          }
-          if (shardDecision.kind === "allCapped") {
-            return await idleUntilCodexReset(shardDecision.earliestResetAt);
-          }
-          if (shardDecision.rewritePin) {
-            // Durable pin (re)write (AM-3/AM-5 rebalance + AM-7 first-turn assign).
-            // The NEXT turn reads this exact home.
-            await setSessionCodexPin(
-              db,
-              input.workspaceId,
-              input.sessionId,
-              shardDecision.credentialId,
-              "policy",
-            );
-            engineMoved = true;
-          }
-          resolvedSessionPin = shardDecision.credentialId; // selectCodexCredentialForTurn returns it.
-        } else if (rotation?.rotationEnabled && resolvedSessionPin == null) {
-          // === Classic auto-rotation (unpinned, non-sharded strategies): UNCHANGED. ===
-          // Reached by a genuinely unpinned session OR one whose stale policy pin was
-          // just cleared above (both now resolvedSessionPin == null); a MANUAL pin keeps
-          // resolvedSessionPin non-null and so NEVER rotates. When skipped, chosenActive
-          // stays the active pointer and selectCodexCredentialForTurn is called with
-          // byte-identical arguments to today.
-          let rankAccounts = accounts;
-          rotationDecision = chooseRotationActive({
-            rotationStrategy: strategy,
-            activeCredentialId: rotation.activeCredentialId,
-            priorCredentialId: sessionCodex?.lastCredentialId ?? null,
-            accounts: rankAccounts,
-            nearExhaustionPct: settings.codexRotationNearExhaustionPct,
-            now: new Date(),
-            // P4: the leaving (active) account's cached connector set is the proxy
-            // for "what this session has access to" — prefer a covering target.
-            usedConnectors:
-              rankAccounts.find((a) => a.id === rotation.activeCredentialId)?.connectorNamespaces ??
-              [],
-          });
-          if (rotationDecision.kind === "allCapped") {
-            // SELF-HEAL (invariant 4): the turn hot path NEVER refreshes usage, so a
-            // window that has actually reset still reads capped from the stale cache —
-            // which would otherwise idle-loop forever (idle → continuation re-dispatch →
-            // same stale all-capped → idle …). Before idling, refresh usage for the
-            // over-threshold accounts (bounded to the account count) and re-rank ONCE,
-            // so a genuinely-reset window is picked up immediately and the cache heals.
-            rankAccounts = await refreshCappedCodexUsageRows(
-              db,
-              settings,
-              input.workspaceId,
-              rankAccounts,
-            );
-            rotationDecision = chooseRotationActive({
-              rotationStrategy: strategy,
-              activeCredentialId: rotation.activeCredentialId,
-              priorCredentialId: sessionCodex?.lastCredentialId ?? null,
-              accounts: rankAccounts,
-              nearExhaustionPct: settings.codexRotationNearExhaustionPct,
-              now: new Date(),
-              // P4: leaving (active) account's connector set (refreshCappedCodexUsageRows
-              // only touches usage columns, so connectorNamespaces is preserved here).
-              usedConnectors:
-                rankAccounts.find((a) => a.id === rotation.activeCredentialId)
-                  ?.connectorNamespaces ?? [],
-            });
-          }
-          if (rotationDecision.kind === "active") {
-            if (rotationDecision.moved) {
-              // The single authoritative pointer-move site: persist the new active.
-              await setActiveCodexCredential(db, input.workspaceId, rotationDecision.credentialId);
-            }
-            chosenActive = rotationDecision.credentialId;
-          } else if (rotationDecision.kind === "allCapped" && turnId) {
-            return await idleUntilCodexReset(rotationDecision.earliestResetAt);
-          }
-          // kind:"none" (no accounts) → chosenActive stays null → existing relogin path.
-        }
-
-        effectiveCodexCredentialId = selectCodexCredentialForTurn({
-          sessionPinnedCredentialId: resolvedSessionPin, // pin (manual / sharded home) still wins
-          activeCredentialId: chosenActive, // rotation-choice OR today's active
-          connectedIds,
-        });
         if (effectiveCodexCredentialId) {
           const priorAccountId = sessionCodex?.lastCredentialId ?? null;
           await recordSessionActiveCodexCredential(
@@ -1795,16 +1813,12 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             effectiveCodexCredentialId,
           );
           if (priorAccountId !== effectiveCodexCredentialId) {
-            // "rotation" whenever the engine moved the session (classic rotation OR a
-            // sharded (re)assignment); otherwise the unchanged P1 "manual" literal (a
-            // manual active flip between turns).
-            const rotated =
-              engineMoved || (rotationDecision?.kind === "active" && rotationDecision.moved);
+            const rotated = rotationDecision.kind === "active" && rotationDecision.moved;
             // P4: surface the dropped-connector note when this rotation pick couldn't
             // cover the session's used connectors (a Tier-2/unknown failover); the pill
             // renders the badge. Omitted when the switch covered everything (the norm).
             const droppedConnectors =
-              rotationDecision?.kind === "active" ? rotationDecision.droppedConnectors : undefined;
+              rotationDecision.kind === "active" ? rotationDecision.droppedConnectors : undefined;
             await publish([
               {
                 type: "codex.account.switched",
@@ -1819,6 +1833,36 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
               },
             ]);
           }
+
+          const selectionReason = leased.reused
+            ? "lease_reused"
+            : sessionPin === effectiveCodexCredentialId
+              ? "pin"
+              : rotationDecision.kind === "active" && rotationDecision.moved
+                ? "rotation"
+                : "active";
+          observability.incrementCounter({
+            name: "opengeni_codex_credential_selections_total",
+            help: "Codex credential selections by strategy and reason.",
+            labels: {
+              workspace_key: codexWorkspaceKey,
+              strategy: leased.rotationStrategy,
+              reason: selectionReason,
+            },
+          });
+          await publish([
+            {
+              type: "codex.credential.selected",
+              payload: {
+                credentialId: effectiveCodexCredentialId,
+                strategy: leased.rotationStrategy,
+                reason: selectionReason,
+                eligibleCount,
+                connectedCount: leased.accounts.length,
+                reused: leased.reused,
+              },
+            },
+          ]);
         }
       }
 
@@ -2843,6 +2887,10 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
           runtime.runStream(agent, runInput!, runSettings, {
             sandboxEnvironment,
             onRuntimeEvent: async (event) => {
+              await renewCodexLease("runtime_event");
+              if (codexLeaseLost) {
+                throw new Error("Codex credential lease expired during the active turn");
+              }
               await publish!([{ type: event.type, payload: event.payload }], true);
             },
             // P1.2: inject the resumed box NON-OWNED (the SDK never reaps it — the
@@ -2866,6 +2914,9 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
               : {}),
             contextCompactionSignalTokens: () => lastInputTokensObserved,
           });
+        if (codexLeaseLost) {
+          throw new Error("Codex credential lease expired before the model run");
+        }
         stream = await withCodex(runStreamOnce);
         // Bounded provider label for the streaming SLIs — the resolved registry
         // provider id (or the built-in OpenAI/Azure provider), never a raw
@@ -2894,6 +2945,10 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             let modelUsageEventContext: Record<string, unknown> | null = null;
             const responseUsage = modelResponseUsageFromSdkEvent(next.value);
             if (responseUsage) {
+              await renewCodexLease("model_usage");
+              if (codexLeaseLost) {
+                throw new Error("Codex credential lease expired during the active turn");
+              }
               responseUsageCount += 1;
               const responseSourceKey = modelUsageSourceKey({
                 responseId: responseUsage.responseId,
@@ -3572,6 +3627,212 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
         activityStatus = "idle";
         return { status: "idle" };
       }
+      // Definitive Codex credential/account refusals are the only provider
+      // errors that may walk the pool. This is an explicit checkpoint + SAME
+      // turn requeue, never an SDK/Temporal blind retry. A network break,
+      // malformed/partial 200 stream, invalid content, prompt 4xx, or provider
+      // 5xx does not classify here and therefore cannot consume another
+      // subscription or duplicate a side effect.
+      const codexCredentialFailure =
+        settings.codexCredentialLeasingEnabled && isCodexTurn && effectiveCodexCredentialId
+          ? classifyCodexCredentialFailure(error)
+          : null;
+      if (
+        codexCredentialFailure &&
+        effectiveCodexCredentialId &&
+        publish &&
+        turnId &&
+        turnStartedPublished
+      ) {
+        const failoverStartedAt = performance.now();
+        let checkpointDurable = false;
+        try {
+          await flushRuntimeBatcher();
+          await reconcileConversationTruth({ requireDurable: true });
+          checkpointDurable = true;
+        } catch (checkpointError) {
+          observability.incrementCounter({
+            name: "opengeni_codex_failover_checkpoints_total",
+            help: "Durable Codex failover checkpoint attempts by outcome.",
+            labels: { workspace_key: codexWorkspaceKey, outcome: "failed" },
+          });
+          observability.warn("Codex failover checkpoint failed; refusing automatic replay", {
+            workspaceId: input.workspaceId,
+            turnId,
+            errorName: checkpointError instanceof Error ? checkpointError.name : "unknown",
+          });
+        }
+
+        if (checkpointDurable) {
+          observability.incrementCounter({
+            name: "opengeni_codex_failover_checkpoints_total",
+            help: "Durable Codex failover checkpoint attempts by outcome.",
+            labels: { workspace_key: codexWorkspaceKey, outcome: "completed" },
+          });
+          const now = new Date();
+          const before = await listCodexAccountStatuses(db, input.workspaceId).catch(() => []);
+          const servingCached = before.find(
+            (account) => account.id === effectiveCodexCredentialId,
+          );
+          const usageSnapshot = latestCodexUsage as CodexUsageHeaderSnapshot | null;
+          const serving = servingCached
+            ? {
+                ...servingCached,
+                ...(usageSnapshot
+                  ? {
+                      primaryUsedPercent: usageSnapshot.primaryUsedPercent,
+                      primaryResetAt: usageSnapshot.primaryResetAt,
+                      secondaryUsedPercent: usageSnapshot.secondaryUsedPercent,
+                      secondaryResetAt: usageSnapshot.secondaryResetAt,
+                    }
+                  : {}),
+              }
+            : null;
+          const cooldownUntil = codexCredentialCooldownUntil(
+            codexCredentialFailure,
+            serving,
+            settings.codexRotationNearExhaustionPct,
+            now,
+          );
+          const statePersisted =
+            codexCredentialFailure.kind === "auth"
+              ? await setCodexCredentialStatusById(
+                  db,
+                  input.workspaceId,
+                  effectiveCodexCredentialId,
+                  "needs_relogin",
+                  "model request remained unauthorized after refresh",
+                ).catch(() => false)
+              : codexCredentialFailure.kind === "forbidden"
+                ? await setCodexCredentialStatusById(
+                    db,
+                    input.workspaceId,
+                    effectiveCodexCredentialId,
+                    "error",
+                    "model request was forbidden for this credential",
+                  ).catch(() => false)
+                : await setCodexCredentialExhausted(
+                    db,
+                    input.workspaceId,
+                    effectiveCodexCredentialId,
+                    cooldownUntil,
+                  ).catch(() => false);
+          const [rotation, accounts] = await Promise.all([
+            getCodexRotationSettings(db, input.workspaceId).catch(() => null),
+            listCodexAccountStatuses(db, input.workspaceId).catch(() => []),
+          ]);
+          const decision = rotation
+            ? chooseRotationActive({
+                rotationStrategy: rotation.rotationStrategy as CodexRotationStrategy,
+                activeCredentialId: rotation.activeCredentialId,
+                priorCredentialId: effectiveCodexCredentialId,
+                accounts,
+                nearExhaustionPct: settings.codexRotationNearExhaustionPct,
+                now: new Date(),
+                usedConnectors: serving?.connectorNamespaces ?? [],
+              })
+            : ({ kind: "none" } as const);
+          const candidateAvailable =
+            statePersisted &&
+            Boolean(rotation?.rotationEnabled || rotation?.leaseRotationEnabled) &&
+            decision.kind === "active" &&
+            decision.credentialId !== effectiveCodexCredentialId;
+
+          if (
+            candidateAvailable &&
+            codexLeaseHolderId &&
+            codexLeaseGeneration !== null
+          ) {
+            let resumeWithNotice =
+              settings.sessionHistorySource === "items" &&
+              persistedHistoryCount > historyCountAtTurnStart;
+            let resumeCheckpointDurable = true;
+            if (settings.sessionHistorySource !== "items" && stream) {
+              try {
+                await saveRunState(db, {
+                  accountId: input.accountId,
+                  workspaceId: input.workspaceId,
+                  sessionId: input.sessionId,
+                  turnId,
+                  serializedRunState: stream.state.toString(),
+                  pendingApprovals: runtime.serializeApprovals(stream.interruptions ?? []),
+                  frozenCodexCredentialId: effectiveCodexCredentialId,
+                });
+                resumeWithNotice = true;
+              } catch {
+                resumeCheckpointDurable = false;
+              }
+            }
+            if (resumeCheckpointDurable) {
+              try {
+                const settlement = await settleCodexCredentialFailover(db, {
+                  accountId: input.accountId,
+                  workspaceId: input.workspaceId,
+                  sessionId: input.sessionId,
+                  turnId,
+                  originalTriggerEventId: input.triggerEventId,
+                  holderId: codexLeaseHolderId,
+                  generation: codexLeaseGeneration,
+                  maxFailovers: Math.max(1, accounts.length),
+                  resumeWithNotice,
+                  preemptedPayload: {
+                    triggerEventId: input.triggerEventId,
+                    reason: "codex_credential_failover",
+                    credentialId: effectiveCodexCredentialId,
+                    failureKind: codexCredentialFailure.kind,
+                    resumeWithNotice,
+                    ...(cooldownUntil ? { cooldownUntil: cooldownUntil.toISOString() } : {}),
+                    ...(resumeWithNotice ? { text: CODEX_ROTATION_RESUME_TEXT } : {}),
+                  },
+                });
+                if (settlement.action === "requeued") {
+                  codexLeaseHeld = false;
+                  observability.incrementCounter({
+                    name: "opengeni_codex_failover_settlements_total",
+                    help: "Atomic Codex failover settlements by outcome.",
+                    labels: { workspace_key: codexWorkspaceKey, outcome: "requeued" },
+                  });
+                  try {
+                    await bus.publish(input.workspaceId, input.sessionId, settlement.events);
+                  } catch {
+                    // Events are durable; SSE replay/gap fill recovers live fan-out.
+                  }
+                  observability.observeHistogram({
+                    name: "opengeni_codex_failover_recovery_seconds",
+                    help: "Time from credential refusal to durable same-turn requeue.",
+                    labels: {
+                      workspace_key: codexWorkspaceKey,
+                      kind: codexCredentialFailure.kind,
+                    },
+                    value: Math.max(0, (performance.now() - failoverStartedAt) / 1000),
+                  });
+                  activityStatus = "preempted";
+                  turnMetricOutcome = "preempted";
+                  return { status: "preempted" };
+                }
+                if (settlement.action === "stale") {
+                  codexLeaseHeld = false;
+                  observability.incrementCounter({
+                    name: "opengeni_codex_failover_settlements_total",
+                    help: "Atomic Codex failover settlements by outcome.",
+                    labels: { workspace_key: codexWorkspaceKey, outcome: "stale" },
+                  });
+                  activityStatus = "preempted";
+                  turnMetricOutcome = "preempted";
+                  return { status: "preempted" };
+                }
+              } catch (failoverError) {
+                observability.incrementCounter({
+                  name: "opengeni_codex_failover_settlements_total",
+                  help: "Atomic Codex failover settlements by outcome.",
+                  labels: { workspace_key: codexWorkspaceKey, outcome: "failed" },
+                });
+                console.error("Codex credential failover settlement failed", failoverError);
+              }
+            }
+          }
+        }
+      }
       // A ChatGPT/Codex usage cap (429 usage_limit_reached) is account state,
       // NOT an agent failure: surface the precise, actionable message (so the
       // user sees the reset window) but idle the session — never go terminal,
@@ -3615,21 +3876,9 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             getCodexRotationSettings(db, input.workspaceId).catch(() => null),
             getSessionCodexState(db, input.workspaceId, input.sessionId).catch(() => null),
           ]);
-          // AM-1: a MANUAL pin is sacred and never rebalances; classic rotation runs for
-          // UNPINNED sessions; the sharded strategy ALSO rebalances a POLICY-pinned session
-          // (re-shard its home off the capped account). manual pin ⇒ today's idle-until-reset.
-          // A stale policy pin was already cleared by the proactive seam this turn, so by
-          // here it reads UNPINNED and takes the classic path.
-          const reactiveStrategy = (rotation?.rotationStrategy ??
-            "most_remaining") as CodexRotationStrategy;
-          const reactiveDisposition = classifyCodexPin({
-            pinnedCredentialId: sessionCodex?.pinnedCredentialId ?? null,
-            pinSource: sessionCodex?.pinSource ?? null,
-            strategy: reactiveStrategy,
-            rotationEnabled: Boolean(rotation?.rotationEnabled),
-          });
-          const reactiveSharded = reactiveDisposition === "sharded";
-          const rotating = Boolean(rotation?.rotationEnabled) && reactiveDisposition !== "manual";
+          const rotating =
+            Boolean(rotation?.rotationEnabled || rotation?.leaseRotationEnabled) &&
+            sessionCodex?.pinnedCredentialId == null;
           if (rotating && rotation) {
             const accounts = await listCodexAccountStatuses(db, input.workspaceId).catch(() => []);
             const serving = accounts.find((a) => a.id === effectiveCodexCredentialId) ?? null;
@@ -3934,6 +4183,13 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       if (!publish || !turnId || !turnStartedPublished) {
         throw error;
       }
+      // A partial/malformed stream may have emitted assistant/tool items (and
+      // external side effects) before its terminal error. Persist every item the
+      // SDK state observed before marking the turn failed so a later user revive
+      // never replays work from an incomplete history. This does not retry or
+      // rotate the ambiguous request.
+      await flushRuntimeBatcher();
+      await reconcileConversationTruth();
       await publish(
         [
           { type: "turn.failed", payload: failure },
@@ -3976,6 +4232,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
           "opengeni.variable_set_id": variableSetId,
           "opengeni.rig_id": rigId,
           "opengeni.rig_version_id": rigVersionId,
+          "opengeni.codex_credential_id": effectiveCodexCredentialId ?? "",
           "opengeni.duration_ms": Math.round(durationSeconds * 1000),
         },
         error: activityError,
@@ -4020,6 +4277,26 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             ...connectorNamespaces,
           ]).catch(() => undefined);
         }
+      }
+      if (codexLeaseHeartbeatTimer) {
+        clearInterval(codexLeaseHeartbeatTimer);
+        codexLeaseHeartbeatTimer = undefined;
+      }
+      if (
+        codexLeaseHeld &&
+        turnId &&
+        codexLeaseHolderId &&
+        codexLeaseGeneration !== null
+      ) {
+        await releaseCodexCredentialLease(
+          db,
+          input.accountId,
+          input.workspaceId,
+          turnId,
+          codexLeaseHolderId,
+          codexLeaseGeneration,
+        ).catch(() => undefined);
+        codexLeaseHeld = false;
       }
       // Workbench v2 turn-end workspace capture (dossier §10.1) — runs FIRST in
       // the turn-end finally, while the box is MAXIMALLY ALIVE. The agent's last
@@ -4280,6 +4557,111 @@ export function agentRunFailurePayload(error: unknown): {
     return { error: message, code: "provider_unavailable", retryable: true };
   }
   return { error: message };
+}
+
+export type CodexCredentialFailure = {
+  kind: "auth" | "forbidden" | "rate_limit" | "quota";
+  cooldownSeconds: number | null;
+};
+
+export const CODEX_ALLOWANCE_FALLBACK_MS = 5 * 60 * 60_000;
+
+/**
+ * Resolve a deterministic quarantine end. Provider retry-after wins. Generic
+ * request throttling gets a minute; allowance/quota refusal waits for the LAST
+ * still-blocking cached window (five-hour and weekly both bind), falling back to
+ * one complete five-hour window when the provider supplied no reset metadata.
+ */
+export function codexCredentialCooldownUntil(
+  failure: CodexCredentialFailure,
+  account: Pick<
+    CodexAccountStatus,
+    "primaryUsedPercent" | "primaryResetAt" | "secondaryUsedPercent" | "secondaryResetAt"
+  > | null,
+  nearExhaustionPct: number,
+  now: Date,
+): Date | null {
+  if (failure.kind === "auth" || failure.kind === "forbidden") {
+    return null;
+  }
+  if (
+    failure.cooldownSeconds !== null &&
+    Number.isFinite(failure.cooldownSeconds) &&
+    failure.cooldownSeconds > 0
+  ) {
+    return new Date(now.getTime() + Math.ceil(failure.cooldownSeconds) * 1000);
+  }
+  if (failure.kind === "rate_limit") {
+    return new Date(now.getTime() + PROVIDER_BACKPRESSURE_DELAY_MS);
+  }
+  const blockingResets = account
+    ? [
+        { used: account.primaryUsedPercent, reset: account.primaryResetAt },
+        { used: account.secondaryUsedPercent, reset: account.secondaryResetAt },
+      ]
+        .filter(
+          (window): window is { used: number; reset: Date } =>
+            (window.used ?? 0) >= nearExhaustionPct &&
+            window.reset instanceof Date &&
+            window.reset.getTime() > now.getTime(),
+        )
+        .map((window) => window.reset)
+    : [];
+  if (blockingResets.length === 0) {
+    return new Date(now.getTime() + CODEX_ALLOWANCE_FALLBACK_MS);
+  }
+  return blockingResets.reduce((latest, reset) =>
+    reset.getTime() > latest.getTime() ? reset : latest,
+  );
+}
+
+/**
+ * Only definitive credential/account refusals are safe rotation signals.
+ * Ambiguous network failures, malformed/partial streams, invalid model content,
+ * prompt 4xx, and provider 5xx may already have consumed tokens or persisted
+ * progress and therefore MUST NOT walk the credential pool automatically.
+ */
+export function classifyCodexCredentialFailure(error: unknown): CodexCredentialFailure | null {
+  const usageLimit = classifyCodexUsageLimitError(error);
+  if (usageLimit) {
+    return { kind: "quota", cooldownSeconds: usageLimit.resetsInSeconds };
+  }
+  let cur: unknown = error;
+  for (let depth = 0; depth < 6 && cur && typeof cur === "object"; depth++) {
+    const value = cur as Record<string, unknown>;
+    const body =
+      value.error && typeof value.error === "object"
+        ? (value.error as Record<string, unknown>)
+        : null;
+    const status = Number(value.status ?? body?.status);
+    const code = String(value.code ?? body?.code ?? "").toLowerCase();
+    const retryAfter = Number(
+      value.retry_after_seconds ?? body?.retry_after_seconds ?? value.retryAfterSeconds,
+    );
+    const cooldownSeconds =
+      Number.isFinite(retryAfter) && retryAfter > 0 ? Math.ceil(retryAfter) : null;
+    // Provider quota codes are more specific than their HTTP transport status.
+    // A permanent allowance refusal commonly arrives as HTTP 429; classify it
+    // before generic backpressure so it receives the binding-window cooldown.
+    if (
+      code === "insufficient_quota" ||
+      code === "quota_exceeded" ||
+      code === "billing_hard_limit_reached"
+    ) {
+      return { kind: "quota", cooldownSeconds };
+    }
+    if (status === 401 || code === "unauthorized" || code === "invalid_api_key") {
+      return { kind: "auth", cooldownSeconds };
+    }
+    if (status === 403) {
+      return { kind: "forbidden", cooldownSeconds };
+    }
+    if (status === 429 || code === "rate_limit_exceeded" || code === "too_many_requests") {
+      return { kind: "rate_limit", cooldownSeconds };
+    }
+    cur = value.cause;
+  }
+  return null;
 }
 
 /** Humanize a seconds duration into a short "2h 5m" / "9m" / "in under a minute" string. */

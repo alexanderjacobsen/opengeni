@@ -151,7 +151,12 @@ export function codexSubscriptionFetch(base: FetchLike = globalThis.fetch): Fetc
         ctx.onUsageHeaders?.(usage);
       }
       if (process.env.CODEX_DEBUG && !res.ok) {
-        console.error(`[codex-debug] <- ${res.status} ${await res.clone().text()}`);
+        // Never log provider bodies: they can contain request-derived content or
+        // account details. Status + request id is sufficient to correlate with
+        // the structured worker failure telemetry.
+        console.error(
+          `[codex-debug] <- ${res.status} requestId=${res.headers.get("x-request-id") ?? "unknown"}`,
+        );
       }
       // The codex backend leaves the terminal event's response.output empty and
       // delivers the assistant items via output_item.done events instead. The

@@ -48,6 +48,16 @@ the completed tool call/full turn is never blindly replayed. Budget/credit
 exhaustion likewise idles the turn rather than failing the session, so a top-up
 lets the same session continue.
 
+Codex-subscription turns add one explicit recovery boundary before the model
+run. With workspace-local leasing enabled, the worker atomically selects and
+leases a credential under the workspace rotation-row lock; concurrent replicas
+therefore observe earlier reservations. A second 401, 403, explicit quota, or
+429 can quarantine that credential and requeue the same durable turn after a
+conversation-truth checkpoint. Network/5xx/invalid-content/partial-stream
+failures never rotate or blindly replay. The allocator, strict workspace scope,
+five-hour reset semantics, and rollout fence are canonical in
+[`codex-subscription-rotation.md`](codex-subscription-rotation.md).
+
 Provider context-window overflow is also handled inside the activity, not by a
 Temporal retry. When an OpenAI/Azure context overflow is classified,
 `runAgentTurn` forces client-side compaction through a bounded recovery

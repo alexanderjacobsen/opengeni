@@ -236,6 +236,11 @@ export const codexSubscriptionCredentials = pgTable(
     // can't false-drop coverage. connectorsCheckedAt is the freshness clock.
     connectorNamespaces: text("connector_namespaces").array(),
     connectorsCheckedAt: timestamp("connectors_checked_at", { withTimezone: true }),
+    // Workspace-local, server-held fairness cursor. Provider usage headers are
+    // capacity hints, never the sole allocator: live lease count is ranked first
+    // and this cursor deterministically breaks equal-load/equal-capacity ties.
+    selectionCount: integer("selection_count").notNull().default(0),
+    lastSelectedAt: timestamp("last_selected_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -248,6 +253,12 @@ export const codexSubscriptionCredentials = pgTable(
       .on(table.workspaceId, table.chatgptAccountId)
       .where(sql`${table.chatgptAccountId} is not null`),
     workspace: index("codex_subscription_credentials_workspace_lookup_idx").on(table.workspaceId),
+    // Composite identity is the defense-in-depth FK target for workspace-local
+    // lease references in migration 0049.
+    workspaceIdentity: uniqueIndex("codex_subscription_credentials_workspace_id_idx").on(
+      table.workspaceId,
+      table.id,
+    ),
   }),
 );
 
@@ -364,13 +375,60 @@ export const codexRotationSettings = pgTable(
       .notNull()
       .references(() => workspaces.id, { onDelete: "cascade" }),
     activeCredentialId: uuid("active_credential_id"),
-    rotationEnabled: boolean("rotation_enabled").notNull().default(false), // P3, inert in P1
+    // Legacy selector bit. Keep false as the DB default forever: an old worker
+    // only understands this column, so a schema-first rollout or binary
+    // rollback must never make it enter the non-atomic rotation path.
+    rotationEnabled: boolean("rotation_enabled").notNull().default(false),
+    // Revision-aware allocator default. Only migration-compatible API/worker
+    // code reads this bit; old binaries safely ignore it and remain sticky.
+    leaseRotationEnabled: boolean("lease_rotation_enabled").notNull().default(false),
     rotationStrategy: text("rotation_strategy").notNull().default("most_remaining"), // P3, inert
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
     workspace: uniqueIndex("codex_rotation_settings_workspace_idx").on(table.workspaceId),
+  }),
+);
+
+// One workspace-local short-lived holder per running Codex turn. Selection and
+// insertion happen atomically while codex_rotation_settings is locked FOR
+// UPDATE, so concurrent replicas in the SAME workspace see one another's
+// assignments before choosing. Workspaces never share or correlate lease state.
+// The turn and composite (workspace, credential) FKs are declared in migration
+// 0049 (sessionTurns is defined later in this module).
+export const codexCredentialLeases = pgTable(
+  "codex_credential_leases",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    accountId: uuid("account_id")
+      .notNull()
+      .references(() => managedAccounts.id, { onDelete: "cascade" }),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    credentialId: uuid("credential_id").notNull(),
+    turnId: uuid("turn_id").notNull(),
+    // Temporal activity execution fence. A successor dispatch for the same
+    // durable turn replaces holderId and increments generation atomically;
+    // stale/zombie heartbeats and releases must match both values.
+    holderId: text("holder_id").notNull(),
+    generation: integer("generation").notNull().default(1),
+    leasedUntil: timestamp("leased_until", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    turn: uniqueIndex("codex_credential_leases_workspace_turn_idx").on(
+      table.workspaceId,
+      table.turnId,
+    ),
+    activeCredential: index("codex_credential_leases_active_credential_idx").on(
+      table.workspaceId,
+      table.credentialId,
+      table.leasedUntil,
+    ),
+    expiry: index("codex_credential_leases_expiry_idx").on(table.leasedUntil),
   }),
 );
 
@@ -832,6 +890,10 @@ export const sessionTurns = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    workspaceIdentity: uniqueIndex("session_turns_workspace_id_idx").on(
+      table.workspaceId,
+      table.id,
+    ),
     queue: index("session_turns_workspace_queue_idx").on(
       table.workspaceId,
       table.sessionId,

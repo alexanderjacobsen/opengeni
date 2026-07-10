@@ -37,6 +37,7 @@ import {
   loadCodexCredentialForRun,
   renameCodexAccount,
   setActiveCodexCredential,
+  setInitialActiveCodexCredential,
   updateCodexRotationSettings,
   upsertCodexSubscriptionCredential,
   CODEX_ROTATION_STRATEGIES,
@@ -235,12 +236,16 @@ export function registerCodexRoutes(app: Hono, deps: ApiRouteDeps): void {
     // the FIRST account only. Additional new accounts do NOT auto-activate — a
     // manual switch is required (no auto-rotation in P1). A re-connect of the
     // already-active account is a no-op for the pointer.
-    await ensureCodexRotationSettings(db, grant.accountId, workspaceId);
+    await ensureCodexRotationSettings(db, grant.accountId, workspaceId, {
+      // This column is invisible to legacy binaries. It is set only by a
+      // migration-compatible API revision after the deployment flag is enabled,
+      // so schema-first rollout and binary rollback remain safe.
+      leaseRotationEnabled: settings.codexCredentialLeasingEnabled,
+    });
     const rotation = await getCodexRotationSettings(db, workspaceId);
     let isActive = rotation?.activeCredentialId === upserted.id;
     if (!isActive && rotation?.activeCredentialId == null) {
-      await setActiveCodexCredential(db, workspaceId, upserted.id);
-      isActive = true;
+      isActive = await setInitialActiveCodexCredential(db, workspaceId, upserted.id);
     }
     return c.json({ status: "connected", plan: id.planType, accountId: upserted.id, isActive });
   });
@@ -318,7 +323,11 @@ export function registerCodexRoutes(app: Hono, deps: ApiRouteDeps): void {
       accounts: accounts.map(codexAccountJson),
       activeAccountId,
       settings: {
-        rotationEnabled: rotation?.rotationEnabled ?? false,
+        rotationEnabled:
+          rotation == null
+            ? false
+            : rotation.rotationEnabled ||
+              (settings.codexCredentialLeasingEnabled && rotation.leaseRotationEnabled),
         rotationStrategy: rotation?.rotationStrategy ?? "most_remaining",
         activeCredentialId: activeAccountId,
       },
@@ -366,7 +375,9 @@ export function registerCodexRoutes(app: Hono, deps: ApiRouteDeps): void {
       throw new HTTPException(404, { message: "codex rotation settings not found" });
     }
     return c.json({
-      rotationEnabled: updated.rotationEnabled,
+      rotationEnabled:
+        updated.rotationEnabled ||
+        (settings.codexCredentialLeasingEnabled && updated.leaseRotationEnabled),
       rotationStrategy: updated.rotationStrategy,
       activeCredentialId: updated.activeCredentialId,
     });

@@ -491,7 +491,10 @@ export function buildProviderClient(provider: ResolvedModelProvider, settings: S
         new OpenAI({
           apiKey: provider.apiKey ?? "codex-subscription",
           ...(provider.baseUrl ? { baseURL: provider.baseUrl } : {}),
-          maxRetries: settings.openaiMaxRetries,
+          // Codex transport owns exactly one explicit 401 refresh/retry. Blind
+          // SDK retries on network/5xx/partial streams can replay provider work
+          // or external tool side effects without a durable checkpoint.
+          maxRetries: 0,
           fetch: codexSubscriptionFetch(instrumentedModelFetch(provider.id, globalThis.fetch)),
         })
       : // ResolvedModelProvider.apiKey is already the resolved key (configuredProviders

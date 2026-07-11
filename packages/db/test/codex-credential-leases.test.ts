@@ -412,10 +412,35 @@ describe("OPE-21 atomic Codex credential allocation", () => {
       update session_turns
       set metadata = jsonb_build_object(
         'codexCredentialPolicyHash', 'policy-v1',
-        'privateAcceptedScope', jsonb_build_object('primaryPoolId', 'pool-a')
+        'privateAcceptedScope', jsonb_build_object(
+          'primaryPoolId', 'pool-a',
+          'fallbackPoolIds', jsonb_build_array('pool-b')
+        )
       )
       where id = ${inFlightTurn}`;
-    type PrivateAcceptedScope = { primaryPoolId: string; policyHash: string };
+    type PrivateAcceptedScope = {
+      primaryPoolId: string;
+      fallbackPoolIds: string[];
+      policyHash: string;
+    };
+    const resolvePrivateAcceptedScope = (
+      metadata: Readonly<Record<string, unknown>>,
+    ): PrivateAcceptedScope | null => {
+      const scope = metadata.privateAcceptedScope as
+        | { primaryPoolId?: unknown; fallbackPoolIds?: unknown }
+        | undefined;
+      const policyHash = metadata.codexCredentialPolicyHash;
+      return typeof scope?.primaryPoolId === "string" &&
+        Array.isArray(scope.fallbackPoolIds) &&
+        scope.fallbackPoolIds.every((id): id is string => typeof id === "string") &&
+        typeof policyHash === "string"
+        ? {
+            primaryPoolId: scope.primaryPoolId,
+            fallbackPoolIds: scope.fallbackPoolIds,
+            policyHash,
+          }
+        : null;
+    };
     const observedScopes: PrivateAcceptedScope[] = [];
     let membershipFilterCalls = 0;
     const resumedInFlight = await acquireCodexCredentialLease<
@@ -429,13 +454,7 @@ describe("OPE-21 atomic Codex credential allocation", () => {
         turnId: inFlightTurn,
         holderId: "temporary-disable-live-resume",
         advanceActivePointer: true,
-        resolvePolicyScope: (metadata) => {
-          const scope = metadata.privateAcceptedScope as { primaryPoolId?: unknown } | undefined;
-          const policyHash = metadata.codexCredentialPolicyHash;
-          return typeof scope?.primaryPoolId === "string" && typeof policyHash === "string"
-            ? { primaryPoolId: scope.primaryPoolId, policyHash }
-            : null;
-        },
+        resolvePolicyScope: resolvePrivateAcceptedScope,
         filterNewAllocationCandidates: ({ accounts, policyScope }) => {
           membershipFilterCalls += 1;
           if (policyScope) observedScopes.push(policyScope);
@@ -450,7 +469,13 @@ describe("OPE-21 atomic Codex credential allocation", () => {
     expect(resumedInFlight.credentialId).toBe(toggledCredential);
     expect(resumedInFlight.reused).toBe(true);
     expect(resumedInFlight.generation).toBeGreaterThan(inFlight.generation!);
-    expect(observedScopes).toEqual([{ primaryPoolId: "pool-a", policyHash: "policy-v1" }]);
+    expect(observedScopes).toEqual([
+      {
+        primaryPoolId: "pool-a",
+        fallbackPoolIds: ["pool-b"],
+        policyHash: "policy-v1",
+      },
+    ]);
     expect(membershipFilterCalls).toBe(0);
     expect(
       await releaseCodexCredentialLease(
@@ -460,6 +485,80 @@ describe("OPE-21 atomic Codex credential allocation", () => {
         inFlightTurn,
         resumedInFlight.holderId!,
         resumedInFlight.generation!,
+      ),
+    ).toBe(true);
+
+    // A NEW acquisition may select one primary/fallback scope and return
+    // downstream-owned per-pool diagnostics. The selector sees only the chosen
+    // pool's candidates, so primary and fallback memberships are never union-ranked.
+    const scopedTurn = await seedTurn(ws!, 20);
+    await admin`
+      update session_turns
+      set metadata = jsonb_build_object(
+        'codexCredentialPolicyHash', 'policy-v3',
+        'privateAcceptedScope', jsonb_build_object(
+          'primaryPoolId', 'pool-empty',
+          'fallbackPoolIds', jsonb_build_array('pool-b')
+        )
+      )
+      where id = ${scopedTurn}`;
+    type PrivatePoolDiagnostic = {
+      poolId: string;
+      reason: "unavailable";
+      earliestResetAt: string | null;
+      resetKnown: boolean;
+    };
+    const scoped = await acquireCodexCredentialLease<
+      RotationDecision,
+      PrivateAcceptedScope,
+      PrivatePoolDiagnostic
+    >(
+      dbA,
+      {
+        accountId: ws!.accountId,
+        workspaceId: ws!.workspaceId,
+        turnId: scopedTurn,
+        holderId: "private-scope-new-acquisition",
+        advanceActivePointer: true,
+        resolvePolicyScope: resolvePrivateAcceptedScope,
+        filterNewAllocationCandidates: ({ accounts, policyScope }) => ({
+          // OPE-32 privately resolves primary then fallbacks; OPE-21 receives
+          // only the chosen scope's rows and does not understand pool ids.
+          accounts: accounts.filter((account) => account.id === alternateCredential),
+          unavailableDiagnostics: [
+            {
+              poolId: policyScope?.primaryPoolId ?? "unknown",
+              reason: "unavailable",
+              earliestResetAt: null,
+              resetKnown: false,
+            },
+          ],
+        }),
+      },
+      (context) =>
+        selector({
+          ...context,
+          policyScope: null,
+          unavailableDiagnostics: [],
+        }),
+    );
+    expect(scoped.credentialId).toBe(alternateCredential);
+    expect(scoped.unavailableDiagnostics).toEqual([
+      {
+        poolId: "pool-empty",
+        reason: "unavailable",
+        earliestResetAt: null,
+        resetKnown: false,
+      },
+    ]);
+    expect(
+      await releaseCodexCredentialLease(
+        dbA,
+        ws!.accountId,
+        ws!.workspaceId,
+        scopedTurn,
+        scoped.holderId!,
+        scoped.generation!,
       ),
     ).toBe(true);
 
@@ -515,7 +614,10 @@ describe("OPE-21 atomic Codex credential allocation", () => {
       update session_turns
       set metadata = jsonb_build_object(
         'codexCredentialPolicyHash', 'policy-v2',
-        'privateAcceptedScope', jsonb_build_object('primaryPoolId', 'pool-b')
+        'privateAcceptedScope', jsonb_build_object(
+          'primaryPoolId', 'pool-b',
+          'fallbackPoolIds', jsonb_build_array()
+        )
       )
       where id = ${frozenTurn}`;
     let frozenFilterCalls = 0;
@@ -528,13 +630,7 @@ describe("OPE-21 atomic Codex credential allocation", () => {
         holderId: "temporary-disable-frozen-resume",
         advanceActivePointer: true,
         continuationCredentialId: toggledCredential,
-        resolvePolicyScope: (metadata) => {
-          const scope = metadata.privateAcceptedScope as { primaryPoolId?: unknown } | undefined;
-          const policyHash = metadata.codexCredentialPolicyHash;
-          return typeof scope?.primaryPoolId === "string" && typeof policyHash === "string"
-            ? { primaryPoolId: scope.primaryPoolId, policyHash }
-            : null;
-        },
+        resolvePolicyScope: resolvePrivateAcceptedScope,
         filterNewAllocationCandidates: ({ accounts }) => {
           frozenFilterCalls += 1;
           return accounts.filter((account) => account.id === alternateCredential);
@@ -544,6 +640,8 @@ describe("OPE-21 atomic Codex credential allocation", () => {
         selectCodexCredentialLeaseForTurn({
           context: { ...context, policyScope: null },
           leasingEnabled: true,
+          sessionId: "session-test",
+          sessionPinSource: null,
           sessionPinnedCredentialId: null,
           sessionLastCredentialId: toggledCredential,
           continuationCredentialId: toggledCredential,

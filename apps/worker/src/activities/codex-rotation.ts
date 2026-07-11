@@ -6,11 +6,11 @@
 // `selectCodexCredentialForTurn` precedence gate (pin > active). Keeping the
 // decision pure makes the whole rotation correctness story unit-testable in
 // isolation (see codex-rotation.test.ts).
-import type { CodexAccountStatus, CodexPinSource } from "@opengeni/db";
 import type {
   CodexAccountStatus,
   CodexCredentialLeaseSelectionContext,
   CodexLeaseAccountStatus,
+  CodexPinSource,
 } from "@opengeni/db";
 
 export type CodexRotationAccount = CodexAccountStatus | CodexLeaseAccountStatus;
@@ -83,6 +83,8 @@ export type RotationDecision =
 export type CodexTurnLeaseSelection = {
   credentialId: string | null;
   decision: RotationDecision;
+  /** Policy/manual homes never move the workspace-global legacy pointer. */
+  advanceActivePointer?: boolean;
 };
 
 // Invariant 4 (NO THRASH / BOUNDED) safety floors. An all-capped idle MUST be a
@@ -202,11 +204,11 @@ export function isCodexCredentialEligible(
  * a valid home or must be re-sharded.
  */
 export function isCodexAccountEligible(
-  acct: CodexAccountStatus,
+  acct: CodexRotationAccount,
   nearExhaustionPct: number,
   now: Date,
 ): boolean {
-  return eligible(acct, nearExhaustionPct, now);
+  return isCodexCredentialEligible(acct, nearExhaustionPct, now);
 }
 
 /** Deterministic 32-bit FNV-1a over a UTF-16 code-unit stream. Pure, allocation-free. */
@@ -241,12 +243,14 @@ function fnv1a32(input: string): number {
  */
 export function shardCredentialForSession(args: {
   sessionId: string;
-  accounts: CodexAccountStatus[];
+  accounts: CodexRotationAccount[];
   nearExhaustionPct: number;
   now: Date;
 }): string | null {
   const { sessionId, accounts, nearExhaustionPct, now } = args;
-  const eligibles = accounts.filter((acct) => eligible(acct, nearExhaustionPct, now));
+  const eligibles = accounts.filter((acct) =>
+    isCodexCredentialEligible(acct, nearExhaustionPct, now),
+  );
   if (eligibles.length === 0) {
     return null;
   }
@@ -256,7 +260,7 @@ export function shardCredentialForSession(args: {
 
 /** earliestResetAt across ALL connected accounts — exported for the sharded all-capped idle. */
 export function earliestCodexReset(
-  accounts: CodexAccountStatus[],
+  accounts: CodexRotationAccount[],
   nearExhaustionPct: number,
   now: Date,
 ): Date {
@@ -283,7 +287,7 @@ export function earliestCodexReset(
 export function chooseShardedHome(args: {
   sessionId: string;
   currentPolicyPin: string | null;
-  accounts: CodexAccountStatus[];
+  accounts: CodexRotationAccount[];
   nearExhaustionPct: number;
   now: Date;
 }):
@@ -293,7 +297,7 @@ export function chooseShardedHome(args: {
   const pinRow = currentPolicyPin
     ? (accounts.find((acct) => acct.id === currentPolicyPin) ?? null)
     : null;
-  if (pinRow && eligible(pinRow, nearExhaustionPct, now)) {
+  if (pinRow && isCodexCredentialEligible(pinRow, nearExhaustionPct, now)) {
     return { kind: "home", credentialId: currentPolicyPin!, rewritePin: false };
   }
   const home = shardCredentialForSession({ sessionId, accounts, nearExhaustionPct, now });
@@ -612,7 +616,7 @@ export function chooseRotationActive(args: {
 }
 
 /**
- * Exact pre-0049 selector used while the lease cutover is off.
+ * Exact pre-0053 selector used while the lease cutover is off.
  *
  * Old workers keep a healthy `most_remaining` active pointer sticky and know
  * nothing about lease counts or fairness cursors. A compatible worker must do
@@ -652,7 +656,9 @@ export function chooseLegacyRotationActive(
 export function selectCodexCredentialLeaseForTurn(args: {
   context: CodexCredentialLeaseSelectionContext;
   leasingEnabled: boolean;
+  sessionId: string;
   sessionPinnedCredentialId: string | null;
+  sessionPinSource: CodexPinSource | null;
   sessionLastCredentialId: string | null;
   /** Same-turn checkpoint/frozen account; temporary disable cannot move it. */
   continuationCredentialId?: string | null;
@@ -668,12 +674,14 @@ export function selectCodexCredentialLeaseForTurn(args: {
     existingCredentialId,
   } = args.context;
   const leasingEnabled = args.leasingEnabled && leaseRotationEnabled;
+  const strategy = rotationStrategy as CodexRotationStrategy;
   const existing = existingCredentialId
     ? accounts.find((account) => account.id === existingCredentialId)
     : undefined;
   if (existing && isCodexCredentialHealthy(existing, args.nearExhaustionPct, args.now)) {
     return {
       credentialId: existing.id,
+      advanceActivePointer: false,
       decision: {
         kind: "active",
         credentialId: existing.id,
@@ -688,6 +696,7 @@ export function selectCodexCredentialLeaseForTurn(args: {
   if (continuation && isCodexCredentialHealthy(continuation, args.nearExhaustionPct, args.now)) {
     return {
       credentialId: continuation.id,
+      advanceActivePointer: false,
       decision: {
         kind: "active",
         credentialId: continuation.id,
@@ -699,13 +708,78 @@ export function selectCodexCredentialLeaseForTurn(args: {
   const connectedIds = new Set(
     accounts.filter((account) => account.allocatorEnabled).map((account) => account.id),
   );
+
+  const pinDisposition = classifyCodexPin({
+    pinnedCredentialId: args.sessionPinnedCredentialId,
+    pinSource: args.sessionPinSource,
+    strategy,
+    rotationEnabled,
+  });
+
+  // A manual pin is user intent, not a policy hint. Never silently fail it over.
+  // We still reject allocator-disabled rows for a NEW turn; healthy live/frozen
+  // same-turn continuity already returned above before this admission filter.
+  if (pinDisposition === "manual" && args.sessionPinnedCredentialId) {
+    const pinned = accounts.find((account) => account.id === args.sessionPinnedCredentialId);
+    if (!pinned?.allocatorEnabled) {
+      return { credentialId: null, decision: { kind: "none" }, advanceActivePointer: false };
+    }
+    if (isCodexCredentialHealthy(pinned, args.nearExhaustionPct, args.now)) {
+      return {
+        credentialId: pinned.id,
+        decision: { kind: "active", credentialId: pinned.id, moved: false },
+        advanceActivePointer: false,
+      };
+    }
+    return {
+      credentialId: null,
+      decision: {
+        kind: "allCapped",
+        earliestResetAt: availableAt(pinned, args.nearExhaustionPct, args.now),
+      },
+      advanceActivePointer: false,
+    };
+  }
+
+  // OPE-31 policy homes compose with OPE-21 by sharding only the candidate list
+  // handed to this selector. A future OPE-32 filter may therefore choose one
+  // primary/fallback pool before this ranker runs; accounts from different pools
+  // are never union-ranked here.
+  if (pinDisposition === "sharded") {
+    if (accounts.length === 0) {
+      return { credentialId: null, decision: { kind: "none" }, advanceActivePointer: false };
+    }
+    const shard = chooseShardedHome({
+      sessionId: args.sessionId,
+      currentPolicyPin: args.sessionPinSource === "policy" ? args.sessionPinnedCredentialId : null,
+      accounts,
+      nearExhaustionPct: args.nearExhaustionPct,
+      now: args.now,
+    });
+    if (shard.kind === "allCapped") {
+      return {
+        credentialId: null,
+        decision: shard,
+        advanceActivePointer: false,
+      };
+    }
+    return {
+      credentialId: shard.credentialId,
+      decision: {
+        kind: "active",
+        credentialId: shard.credentialId,
+        moved: shard.credentialId !== activeCredentialId,
+      },
+      advanceActivePointer: false,
+    };
+  }
+
+  // A stale policy pin is intentionally ignored here and cleared by the caller
+  // after the atomic selection. Rotation-off/unpinned behavior otherwise keeps
+  // the pre-lease pin > active-pointer contract.
   if (!rotationEnabled) {
     const credentialId =
-      args.sessionPinnedCredentialId && connectedIds.has(args.sessionPinnedCredentialId)
-        ? args.sessionPinnedCredentialId
-        : activeCredentialId && connectedIds.has(activeCredentialId)
-          ? activeCredentialId
-          : null;
+      activeCredentialId && connectedIds.has(activeCredentialId) ? activeCredentialId : null;
     return {
       credentialId,
       decision: credentialId ? { kind: "active", credentialId, moved: false } : { kind: "none" },
@@ -716,7 +790,7 @@ export function selectCodexCredentialLeaseForTurn(args: {
   // switch is turned off), preserve the exact legacy policy used by old workers:
   // a pin stays sticky; otherwise an enabled workspace runs the pure legacy
   // rotation ranker without touching lease/cursor state.
-  if (!leasingEnabled && args.sessionPinnedCredentialId) {
+  if (!leasingEnabled && pinDisposition !== "clearStale" && args.sessionPinnedCredentialId) {
     const credentialId = connectedIds.has(args.sessionPinnedCredentialId)
       ? args.sessionPinnedCredentialId
       : activeCredentialId && connectedIds.has(activeCredentialId)
@@ -728,21 +802,10 @@ export function selectCodexCredentialLeaseForTurn(args: {
     };
   }
 
-  const pinned =
-    leasingEnabled && args.sessionPinnedCredentialId
-      ? accounts.find((account) => account.id === args.sessionPinnedCredentialId)
-      : undefined;
-  if (pinned && isCodexCredentialEligible(pinned, args.nearExhaustionPct, args.now)) {
-    return {
-      credentialId: pinned.id,
-      decision: { kind: "active", credentialId: pinned.id, moved: false },
-    };
-  }
-
   const priorId = args.sessionLastCredentialId ?? activeCredentialId;
   const choose = leasingEnabled ? chooseRotationActive : chooseLegacyRotationActive;
   const decision = choose({
-    rotationStrategy: rotationStrategy as CodexRotationStrategy,
+    rotationStrategy: strategy,
     activeCredentialId,
     // Per-session continuity is the round-robin/drain cursor. Falling back to
     // the workspace pointer is only correct when this session has never run.

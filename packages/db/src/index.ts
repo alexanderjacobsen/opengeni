@@ -7268,12 +7268,27 @@ export type CodexCredentialLeasePolicyScopeResolver<TPolicyScope> = (
   turnMetadata: Readonly<Record<string, unknown>>,
 ) => TPolicyScope | null;
 
-export type CodexCredentialLeaseCandidateFilter<TPolicyScope> = (input: {
+export type CodexCredentialLeaseCandidateFilterResult<TUnavailableDiagnostic = never> = {
+  /** Candidates from exactly one selected policy scope; never a union-ranked pool list. */
+  accounts: readonly CodexLeaseAccountStatus[];
+  /** Downstream-owned, secret-safe diagnostics for rejected primary/fallback scopes. */
+  unavailableDiagnostics?: readonly TUnavailableDiagnostic[];
+};
+
+export type CodexCredentialLeaseCandidateFilter<
+  TPolicyScope,
+  TUnavailableDiagnostic = never,
+> = (input: {
   accounts: readonly CodexLeaseAccountStatus[];
   policyScope: TPolicyScope | null;
-}) => readonly CodexLeaseAccountStatus[];
+}) =>
+  | readonly CodexLeaseAccountStatus[]
+  | CodexCredentialLeaseCandidateFilterResult<TUnavailableDiagnostic>;
 
-export type CodexCredentialLeaseSelectionContext<TPolicyScope = never> = {
+export type CodexCredentialLeaseSelectionContext<
+  TPolicyScope = never,
+  TUnavailableDiagnostic = never,
+> = {
   accounts: CodexLeaseAccountStatus[];
   activeCredentialId: string | null;
   rotationEnabled: boolean;
@@ -7284,14 +7299,18 @@ export type CodexCredentialLeaseSelectionContext<TPolicyScope = never> = {
   existingCredentialId: string | null;
   /** Downstream-owned accepted-turn policy; absent until a resolver is supplied. */
   policyScope: TPolicyScope | null;
+  /** Diagnostics produced while choosing one policy scope for this NEW allocation. */
+  unavailableDiagnostics: readonly TUnavailableDiagnostic[];
 };
 
 export type CodexCredentialLeaseSelection<T> = {
   credentialId: string | null;
   decision: T;
+  /** Optional selector veto for policy/manual homes that must not move the legacy pointer. */
+  advanceActivePointer?: boolean;
 };
 
-export type CodexCredentialLeaseResult<T> = {
+export type CodexCredentialLeaseResult<T, TUnavailableDiagnostic = never> = {
   decision: T;
   accounts: CodexLeaseAccountStatus[];
   activeCredentialId: string | null;
@@ -7302,6 +7321,9 @@ export type CodexCredentialLeaseResult<T> = {
   holderId: string | null;
   generation: number | null;
   leasedUntil: Date | null;
+  unavailableDiagnostics: readonly TUnavailableDiagnostic[];
+  /** Final selector decision after input policy and manual/policy pin handling. */
+  advanceActivePointer: boolean;
 };
 
 /**
@@ -7371,22 +7393,30 @@ function mapCodexLeaseCandidate(
   };
 }
 
-function filterCodexLeaseCandidatesForPolicy<TPolicyScope>(
+function filterCodexLeaseCandidatesForPolicy<TPolicyScope, TUnavailableDiagnostic>(
   accounts: CodexLeaseAccountStatus[],
   policyScope: TPolicyScope | null,
-  filter: CodexCredentialLeaseCandidateFilter<TPolicyScope> | undefined,
-): CodexLeaseAccountStatus[] {
+  filter: CodexCredentialLeaseCandidateFilter<TPolicyScope, TUnavailableDiagnostic> | undefined,
+): {
+  accounts: CodexLeaseAccountStatus[];
+  unavailableDiagnostics: readonly TUnavailableDiagnostic[];
+} {
   const filtered = filter?.({ accounts, policyScope });
-  if (!filtered) return accounts;
+  if (!filtered) return { accounts, unavailableDiagnostics: [] };
+  const structured = Array.isArray(filtered)
+    ? null
+    : (filtered as CodexCredentialLeaseCandidateFilterResult<TUnavailableDiagnostic>);
+  const filteredAccounts = structured?.accounts ?? (filtered as readonly CodexLeaseAccountStatus[]);
+  const unavailableDiagnostics = structured?.unavailableDiagnostics ?? [];
   const workspaceIds = new Set(accounts.map((account) => account.id));
   const filteredIds = new Set<string>();
-  for (const account of filtered) {
+  for (const account of filteredAccounts) {
     if (!workspaceIds.has(account.id) || filteredIds.has(account.id)) {
       throw new Error("Codex lease candidate filter returned a foreign or duplicate credential");
     }
     filteredIds.add(account.id);
   }
-  return [...filtered];
+  return { accounts: [...filteredAccounts], unavailableDiagnostics };
 }
 
 async function listCodexLeaseCandidatesInTransaction(
@@ -7450,7 +7480,11 @@ async function listCodexLeaseCandidatesInTransaction(
  * RLS-scoped candidate set before any write, closing a malicious/buggy callback
  * from naming another workspace's row.
  */
-export async function acquireCodexCredentialLease<T, TPolicyScope = never>(
+export async function acquireCodexCredentialLease<
+  T,
+  TPolicyScope = never,
+  TUnavailableDiagnostic = never,
+>(
   db: Database,
   input: {
     accountId: string;
@@ -7473,13 +7507,16 @@ export async function acquireCodexCredentialLease<T, TPolicyScope = never>(
      * lease or validated frozen credential is offered to the selector against
      * the complete workspace rows first and can never be filtered out here.
      */
-    filterNewAllocationCandidates?: CodexCredentialLeaseCandidateFilter<TPolicyScope>;
+    filterNewAllocationCandidates?: CodexCredentialLeaseCandidateFilter<
+      TPolicyScope,
+      TUnavailableDiagnostic
+    >;
     leaseTtlMs?: number;
   },
   select: (
-    context: CodexCredentialLeaseSelectionContext<TPolicyScope>,
+    context: CodexCredentialLeaseSelectionContext<TPolicyScope, TUnavailableDiagnostic>,
   ) => CodexCredentialLeaseSelection<T>,
-): Promise<CodexCredentialLeaseResult<T>> {
+): Promise<CodexCredentialLeaseResult<T, TUnavailableDiagnostic>> {
   const leaseTtlMs = input.leaseTtlMs ?? CODEX_CREDENTIAL_LEASE_TTL_MS;
   if (!Number.isFinite(leaseTtlMs) || leaseTtlMs <= 0) {
     throw new Error("Codex credential lease TTL must be positive");
@@ -7586,7 +7623,10 @@ export async function acquireCodexCredentialLease<T, TPolicyScope = never>(
         excludeTurnId: input.turnId,
       });
       const sameTurnCredentialId = existingCredentialId ?? validatedContinuationCredentialId;
-      const selectionContext = (accounts: CodexLeaseAccountStatus[]) => ({
+      const selectionContext = (
+        accounts: CodexLeaseAccountStatus[],
+        unavailableDiagnostics: readonly TUnavailableDiagnostic[],
+      ) => ({
         accounts,
         activeCredentialId,
         rotationEnabled,
@@ -7594,11 +7634,13 @@ export async function acquireCodexCredentialLease<T, TPolicyScope = never>(
         rotationStrategy,
         existingCredentialId,
         policyScope,
+        unavailableDiagnostics,
       });
       let accounts = allAccounts;
+      let unavailableDiagnostics: readonly TUnavailableDiagnostic[] = [];
       let selected: CodexCredentialLeaseSelection<T> | undefined;
       if (sameTurnCredentialId !== null) {
-        const sameTurnSelection = select(selectionContext(allAccounts));
+        const sameTurnSelection = select(selectionContext(allAccounts, []));
         if (sameTurnSelection.credentialId === sameTurnCredentialId) {
           selected = sameTurnSelection;
         }
@@ -7609,12 +7651,14 @@ export async function acquireCodexCredentialLease<T, TPolicyScope = never>(
       // live/frozen row falls through to scoped new acquisition rather than
       // being reused blindly.
       if (!selected) {
-        accounts = filterCodexLeaseCandidatesForPolicy(
+        const filtered = filterCodexLeaseCandidatesForPolicy(
           allAccounts,
           policyScope,
           input.filterNewAllocationCandidates,
         );
-        selected = select(selectionContext(accounts));
+        accounts = filtered.accounts;
+        unavailableDiagnostics = filtered.unavailableDiagnostics;
+        selected = select(selectionContext(accounts, unavailableDiagnostics));
       }
       if (selected.credentialId === null) {
         if (leaseRotationEnabled && existingCredentialId !== null) {
@@ -7634,6 +7678,8 @@ export async function acquireCodexCredentialLease<T, TPolicyScope = never>(
           holderId: null,
           generation: null,
           leasedUntil: null,
+          unavailableDiagnostics,
+          advanceActivePointer: false,
         };
       }
       const selectedAccount = accounts.find((account) => account.id === selected.credentialId);
@@ -7648,11 +7694,14 @@ export async function acquireCodexCredentialLease<T, TPolicyScope = never>(
         throw new Error("Codex lease selector returned a credential disabled for new allocations");
       }
 
+      const advanceActivePointer =
+        input.advanceActivePointer && selected.advanceActivePointer !== false;
+
       // Compatible-but-not-cut-over workers may still run the legacy rotation
       // policy under this same workspace-row lock. They can advance the active
       // pointer, but never create a lease or mutate fairness cursors.
       if (!leaseRotationEnabled) {
-        if (input.advanceActivePointer && activeCredentialId !== selected.credentialId) {
+        if (advanceActivePointer && activeCredentialId !== selected.credentialId) {
           await tx.execute(sql`
             update codex_rotation_settings
             set active_credential_id = ${selected.credentialId}, updated_at = now()
@@ -7670,6 +7719,8 @@ export async function acquireCodexCredentialLease<T, TPolicyScope = never>(
           holderId: null,
           generation: null,
           leasedUntil: null,
+          unavailableDiagnostics,
+          advanceActivePointer,
         };
       }
 
@@ -7707,7 +7758,7 @@ export async function acquireCodexCredentialLease<T, TPolicyScope = never>(
             and id = ${selected.credentialId}
         `);
       }
-      if (input.advanceActivePointer && activeCredentialId !== selected.credentialId) {
+      if (advanceActivePointer && activeCredentialId !== selected.credentialId) {
         await tx.execute(sql`
           update codex_rotation_settings
           set active_credential_id = ${selected.credentialId}, updated_at = now()
@@ -7725,6 +7776,8 @@ export async function acquireCodexCredentialLease<T, TPolicyScope = never>(
         holderId: leaseRows[0]?.holder_id ?? input.holderId,
         generation: Number(leaseRows[0]?.generation),
         leasedUntil,
+        unavailableDiagnostics,
+        advanceActivePointer,
       };
     },
   );
@@ -7781,12 +7834,16 @@ export type CodexCapacityAvailabilityDecision =
       diagnostic?: Record<string, unknown>;
     };
 
-export type CodexCapacitySelectionContext<TPolicyScope = never> =
-  CodexCredentialLeaseSelectionContext<TPolicyScope> & {
-    sessionPinnedCredentialId: string | null;
-    sessionLastCredentialId: string | null;
-    policyHash: string | null;
-  };
+export type CodexCapacitySelectionContext<
+  TPolicyScope = never,
+  TUnavailableDiagnostic = never,
+> = CodexCredentialLeaseSelectionContext<TPolicyScope, TUnavailableDiagnostic> & {
+  sessionId: string;
+  sessionPinnedCredentialId: string | null;
+  sessionPinSource: CodexPinSource | null;
+  sessionLastCredentialId: string | null;
+  policyHash: string | null;
+};
 
 export type ArmCodexCapacityWaitResult =
   | { action: "waiting"; waiter: CodexCapacityWait; events: SessionEvent[] }
@@ -8369,7 +8426,10 @@ async function supersedeCodexCapacityWaitInTransaction(
  * work. If any goal/control/policy/turn/queue fence changed, the waiter is
  * superseded without inference.
  */
-export async function reconcileCodexCapacityWait<TPolicyScope = never>(
+export async function reconcileCodexCapacityWait<
+  TPolicyScope = never,
+  TUnavailableDiagnostic = never,
+>(
   db: Database,
   input: {
     accountId: string;
@@ -8380,11 +8440,14 @@ export async function reconcileCodexCapacityWait<TPolicyScope = never>(
     now?: Date;
   },
   decide: (
-    context: CodexCapacitySelectionContext<TPolicyScope>,
+    context: CodexCapacitySelectionContext<TPolicyScope, TUnavailableDiagnostic>,
   ) => CodexCapacityAvailabilityDecision,
   policy?: {
     resolvePolicyScope?: CodexCredentialLeasePolicyScopeResolver<TPolicyScope>;
-    filterNewAllocationCandidates?: CodexCredentialLeaseCandidateFilter<TPolicyScope>;
+    filterNewAllocationCandidates?: CodexCredentialLeaseCandidateFilter<
+      TPolicyScope,
+      TUnavailableDiagnostic
+    >;
   },
 ): Promise<ReconcileCodexCapacityWaitResult> {
   const now = input.now ?? new Date();
@@ -8532,20 +8595,23 @@ export async function reconcileCodexCapacityWait<TPolicyScope = never>(
           excludeTurnId: waiter.blockedTurnId,
         });
         const policyScope = policy?.resolvePolicyScope?.(blockedTurn.metadata ?? {}) ?? null;
-        const accounts = filterCodexLeaseCandidatesForPolicy(
+        const filtered = filterCodexLeaseCandidatesForPolicy(
           allAccounts,
           policyScope,
           policy?.filterNewAllocationCandidates,
         );
         const decision = decide({
-          accounts,
+          accounts: filtered.accounts,
           activeCredentialId: rotation.activeCredentialId,
           rotationEnabled: rotation.rotationEnabled,
           leaseRotationEnabled: rotation.leaseRotationEnabled,
           rotationStrategy: rotation.rotationStrategy,
           existingCredentialId: null,
           policyScope,
+          unavailableDiagnostics: filtered.unavailableDiagnostics,
+          sessionId: session.id,
           sessionPinnedCredentialId: session.codexPinnedCredentialId,
+          sessionPinSource: (session.codexPinSource as CodexPinSource | null) ?? null,
           sessionLastCredentialId: session.codexLastCredentialId,
           policyHash: waiter.policyHash,
         });

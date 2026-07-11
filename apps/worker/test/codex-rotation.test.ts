@@ -864,6 +864,10 @@ describe("chooseShardedHome — proactive home decision (AM-4/AM-7)", () => {
     expect(decision.kind).toBe("home");
     if (decision.kind === "home") {
       expect(decision.rewritePin).toBe(true);
+    }
+  });
+});
+
 describe("OPE-21 deterministic fairness properties", () => {
   test("concurrent reservation simulation chooses every idle identity before reusing one", () => {
     const accounts = [leasedAcct("a"), leasedAcct("b"), leasedAcct("c"), leasedAcct("d")];
@@ -1051,6 +1055,9 @@ describe("classifyCodexPin — pin lifecycle (manual sacrosanct, policy meaningf
         rotationEnabled: false,
       }),
     ).toBe("unpinned");
+  });
+});
+
 describe("OPE-21 pin and rollout policy", () => {
   const context = (
     accounts: CodexLeaseAccountStatus[],
@@ -1063,12 +1070,15 @@ describe("OPE-21 pin and rollout policy", () => {
     rotationStrategy: "most_remaining",
     existingCredentialId,
     policyScope: null,
+    unavailableDiagnostics: [],
   });
 
   test("a healthy explicit pin wins", () => {
     const selected = selectCodexCredentialLeaseForTurn({
       context: context([leasedAcct("a", { primaryUsedPercent: 60 }), leasedAcct("b")]),
       leasingEnabled: true,
+      sessionId: "session-test",
+      sessionPinSource: "manual",
       sessionPinnedCredentialId: "a",
       sessionLastCredentialId: null,
       nearExhaustionPct: 90,
@@ -1077,7 +1087,7 @@ describe("OPE-21 pin and rollout policy", () => {
     expect(selected.credentialId).toBe("a");
   });
 
-  test("a capped pinned credential fails over to a healthy subscription", () => {
+  test("a capped stale policy pin leaves a non-sharded strategy free to select healthy capacity", () => {
     const selected = selectCodexCredentialLeaseForTurn({
       context: context([
         leasedAcct("a", {
@@ -1087,6 +1097,8 @@ describe("OPE-21 pin and rollout policy", () => {
         leasedAcct("b"),
       ]),
       leasingEnabled: true,
+      sessionId: "session-test",
+      sessionPinSource: "policy",
       sessionPinnedCredentialId: "a",
       sessionLastCredentialId: "a",
       nearExhaustionPct: 90,
@@ -1095,10 +1107,53 @@ describe("OPE-21 pin and rollout policy", () => {
     expect(selected.credentialId).toBe("b");
   });
 
+  test("a capped manual pin never silently fails over", () => {
+    const selected = selectCodexCredentialLeaseForTurn({
+      context: context([
+        leasedAcct("a", {
+          primaryUsedPercent: 100,
+          primaryResetAt: new Date(NOW.getTime() + HOUR),
+        }),
+        leasedAcct("b"),
+      ]),
+      leasingEnabled: true,
+      sessionId: "manual-session",
+      sessionPinSource: "manual",
+      sessionPinnedCredentialId: "a",
+      sessionLastCredentialId: "a",
+      nearExhaustionPct: 90,
+      now: NOW,
+    });
+    expect(selected.credentialId).toBeNull();
+    expect(selected.advanceActivePointer).toBe(false);
+    expect(selected.decision.kind).toBe("allCapped");
+  });
+
+  test("sharded policy ranks only the supplied scope and never moves the workspace pointer", () => {
+    const selected = selectCodexCredentialLeaseForTurn({
+      context: {
+        ...context([leasedAcct("pool-b-1"), leasedAcct("pool-b-2")]),
+        activeCredentialId: "outside-scope",
+        rotationStrategy: "sharded",
+      },
+      leasingEnabled: true,
+      sessionId: "sharded-session",
+      sessionPinSource: "policy",
+      sessionPinnedCredentialId: "outside-scope",
+      sessionLastCredentialId: "outside-scope",
+      nearExhaustionPct: 90,
+      now: NOW,
+    });
+    expect(["pool-b-1", "pool-b-2"]).toContain(selected.credentialId);
+    expect(selected.advanceActivePointer).toBe(false);
+  });
+
   test("a still-live same-turn lease is reused idempotently", () => {
     const selected = selectCodexCredentialLeaseForTurn({
       context: context([leasedAcct("a"), leasedAcct("b")], "b"),
       leasingEnabled: true,
+      sessionId: "session-test",
+      sessionPinSource: null,
       sessionPinnedCredentialId: null,
       sessionLastCredentialId: null,
       nearExhaustionPct: 90,
@@ -1114,12 +1169,14 @@ describe("OPE-21 pin and rollout policy", () => {
         leasedAcct("b", { primaryUsedPercent: 0 }),
       ]),
       leasingEnabled: false,
+      sessionId: "session-test",
+      sessionPinSource: null,
       sessionPinnedCredentialId: null,
       sessionLastCredentialId: "a",
       nearExhaustionPct: 90,
       now: NOW,
     });
-    // Pre-0049 most_remaining keeps a still-eligible active pointer sticky.
+    // Pre-0053 most_remaining keeps a still-eligible active pointer sticky.
     expect(selected.credentialId).toBe("a");
   });
 
@@ -1133,6 +1190,8 @@ describe("OPE-21 pin and rollout policy", () => {
         leaseRotationEnabled: false,
       },
       leasingEnabled: true,
+      sessionId: "session-test",
+      sessionPinSource: null,
       sessionPinnedCredentialId: null,
       sessionLastCredentialId: "a",
       nearExhaustionPct: 90,
@@ -1165,6 +1224,8 @@ describe("OPE-21 pin and rollout policy", () => {
         leaseRotationEnabled: false,
       },
       leasingEnabled: true,
+      sessionId: "session-test",
+      sessionPinSource: null,
       sessionPinnedCredentialId: null,
       sessionLastCredentialId: "a",
       nearExhaustionPct: 90,
@@ -1182,6 +1243,8 @@ describe("OPE-21 pin and rollout policy", () => {
         leaseRotationEnabled: false,
       },
       leasingEnabled: true,
+      sessionId: "session-test",
+      sessionPinSource: null,
       sessionPinnedCredentialId: null,
       sessionLastCredentialId: "b",
       nearExhaustionPct: 90,
@@ -1205,8 +1268,11 @@ describe("OPE-21 pin and rollout policy", () => {
         rotationStrategy: "round_robin",
         existingCredentialId: null,
         policyScope: null,
+        unavailableDiagnostics: [],
       },
       leasingEnabled: true,
+      sessionId: "session-test",
+      sessionPinSource: null,
       sessionPinnedCredentialId: null,
       sessionLastCredentialId: "b",
       nearExhaustionPct: 90,
@@ -1225,11 +1291,14 @@ describe("OPE-21 pin and rollout policy", () => {
       rotationStrategy: "most_remaining",
       existingCredentialId: null,
       policyScope: null,
+      unavailableDiagnostics: [],
     };
     expect(
       selectCodexCredentialLeaseForTurn({
         context: frozenContext,
         leasingEnabled: true,
+        sessionId: "session-test",
+        sessionPinSource: null,
         sessionPinnedCredentialId: null,
         sessionLastCredentialId: "frozen",
         continuationCredentialId: "frozen",
@@ -1241,6 +1310,8 @@ describe("OPE-21 pin and rollout policy", () => {
       selectCodexCredentialLeaseForTurn({
         context: frozenContext,
         leasingEnabled: true,
+        sessionId: "session-test",
+        sessionPinSource: null,
         sessionPinnedCredentialId: null,
         sessionLastCredentialId: "frozen",
         nearExhaustionPct: 90,

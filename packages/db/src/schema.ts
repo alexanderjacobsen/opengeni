@@ -258,7 +258,7 @@ export const codexSubscriptionCredentials = pgTable(
       .where(sql`${table.chatgptAccountId} is not null`),
     workspace: index("codex_subscription_credentials_workspace_lookup_idx").on(table.workspaceId),
     // Composite identity is the defense-in-depth FK target for workspace-local
-    // lease references in migration 0049.
+    // lease references in migration 0053.
     workspaceIdentity: uniqueIndex("codex_subscription_credentials_workspace_id_idx").on(
       table.workspaceId,
       table.id,
@@ -401,7 +401,7 @@ export const codexRotationSettings = pgTable(
 // UPDATE, so concurrent replicas in the SAME workspace see one another's
 // assignments before choosing. Workspaces never share or correlate lease state.
 // The composite (workspace, account), (workspace, credential), and
-// (workspace, turn) FKs are declared in migration 0049 (sessionTurns is defined
+// (workspace, turn) FKs are declared in migration 0053 (sessionTurns is defined
 // later in this module).
 export const codexCredentialLeases = pgTable(
   "codex_credential_leases",
@@ -960,7 +960,7 @@ export const sessionGoals = pgTable(
 // allocator. Temporal signals are therefore repairable nudges rather than the
 // source of truth. No credential material or provider response is stored here.
 //
-// The session/goal/turn foreign keys are declared in migration 0049 so the
+// The session/goal/turn foreign keys are declared in migration 0053 so the
 // table keeps the same composite workspace-integrity posture as credential
 // leases. OPE-18 may later supply a non-zero controlGeneration; legacy rows use
 // zero and remain fenced by goal version + session/queue/turn truth. OPE-32

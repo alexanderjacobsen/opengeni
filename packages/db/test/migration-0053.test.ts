@@ -19,10 +19,10 @@ let blank: BlankTestDatabase | null = null;
 let databaseUrl = "";
 
 beforeAll(async () => {
-  blank = await acquireBlankTestDatabase("migration-0049");
+  blank = await acquireBlankTestDatabase("migration-0053");
   if (!blank) {
     available = false;
-    console.warn("[migration-0049] postgres unavailable, skipping");
+    console.warn("[migration-0053] postgres unavailable, skipping");
     return;
   }
   databaseUrl = blank.databaseUrl;
@@ -32,7 +32,7 @@ afterAll(async () => {
   await blank?.release();
 });
 
-describe("migration 0049 (Codex credential leases)", () => {
+describe("migration 0053 (Codex credential leases)", () => {
   test("keeps old workers compatible through schema-first rollout, cutover, and feature-off rollback", async () => {
     if (!available) return;
 
@@ -40,14 +40,14 @@ describe("migration 0049 (Codex credential leases)", () => {
     let app: ReturnType<typeof createDb> | null = null;
     try {
       const files = (await readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).sort();
-      expect(files.includes("0049_codex_credential_leases.sql")).toBe(true);
-      const pre0049 = files.filter((file) => file < "0049_");
+      expect(files.includes("0053_codex_credential_leases.sql")).toBe(true);
+      const pre0053 = files.filter((file) => file < "0053_");
 
       await admin`select pg_advisory_lock(727458)`;
       await admin.unsafe(
         `CREATE TABLE IF NOT EXISTS "schema_migrations" ("name" text PRIMARY KEY, "applied_at" timestamptz NOT NULL DEFAULT now())`,
       );
-      for (const file of pre0049) {
+      for (const file of pre0053) {
         await applyFile(admin, file);
         await admin`insert into schema_migrations (name) values (${file}) on conflict do nothing`;
       }
@@ -55,7 +55,7 @@ describe("migration 0049 (Codex credential leases)", () => {
       const accountId = (
         await admin<
           { id: string }[]
-        >`insert into managed_accounts (name) values ('migration-0049-account') returning id`
+        >`insert into managed_accounts (name) values ('migration-0053-account') returning id`
       )[0]!.id;
       const workspaceId = (
         await admin<
@@ -118,10 +118,10 @@ describe("migration 0049 (Codex credential leases)", () => {
           and column_name = 'lease_rotation_enabled'`;
       expect(preColumns).toHaveLength(0);
 
-      await applyFile(admin, "0049_codex_credential_leases.sql");
+      await applyFile(admin, "0053_codex_credential_leases.sql");
       await admin`
         insert into schema_migrations (name)
-        values ('0049_codex_credential_leases.sql') on conflict do nothing`;
+        values ('0053_codex_credential_leases.sql') on conflict do nothing`;
       await admin`select pg_advisory_unlock(727458)`;
 
       // Schema-first rollout preserves all existing rows and keeps both old and
@@ -197,8 +197,11 @@ describe("migration 0049 (Codex credential leases)", () => {
           rotationStrategy: "most_remaining",
           existingCredentialId: null,
           policyScope: null,
+          unavailableDiagnostics: [],
         },
         leasingEnabled: false,
+        sessionId: "session-test",
+        sessionPinSource: null,
         sessionPinnedCredentialId: null,
         sessionLastCredentialId: credentialA,
         nearExhaustionPct: 90,
@@ -223,13 +226,15 @@ describe("migration 0049 (Codex credential leases)", () => {
           accountId,
           workspaceId,
           turnId,
-          holderId: "migration-0049-pre-cutover",
+          holderId: "migration-0053-pre-cutover",
           advanceActivePointer: true,
         },
         (context) =>
           selectCodexCredentialLeaseForTurn({
             context,
             leasingEnabled: true,
+            sessionId: "session-test",
+            sessionPinSource: null,
             sessionPinnedCredentialId: null,
             sessionLastCredentialId: credentialA,
             nearExhaustionPct: 90,
@@ -256,13 +261,15 @@ describe("migration 0049 (Codex credential leases)", () => {
           accountId,
           workspaceId,
           turnId,
-          holderId: "migration-0049-new-worker",
+          holderId: "migration-0053-new-worker",
           advanceActivePointer: true,
         },
         (context) =>
           selectCodexCredentialLeaseForTurn({
             context,
             leasingEnabled: true,
+            sessionId: "session-test",
+            sessionPinSource: null,
             sessionPinnedCredentialId: null,
             sessionLastCredentialId: null,
             nearExhaustionPct: 90,
@@ -299,6 +306,8 @@ describe("migration 0049 (Codex credential leases)", () => {
           leaseRotationEnabled: false,
         },
         leasingEnabled: false,
+        sessionId: "session-test",
+        sessionPinSource: null,
         sessionPinnedCredentialId: null,
         sessionLastCredentialId: leased.credentialId,
         nearExhaustionPct: 90,
@@ -353,5 +362,6 @@ function rollbackSelectionContext(credentialA: string, credentialB: string) {
     rotationStrategy: "most_remaining",
     existingCredentialId: null,
     policyScope: null,
+    unavailableDiagnostics: [],
   };
 }

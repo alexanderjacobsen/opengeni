@@ -26,7 +26,9 @@ function capacityDecision(
   const selected = selectCodexCredentialLeaseForTurn({
     context,
     leasingEnabled: settings.codexCredentialLeasingEnabled,
+    sessionId: context.sessionId,
     sessionPinnedCredentialId: context.sessionPinnedCredentialId,
+    sessionPinSource: context.sessionPinSource,
     sessionLastCredentialId: context.sessionLastCredentialId,
     continuationCredentialId: null,
     nearExhaustionPct: settings.codexRotationNearExhaustionPct,

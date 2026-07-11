@@ -45,9 +45,10 @@ When `OPENGENI_CODEX_CREDENTIAL_LEASING_ENABLED=true`, every Codex turn calls
    pure strategy against the complete workspace rows. Only if this is a new
    allocation may an optional downstream policy filter the candidate rows. Run
    the strategy and revalidate its chosen id against that resulting set.
-5. Upsert the unique `(workspace_id, turn_id)` lease, increment the selected
-   credential's server-held fairness cursor, and advance the active pointer in
-   the same transaction.
+5. Upsert the unique `(workspace_id, turn_id)` lease and increment the selected
+   credential's server-held fairness cursor. The legacy active pointer advances
+   in the same transaction only when the selector allows it; manual pins and
+   sharded policy homes explicitly veto pointer movement.
 
 `most_remaining` ranks eligible credentials by:
 
@@ -60,19 +61,29 @@ The first and third/fourth inputs are server-held. Provider usage headers improv
 capacity ranking but are **never the sole atomic allocator**. Consequently a
 burst sees earlier reservations and spreads before delayed usage headers move.
 
-The workspace active credential is a cursor, not a sticky lease. A healthy
-explicit session pin wins while eligible; a pinned credential that becomes
-exhausted, unauthorized, forbidden, or otherwise quarantined may fail over to a
-healthy workspace alternative. `rotation_enabled=false` and
-`drain_then_next` remain explicit sticky product policies.
+The workspace active credential is a cursor, not a sticky lease. Pin source is
+load-bearing: a `manual` (or defensively unlabeled) pin is user intent and never
+silently fails over; if it is capped, the turn enters the same durable capacity
+wait. A `policy` pin is a sharded cache-affinity home and may be re-sharded over
+eligible candidates when that home caps. Policy pins are ignored and lazily
+cleared outside the active `sharded` strategy. A live/frozen same-turn holder is
+reused before either pin policy or future membership filtering, so cache policy
+never moves in-flight work. `rotation_enabled=false` and `drain_then_next`
+remain explicit sticky product policies.
 
 Named pool membership is intentionally not an OPE-21 concept. The generic
-`CodexCredentialLeasePolicyScopeResolver<TPolicyScope>` and
-`CodexCredentialLeaseCandidateFilter<TPolicyScope>` seams let a downstream
-accepted-turn policy pass a private scope (including its policy hash) into the
-existing rotation-row transaction. OPE-21 stores no pool table or membership
-rule. The new-allocation filter runs only after exact live/frozen same-turn reuse,
-so a later membership/default change cannot move an already accepted holder.
+`CodexCredentialLeasePolicyScopeResolver<TPolicyScope>`,
+`CodexCredentialLeaseCandidateFilter<TPolicyScope, TUnavailableDiagnostic>`,
+and `CodexCredentialLeaseCandidateFilterResult<TUnavailableDiagnostic>` seams
+let a downstream accepted-turn policy pass a private scope such as
+`{primaryPoolId,fallbackPoolIds,policyHash}` into the existing rotation-row
+transaction. The filter chooses candidates from exactly one resolved primary or
+fallback scope and may return downstream-owned per-pool unavailable/reset
+diagnostics; OPE-21 never union-ranks memberships and stores no pool table or
+membership rule. `CodexCredentialLeaseResult<T, TUnavailableDiagnostic>` returns
+those diagnostics. The new-allocation filter runs only after exact live/frozen
+same-turn reuse, so a later membership/default change cannot move an already
+accepted holder.
 
 `codex_subscription_credentials.allocator_enabled` is a separate, additive
 new-allocation gate (default `true`); it is not credential health. Setting it
@@ -175,7 +186,7 @@ new-allocation policy.
 
 ## Rollout and rollback
 
-Migration `0049_codex_credential_leases.sql` is additive. It creates the
+Migration `0053_codex_credential_leases.sql` is additive. It creates the
 workspace-local lease table and fairness columns, strengthens workspace reference
 integrity, and adds a separate `lease_rotation_enabled` cutover bit. Both that bit
 and the legacy `rotation_enabled` column keep a database default of `false`, so a

@@ -205,8 +205,6 @@ import {
   type ResourceRef,
   type SessionEventType,
 } from "@opengeni/contracts";
-import { randomUUID } from "node:crypto";
-import { CAPABILITY_DESCRIPTORS, type ResourceRef } from "@opengeni/contracts";
 import { createHash, randomUUID } from "node:crypto";
 
 // How long the session workflow holds the loop after a retryable provider
@@ -1734,11 +1732,14 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       if (isCodexTurn) {
         const sessionCodex = await getSessionCodexState(db, input.workspaceId, input.sessionId);
         const sessionPin = sessionCodex?.pinnedCredentialId ?? null;
+        const sessionPinSource = sessionCodex?.pinSource ?? null;
         const selectForTurn = (context: CodexCredentialLeaseSelectionContext) =>
           selectCodexCredentialLeaseForTurn({
             context,
             leasingEnabled: settings.codexCredentialLeasingEnabled,
+            sessionId: input.sessionId,
             sessionPinnedCredentialId: sessionPin,
+            sessionPinSource,
             sessionLastCredentialId: sessionCodex?.lastCredentialId ?? null,
             continuationCredentialId: continuationCodexCredentialId,
             nearExhaustionPct: settings.codexRotationNearExhaustionPct,
@@ -1784,6 +1785,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             rotationStrategy: rotation?.rotationStrategy ?? "most_remaining",
             existingCredentialId: null,
             policyScope: null,
+            unavailableDiagnostics: [],
           });
           leased = {
             ...selected,
@@ -1795,6 +1797,8 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             holderId: null,
             generation: null,
             leasedUntil: null,
+            unavailableDiagnostics: [],
+            advanceActivePointer: selected.advanceActivePointer !== false,
           };
         }
         if (leased.decision.kind === "allCapped") {
@@ -1833,6 +1837,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
               rotationStrategy: rotation?.rotationStrategy ?? "most_remaining",
               existingCredentialId: null,
               policyScope: null,
+              unavailableDiagnostics: [],
             });
             leased = {
               ...selected,
@@ -1844,12 +1849,40 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
               holderId: null,
               generation: null,
               leasedUntil: null,
+              unavailableDiagnostics: [],
+              advanceActivePointer: selected.advanceActivePointer !== false,
             };
           }
         }
         const rotationDecision = leased.decision;
+        const selectedPinDisposition = classifyCodexPin({
+          pinnedCredentialId: sessionPin,
+          pinSource: sessionPinSource,
+          strategy: leased.rotationStrategy as CodexRotationStrategy,
+          rotationEnabled: leased.rotationEnabled,
+        });
+        // OPE-31 pin persistence follows the atomic OPE-21 selection. The selector
+        // already ran exact-turn reuse before policy filtering and vetoed pointer
+        // movement for manual/policy homes; this write only records the NEXT turn's
+        // policy home (or clears a policy pin whose strategy is no longer active).
+        if (
+          selectedPinDisposition === "sharded" &&
+          leased.credentialId !== null &&
+          (sessionPinSource !== "policy" || sessionPin !== leased.credentialId)
+        ) {
+          await setSessionCodexPin(
+            db,
+            input.workspaceId,
+            input.sessionId,
+            leased.credentialId,
+            "policy",
+          );
+        } else if (selectedPinDisposition === "clearStale") {
+          await setSessionCodexPin(db, input.workspaceId, input.sessionId, null);
+        }
         if (
           !settings.codexCredentialLeasingEnabled &&
+          leased.advanceActivePointer &&
           sessionPin === null &&
           rotationDecision.kind === "active" &&
           rotationDecision.moved
@@ -4275,8 +4308,18 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             getCodexRotationSettings(db, input.workspaceId).catch(() => null),
             getSessionCodexState(db, input.workspaceId, input.sessionId).catch(() => null),
           ]);
+          const reactiveStrategy = (rotation?.rotationStrategy ??
+            "most_remaining") as CodexRotationStrategy;
+          const reactiveDisposition = classifyCodexPin({
+            pinnedCredentialId: sessionCodex?.pinnedCredentialId ?? null,
+            pinSource: sessionCodex?.pinSource ?? null,
+            strategy: reactiveStrategy,
+            rotationEnabled: Boolean(rotation?.rotationEnabled),
+          });
+          const reactiveSharded = reactiveDisposition === "sharded";
           const rotating =
-            Boolean(rotation?.rotationEnabled) && sessionCodex?.pinnedCredentialId == null;
+            Boolean(rotation?.rotationEnabled || rotation?.leaseRotationEnabled) &&
+            reactiveDisposition !== "manual";
           if (rotating && rotation) {
             const accounts = await listCodexAccountStatuses(db, input.workspaceId).catch(() => []);
             const serving = accounts.find((a) => a.id === effectiveCodexCredentialId) ?? null;
@@ -4975,7 +5018,12 @@ export function agentRunFailurePayload(error: unknown): {
   // goal against a capped backend). Surface a precise, actionable message with
   // the humanized reset window and code, non-retryable. Checked BEFORE the
   // generic 429 branch below (a usage cap is also a 429).
-  const usageLimit = isCodexTransportError(error) ? classifyCodexUsageLimitError(error) : null;
+  // This terminal payload classifier may receive a plain SDK-shaped error in
+  // tests or after wrapper metadata was stripped. An explicit
+  // `usage_limit_reached` shape must still outrank generic 429 retryability.
+  // Credential quarantine/failover remains separately provenance-gated by
+  // `isCodexTransportError`; this branch only chooses the truthful user payload.
+  const usageLimit = classifyCodexUsageLimitError(error);
   if (usageLimit) {
     return codexUsageLimitFailurePayload(usageLimit, message);
   }

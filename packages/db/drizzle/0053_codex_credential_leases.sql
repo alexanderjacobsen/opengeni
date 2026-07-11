@@ -1,3 +1,4 @@
+-- 0053_codex_credential_leases.sql
 -- OPE-21: fair, atomic Codex subscription selection across worker replicas.
 --
 -- Every field in this migration is workspace-local. In particular, the same

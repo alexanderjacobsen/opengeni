@@ -7825,6 +7825,11 @@ export type CodexCapacityWakeTarget = {
   wakeRevision: number;
 };
 
+export type CodexCapacityMutationResult<T> = {
+  result: T;
+  wakeTargets: CodexCapacityWakeTarget[];
+};
+
 export type CodexCapacityAvailabilityDecision =
   | { kind: "available"; credentialId: string; diagnostic?: Record<string, unknown> }
   | {
@@ -8286,7 +8291,7 @@ export async function withCodexCapacityMutation<T>(
     policyHash?: string | null;
   },
   mutate: (tx: Database) => Promise<{ result: T; changed: boolean }>,
-): Promise<{ result: T; wakeTargets: CodexCapacityWakeTarget[] }> {
+): Promise<CodexCapacityMutationResult<T>> {
   return await withWorkspaceRls(
     db,
     input.workspaceId,
@@ -8687,6 +8692,13 @@ export async function reconcileCodexCapacityWait<
           where workspace_id = ${input.workspaceId} and session_id = ${input.sessionId}
         `);
         const position = Number(positions[0]?.position ?? blockedTurn.position + 1);
+        // A capacity resume is a new turn. Preserve accepted model/policy/resource
+        // metadata, but never inherit execution-local budgets consumed by the
+        // blocked turn: doing so would make the first failure of this new turn look
+        // like the fourth worker death or an already-exhausted failover budget.
+        const continuationMetadata = { ...(blockedTurn.metadata ?? {}) };
+        delete continuationMetadata.workerDeathRedispatches;
+        delete continuationMetadata.codexCredentialFailovers;
         const [turnRow] = await tx
           .insert(schema.sessionTurns)
           .values({
@@ -8706,7 +8718,7 @@ export async function reconcileCodexCapacityWait<
             sandboxBackend: blockedTurn.sandboxBackend,
             sandboxOs: blockedTurn.sandboxOs,
             metadata: {
-              ...blockedTurn.metadata,
+              ...continuationMetadata,
               goalId: goal.id,
               codexCapacityWaiterId: waiter.id,
               codexCapacityWaitGeneration: waiter.generation,
@@ -9266,7 +9278,18 @@ export async function recordCodexAccountUsage(
   credentialId: string,
   snapshot: CodexAccountUsageSnapshot,
 ): Promise<boolean> {
-  const { result } = await withCodexCapacityMutation(
+  return (await recordCodexAccountUsageWithWakeTargets(db, workspaceId, credentialId, snapshot))
+    .result;
+}
+
+/** Usage-cache mutation plus its committed durable capacity-wake outbox. */
+export async function recordCodexAccountUsageWithWakeTargets(
+  db: Database,
+  workspaceId: string,
+  credentialId: string,
+  snapshot: CodexAccountUsageSnapshot,
+): Promise<CodexCapacityMutationResult<boolean>> {
+  return await withCodexCapacityMutation(
     db,
     { workspaceId, reason: "codex_usage_refreshed" },
     async (tx) => {
@@ -9293,7 +9316,6 @@ export async function recordCodexAccountUsage(
       return { result: changed, changed };
     },
   );
-  return result;
 }
 
 export type CodexRotationSettings = {
@@ -9432,7 +9454,18 @@ export async function setCodexCredentialExhausted(
   credentialId: string,
   until: Date | null,
 ): Promise<boolean> {
-  const { result } = await withCodexCapacityMutation(
+  return (await setCodexCredentialExhaustedWithWakeTargets(db, workspaceId, credentialId, until))
+    .result;
+}
+
+/** Cooldown mutation plus its committed durable capacity-wake outbox. */
+export async function setCodexCredentialExhaustedWithWakeTargets(
+  db: Database,
+  workspaceId: string,
+  credentialId: string,
+  until: Date | null,
+): Promise<CodexCapacityMutationResult<boolean>> {
+  return await withCodexCapacityMutation(
     db,
     { workspaceId, reason: until === null ? "codex_cooldown_cleared" : "codex_cooldown_changed" },
     async (tx) => {
@@ -9450,7 +9483,6 @@ export async function setCodexCredentialExhausted(
       return { result: changed, changed };
     },
   );
-  return result;
 }
 
 /**
@@ -9633,6 +9665,11 @@ export type SessionCodexState = {
   pinSource: CodexPinSource | null;
 };
 
+export type SetSessionCodexPinOptions = {
+  /** Policy writers must not overwrite a pin committed after their read. */
+  expected?: Pick<SessionCodexState, "pinnedCredentialId" | "pinSource">;
+};
+
 /** The session's pin (+ source) + last-ran-on Codex account (drives the worker resolver + indicator). */
 export async function getSessionCodexState(
   db: Database,
@@ -9674,6 +9711,7 @@ export async function setSessionCodexPin(
   sessionId: string,
   pinnedCredentialId: string | null,
   source: CodexPinSource = "manual",
+  options: SetSessionCodexPinOptions = {},
 ): Promise<boolean> {
   return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
     if (pinnedCredentialId !== null) {
@@ -9691,6 +9729,20 @@ export async function setSessionCodexPin(
         return false;
       }
     }
+    const conditions = [
+      eq(schema.sessions.workspaceId, workspaceId),
+      eq(schema.sessions.id, sessionId),
+    ];
+    if (options.expected) {
+      conditions.push(
+        options.expected.pinnedCredentialId === null
+          ? isNull(schema.sessions.codexPinnedCredentialId)
+          : eq(schema.sessions.codexPinnedCredentialId, options.expected.pinnedCredentialId),
+        options.expected.pinSource === null
+          ? isNull(schema.sessions.codexPinSource)
+          : eq(schema.sessions.codexPinSource, options.expected.pinSource),
+      );
+    }
     const updated = await scopedDb
       .update(schema.sessions)
       .set({
@@ -9699,7 +9751,7 @@ export async function setSessionCodexPin(
         codexPinSource: pinnedCredentialId === null ? null : source,
         updatedAt: new Date(),
       })
-      .where(and(eq(schema.sessions.workspaceId, workspaceId), eq(schema.sessions.id, sessionId)))
+      .where(and(...conditions))
       .returning({ id: schema.sessions.id });
     return updated.length > 0;
   });

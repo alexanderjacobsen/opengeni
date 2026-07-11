@@ -65,11 +65,13 @@ The workspace active credential is a cursor, not a sticky lease. Pin source is
 load-bearing: a `manual` (or defensively unlabeled) pin is user intent and never
 silently fails over; if it is capped, the turn enters the same durable capacity
 wait. A `policy` pin is a sharded cache-affinity home and may be re-sharded over
-eligible candidates when that home caps. Policy pins are ignored and lazily
-cleared outside the active `sharded` strategy. A live/frozen same-turn holder is
-reused before either pin policy or future membership filtering, so cache policy
-never moves in-flight work. `rotation_enabled=false` and `drain_then_next`
-remain explicit sticky product policies.
+eligible candidates when that home caps. Policy pin writes use an observed-state
+CAS inside the rotation-row-first capacity-mutation transaction, so a stale
+sharding decision cannot overwrite a concurrent manual pin. Policy pins are
+ignored and lazily cleared outside the active `sharded` strategy. A live/frozen
+same-turn holder is reused before either pin policy or future membership
+filtering, so cache policy never moves in-flight work. `rotation_enabled=false`
+and `drain_then_next` remain explicit sticky product policies.
 
 Named pool membership is intentionally not an OPE-21 concept. The generic
 `CodexCredentialLeasePolicyScopeResolver<TPolicyScope>`,
@@ -134,8 +136,10 @@ unknown resets exponentially back off from one to fifteen minutes without
 running a model. Availability commits one system
 `goal.continuation` event and one queued turn, preserving model, reasoning,
 resources, tools, and sandbox policy from the blocked turn. It does not create a
-`user.message` or replay the failed turn row. A second timer/signal observes the
-waiter as resumed/stale and enqueues nothing.
+`user.message` or replay the failed turn row. The new turn resets execution-local
+worker-death and credential-failover counters rather than inheriting budgets
+consumed by the blocked turn. A second timer/signal observes the waiter as
+resumed/stale and enqueues nothing.
 
 `withCodexCapacityMutation` is the same-transaction mutation/outbox seam for any
 eligibility or future pool membership/default write: it locks the workspace
@@ -143,11 +147,14 @@ rotation row first, applies the mutation, increments matching waiter wake
 revisions only when truth changed, and returns secret-safe signal targets.
 `listPendingCodexCapacityWakeTargets` repairs commit→signal loss. The session
 workflow's `codexCapacityChanged` signal is only a nudge; the Postgres revision
-is authoritative. The workflow reconstructs pending timers on worker/Temporal
-restart and `continueAsNew`, while `validateCodexCapacityResumeTurn` closes the
-wake→claim race against user queue, pause/stop, goal/control/policy changes, and
-duplicate turns before provider/model/tool/billing work starts. Reset/boost
-entitlement redemption is never automatic.
+is authoritative. The workflow snapshots its wake counters before dispatching a
+turn, so a signal delivered after waiter commit but before the activity result
+returns causes immediate reconciliation instead of being baselined away. It
+reconstructs pending timers on worker/Temporal restart and `continueAsNew`, while
+`validateCodexCapacityResumeTurn` closes the wake→claim race against user queue,
+pause/stop, goal/control/policy changes, and duplicate turns before
+provider/model/tool/billing work starts. Reset/boost entitlement redemption is
+never automatic.
 
 Only a **definitive credential/account refusal** can move the same durable turn to
 another credential:

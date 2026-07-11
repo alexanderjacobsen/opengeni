@@ -4,6 +4,7 @@ import {
   listCodexAccountStatuses,
   listPendingCodexCapacityWakeTargets,
   reconcileCodexCapacityWait as reconcileCodexCapacityWaitDb,
+  type CodexCapacityWakeTarget,
   type CodexCapacitySelectionContext,
 } from "@opengeni/db";
 import type { Settings } from "@opengeni/config";
@@ -18,6 +19,52 @@ import type {
   ReconcileCodexCapacityWaitInput,
   ReconcileCodexCapacityWaitResult,
 } from "./types";
+
+type CodexCapacitySignalServices = {
+  signalCodexCapacityWorkflow?:
+    | NonNullable<ActivityServices["signalCodexCapacityWorkflow"]>
+    | null
+    | undefined;
+  wakeSessionWorkflow: ActivityServices["wakeSessionWorkflow"];
+};
+
+/** Deliver committed waiter revisions; Postgres remains the repairable outbox. */
+export async function signalCodexCapacityWakeTargets(
+  services: CodexCapacitySignalServices,
+  targets: readonly CodexCapacityWakeTarget[],
+): Promise<void> {
+  await Promise.allSettled(
+    targets.map((target) =>
+      services.signalCodexCapacityWorkflow
+        ? services.signalCodexCapacityWorkflow({
+            accountId: target.accountId,
+            workspaceId: target.workspaceId,
+            sessionId: target.sessionId,
+            workflowId: target.workflowId,
+            wakeRevision: target.wakeRevision,
+          })
+        : services.wakeSessionWorkflow
+          ? services.wakeSessionWorkflow({
+              accountId: target.accountId,
+              workspaceId: target.workspaceId,
+              sessionId: target.sessionId,
+              workflowId: target.workflowId,
+            })
+          : Promise.resolve(),
+    ),
+  );
+}
+
+/** Repair a commit/signal crash edge by redelivering every pending revision. */
+export async function signalPendingCodexCapacityWakeTargets(
+  services: CodexCapacitySignalServices & { db: ActivityServices["db"] },
+  workspaceId: string,
+): Promise<void> {
+  const targets = await listPendingCodexCapacityWakeTargets(services.db, workspaceId).catch(
+    () => [],
+  );
+  await signalCodexCapacityWakeTargets(services, targets);
+}
 
 export function codexCapacityDecision(
   context: CodexCapacitySelectionContext,
@@ -84,21 +131,7 @@ async function refreshCapacityMetadata(
       ),
     ),
   );
-  if (services.wakeSessionWorkflow) {
-    const targets = await listPendingCodexCapacityWakeTargets(services.db, workspaceId).catch(
-      () => [],
-    );
-    await Promise.allSettled(
-      targets.map((target) =>
-        services.wakeSessionWorkflow!({
-          accountId: target.accountId,
-          workspaceId: target.workspaceId,
-          sessionId: target.sessionId,
-          workflowId: target.workflowId,
-        }),
-      ),
-    );
-  }
+  await signalPendingCodexCapacityWakeTargets(services, workspaceId);
 }
 
 export function createCodexCapacityActivities(services: () => Promise<ActivityServices>) {

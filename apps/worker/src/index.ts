@@ -22,7 +22,7 @@ import {
 import { NativeConnection, Worker } from "@temporalio/worker";
 import { ensureModalRegistryImage } from "@opengeni/runtime";
 import { createActivities, type ActivityDependencies } from "./activities";
-import type { WakeSessionWorkflowSignal } from "./activities/types";
+import type { SignalCodexCapacityWorkflow, WakeSessionWorkflowSignal } from "./activities/types";
 import { dbReadyCheck, natsReadyCheck, startWorkerHttpServer } from "./http";
 import { observabilityEventLogger } from "./observability-metrics";
 
@@ -111,6 +111,7 @@ export async function createOpenGeniWorker(options: WorkerOptions = {}): Promise
 // Connection is what exposes workflow.signalWithStart.
 export async function createWorkerWorkflowSignaler(settings: Settings): Promise<{
   wakeSessionWorkflow: WakeSessionWorkflowSignal;
+  signalCodexCapacityWorkflow: SignalCodexCapacityWorkflow;
   check: () => Promise<void>;
   close: () => Promise<void>;
 }> {
@@ -124,6 +125,22 @@ export async function createWorkerWorkflowSignaler(settings: Settings): Promise<
         workflowIdReusePolicy: "ALLOW_DUPLICATE",
         args: [{ accountId, workspaceId, sessionId }],
         signal: "queueChanged",
+      });
+    },
+    signalCodexCapacityWorkflow: async ({
+      accountId,
+      workspaceId,
+      sessionId,
+      workflowId,
+      wakeRevision,
+    }) => {
+      await temporal.workflow.signalWithStart("sessionWorkflow", {
+        taskQueue: settings.temporalTaskQueue,
+        workflowId,
+        workflowIdReusePolicy: "ALLOW_DUPLICATE",
+        args: [{ accountId, workspaceId, sessionId }],
+        signal: "codexCapacityChanged",
+        signalArgs: [wakeRevision],
       });
     },
     check: async () => {
@@ -302,6 +319,7 @@ export async function startWorker() {
       activityDependencies: {
         observability,
         wakeSessionWorkflow: signaler.wakeSessionWorkflow,
+        signalCodexCapacityWorkflow: signaler.signalCodexCapacityWorkflow,
         db: dbClient.db,
         bus,
       },

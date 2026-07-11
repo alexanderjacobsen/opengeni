@@ -983,6 +983,69 @@ describe("Temporal workflow integration", () => {
   );
 
   test(
+    "does not lose a capacity signal buffered before the waiter activity returns",
+    async () => {
+      const taskQueue = `workflow-test-${crypto.randomUUID()}`;
+      const scope = workflowScope();
+      const sessionId = crypto.randomUUID();
+      const workflowId = `session-${sessionId}`;
+      const queuedTurns = [queuedTurn("event-1")];
+      const runs: Array<{ triggerEventId: string }> = [];
+      const reconciliationCauses: string[] = [];
+      const waiter = {
+        waiterId: crypto.randomUUID(),
+        generation: 2,
+        nextCheckAt: new Date(Date.now() + 60_000).toISOString(),
+        wakeRevision: 5,
+      };
+      let releaseFirstRun!: () => void;
+      const firstRunBlocked = new Promise<void>((resolve) => {
+        releaseFirstRun = resolve;
+      });
+      const worker = await testWorker(nativeConnection, taskQueue, {
+        claimNextQueuedTurn: async () => queuedTurns.shift() ?? null,
+        markSessionIdle: async () => undefined,
+        runAgentTurn: async (input: { triggerEventId: string }) => {
+          runs.push(input);
+          if (input.triggerEventId === "event-1") {
+            await firstRunBlocked;
+            return { status: "idle", capacityWait: waiter };
+          }
+          return { status: "failed" };
+        },
+        failSession: async () => undefined,
+        interruptActiveTurn: async () => undefined,
+        getCodexCapacityWait: async () => waiter,
+        reconcileCodexCapacityWait: async (input: { cause: string }) => {
+          reconciliationCauses.push(input.cause);
+          queuedTurns.push(queuedTurn("capacity-resume"));
+          return { action: "resumed", turnId: queuedTurns[0]!.id };
+        },
+      });
+      const run = worker.run();
+      try {
+        const client = new Client({ connection });
+        const handle = await client.workflow.start("sessionWorkflow", {
+          taskQueue,
+          workflowId,
+          args: [{ ...scope, sessionId, initialEventId: "event-1" }],
+        });
+        await waitFor(() => runs.length === 1);
+        await handle.signal("codexCapacityChanged", waiter.wakeRevision + 1);
+        releaseFirstRun();
+        await handle.result();
+        expect(reconciliationCauses).toEqual(["signal"]);
+        expect(runs.map((input) => input.triggerEventId)).toEqual(["event-1", "capacity-resume"]);
+      } finally {
+        releaseFirstRun();
+        worker.shutdown();
+        await run;
+      }
+    },
+    temporalWorkflowTestTimeoutMs,
+  );
+
+  test(
     "reconstructs a capacity timer across continue-as-new without goal polling",
     async () => {
       const taskQueue = `workflow-test-${crypto.randomUUID()}`;

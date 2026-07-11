@@ -95,6 +95,7 @@ export function createActivities(dependencies: ActivityDependencies = {}) {
         documentServices: dependencies.documentServices ?? createDocumentServices(settings),
         observability,
         wakeSessionWorkflow: dependencies.wakeSessionWorkflow ?? null,
+        signalCodexCapacityWorkflow: dependencies.signalCodexCapacityWorkflow ?? null,
         // §7.5 P3 — host-entitlements port. No constructed default: standalone
         // has no host meter, so unset → null → `ensureRunAllowed` reads the
         // local ledger exactly as today (mirrors `wakeSessionWorkflow`'s

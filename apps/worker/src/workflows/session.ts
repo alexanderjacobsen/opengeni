@@ -132,20 +132,32 @@ export async function sessionWorkflow(input: SessionWorkflowInput): Promise<void
     capacityWakeups += 1;
   });
 
-  async function waitForCodexCapacity(initial: activities.CodexCapacityWaitRef): Promise<void> {
+  async function waitForCodexCapacity(
+    initial: activities.CodexCapacityWaitRef,
+    entryBaseline?: { wakeups: number; capacityWakeups: number },
+  ): Promise<void> {
     let current = initial;
+    let firstEntryBaseline = entryBaseline;
     for (;;) {
       if (interruptedEventId !== null) {
         return;
       }
-      const seenWakeups = wakeups;
-      const seenCapacityWakeups = capacityWakeups;
+      // Signals can land after the waiter commit but before runAgentTurn returns.
+      // Compare the first wait against pre-dispatch counters so they cannot be
+      // baselined away; later iterations use their normal local snapshot.
+      const seenWakeups = firstEntryBaseline?.wakeups ?? wakeups;
+      const seenCapacityWakeups = firstEntryBaseline?.capacityWakeups ?? capacityWakeups;
+      firstEntryBaseline = undefined;
       const parsedDeadline = Date.parse(current.nextCheckAt);
       const timerMs = Number.isFinite(parsedDeadline)
         ? Math.max(0, parsedDeadline - Date.now())
         : 0;
       let cause: activities.ReconcileCodexCapacityWaitInput["cause"] = "timer";
-      if (timerMs > 0) {
+      if (wakeups !== seenWakeups) {
+        cause = "queue";
+      } else if (capacityWakeups !== seenCapacityWakeups) {
+        cause = "signal";
+      } else if (timerMs > 0) {
         await condition(
           () =>
             interruptedEventId !== null ||
@@ -384,6 +396,8 @@ export async function sessionWorkflow(input: SessionWorkflowInput): Promise<void
       return true;
     }
 
+    const capacityWaitEntryBaseline = { wakeups, capacityWakeups };
+
     const scope = new CancellationScope();
     const workflowId = workflowInfo().workflowId;
     // P1.2 STATELESS-LEASE GATE. The stateless resume-by-id model (lease acquire
@@ -446,7 +460,7 @@ export async function sessionWorkflow(input: SessionWorkflowInput): Promise<void
       if (patched("codex-capacity-wait-v1")) {
         const capacityWait = await activity.getCodexCapacityWait({ workspaceId, sessionId });
         if (capacityWait) {
-          await waitForCodexCapacity(capacityWait);
+          await waitForCodexCapacity(capacityWait, capacityWaitEntryBaseline);
           return true;
         }
       }
@@ -507,7 +521,7 @@ export async function sessionWorkflow(input: SessionWorkflowInput): Promise<void
     }
 
     if (outcome.result.capacityWait) {
-      await waitForCodexCapacity(outcome.result.capacityWait);
+      await waitForCodexCapacity(outcome.result.capacityWait, capacityWaitEntryBaseline);
       return true;
     }
 

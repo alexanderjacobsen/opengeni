@@ -67,9 +67,12 @@ authoritative provider reset or a bounded secret-safe metadata refresh, and
 capacity-affecting writes increment a same-transaction wake revision before a
 best-effort Temporal signal. Duplicate/lost signals are harmless: row-locked
 re-evaluation is the sole continuation writer, and unobserved revisions repair
-commit-to-signal loss after restart or `continueAsNew`. Capacity return enqueues
+commit-to-signal loss after restart or `continueAsNew`; a signal delivered
+between waiter commit and the activity result is compared against the workflow's
+pre-dispatch wake counters and cannot be baselined away. Capacity return enqueues
 one normal, queue-respecting goal continuation with the blocked turn's effective
-model/reasoning/resources/tools; it does not create a user message, replay the
+model/reasoning/resources/tools while resetting execution-local worker-death and
+credential-failover counters; it does not create a user message, replay the
 failed full turn, poll with inference, or redeem a reset/boost entitlement.
 
 Provider context-window overflow is also handled inside the activity, not by a

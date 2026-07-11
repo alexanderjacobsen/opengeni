@@ -28,12 +28,13 @@ import {
   getSessionCodexState,
   recordSessionActiveCodexCredential,
   setSessionCodexPin,
-  recordCodexAccountUsage,
+  recordCodexAccountUsageWithWakeTargets,
   recordCodexAccountConnectors,
   quarantineCodexCredentialForLease,
   setActiveCodexCredential,
   resolveWorkspaceMemoryBlock,
-  setCodexCredentialExhausted,
+  setCodexCredentialExhaustedWithWakeTargets,
+  withCodexCapacityMutation,
   countConsecutiveReactiveRotations,
   requireSession,
   recordUsageEvent,
@@ -122,6 +123,7 @@ import {
 } from "./codex-rotation";
 import type { CodexAccountStatus } from "@opengeni/db";
 import { buildCodexTokenResolver } from "./codex-auth";
+import { signalCodexCapacityWakeTargets } from "./codex-capacity";
 import {
   buildModelResolver,
   CODEX_CLIENT_VERSION,
@@ -1077,6 +1079,7 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
       objectStorage,
       observability,
       wakeSessionWorkflow,
+      signalCodexCapacityWorkflow,
       entitlements,
       connectionCredentials,
     } = await services();
@@ -1869,15 +1872,55 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
           leased.credentialId !== null &&
           (sessionPinSource !== "policy" || sessionPin !== leased.credentialId)
         ) {
-          await setSessionCodexPin(
+          const pinMutation = await withCodexCapacityMutation(
             db,
-            input.workspaceId,
-            input.sessionId,
-            leased.credentialId,
-            "policy",
+            { workspaceId: input.workspaceId, reason: "codex_policy_pin_changed" },
+            async (tx) => {
+              const changed = await setSessionCodexPin(
+                tx,
+                input.workspaceId,
+                input.sessionId,
+                leased.credentialId,
+                "policy",
+                {
+                  expected: {
+                    pinnedCredentialId: sessionPin,
+                    pinSource: sessionPinSource,
+                  },
+                },
+              );
+              return { result: changed, changed };
+            },
+          );
+          await signalCodexCapacityWakeTargets(
+            { signalCodexCapacityWorkflow, wakeSessionWorkflow },
+            pinMutation.wakeTargets,
           );
         } else if (selectedPinDisposition === "clearStale") {
-          await setSessionCodexPin(db, input.workspaceId, input.sessionId, null);
+          const pinMutation = await withCodexCapacityMutation(
+            db,
+            { workspaceId: input.workspaceId, reason: "codex_stale_policy_pin_cleared" },
+            async (tx) => {
+              const changed = await setSessionCodexPin(
+                tx,
+                input.workspaceId,
+                input.sessionId,
+                null,
+                "policy",
+                {
+                  expected: {
+                    pinnedCredentialId: sessionPin,
+                    pinSource: sessionPinSource,
+                  },
+                },
+              );
+              return { result: changed, changed };
+            },
+          );
+          await signalCodexCapacityWakeTargets(
+            { signalCodexCapacityWorkflow, wakeSessionWorkflow },
+            pinMutation.wakeTargets,
+          );
         }
         if (
           !settings.codexCredentialLeasingEnabled &&
@@ -4335,12 +4378,19 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
             // write whose failure went unnoticed is exactly what lets the next proactive
             // rank re-pick this just-capped account (stale-low cached usedPercent, not
             // cooling) — so capture whether it PERSISTED and feed it into the resume floor.
-            const cooldownPersisted = await setCodexCredentialExhausted(
+            const cooldownMutation = await setCodexCredentialExhaustedWithWakeTargets(
               db,
               input.workspaceId,
               effectiveCodexCredentialId,
               until,
-            ).catch(() => false);
+            ).catch(() => null);
+            const cooldownPersisted = cooldownMutation?.result ?? false;
+            if (cooldownMutation) {
+              await signalCodexCapacityWakeTargets(
+                { signalCodexCapacityWorkflow, wakeSessionWorkflow },
+                cooldownMutation.wakeTargets,
+              );
+            }
             // Re-rank over the fresh accounts; the in-memory list predates the cooldown
             // write, so stamp the just-cooled account so the engine excludes it now. The
             // serving account is thus walked AT MOST ONCE per turn (invariant 4: bounded).
@@ -4364,13 +4414,32 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
               });
               if (newHome) {
                 rotated = true;
-                await setSessionCodexPin(
+                const pinMutation = await withCodexCapacityMutation(
                   db,
-                  input.workspaceId,
-                  input.sessionId,
-                  newHome,
-                  "policy",
-                ).catch(() => false);
+                  { workspaceId: input.workspaceId, reason: "codex_policy_pin_resharded" },
+                  async (tx) => {
+                    const changed = await setSessionCodexPin(
+                      tx,
+                      input.workspaceId,
+                      input.sessionId,
+                      newHome,
+                      "policy",
+                      {
+                        expected: {
+                          pinnedCredentialId: sessionCodex?.pinnedCredentialId ?? null,
+                          pinSource: sessionCodex?.pinSource ?? null,
+                        },
+                      },
+                    );
+                    return { result: changed, changed };
+                  },
+                ).catch(() => null);
+                if (pinMutation) {
+                  await signalCodexCapacityWakeTargets(
+                    { signalCodexCapacityWorkflow, wakeSessionWorkflow },
+                    pinMutation.wakeTargets,
+                  );
+                }
                 const priorConsecutiveRotations = await countConsecutiveReactiveRotations(
                   db,
                   input.workspaceId,
@@ -4761,12 +4830,18 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
         // full both-windows snapshot (parseCodexUsageHeaders gates on both), so this
         // is byte-identical to the /wham/usage write — no partial-window clobber.
         if (latestCodexUsage) {
-          await recordCodexAccountUsage(
+          const usageMutation = await recordCodexAccountUsageWithWakeTargets(
             db,
             input.workspaceId,
             effectiveCodexCredentialId,
             latestCodexUsage,
-          ).catch(() => undefined);
+          ).catch(() => null);
+          if (usageMutation) {
+            await signalCodexCapacityWakeTargets(
+              { signalCodexCapacityWorkflow, wakeSessionWorkflow },
+              usageMutation.wakeTargets,
+            );
+          }
         }
         // Part B.1: the connector namespaces codex_apps listed this turn → the
         // connector-set cache. NON-EMPTY-only: a flaky/empty tools/list must never

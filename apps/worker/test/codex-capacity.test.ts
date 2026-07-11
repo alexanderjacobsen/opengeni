@@ -1,7 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
 import type { CodexCapacitySelectionContext, CodexLeaseAccountStatus } from "@opengeni/db";
 import { testSettings } from "@opengeni/testing";
-import { codexCapacityDecision } from "../src/activities/codex-capacity";
+import {
+  codexCapacityDecision,
+  signalCodexCapacityWakeTargets,
+} from "../src/activities/codex-capacity";
 
 function account(
   id: string,
@@ -69,6 +72,43 @@ describe("Codex capacity availability diagnostics", () => {
       kind: "available",
       credentialId: "healthy",
       diagnostic: { connectedCount: 3, eligibleCount: 1 },
+    });
+  });
+
+  test("committed wake targets prefer revisioned signals and retain queue fallback", async () => {
+    const target = {
+      accountId: "account",
+      workspaceId: "workspace",
+      sessionId: "session",
+      workflowId: "session-session",
+      waiterId: "waiter",
+      generation: 3,
+      wakeRevision: 9,
+    };
+    const revisioned = mock(async () => undefined);
+    const queueWake = mock(async () => undefined);
+    await signalCodexCapacityWakeTargets(
+      { signalCodexCapacityWorkflow: revisioned, wakeSessionWorkflow: queueWake },
+      [target],
+    );
+    expect(revisioned).toHaveBeenCalledWith({
+      accountId: target.accountId,
+      workspaceId: target.workspaceId,
+      sessionId: target.sessionId,
+      workflowId: target.workflowId,
+      wakeRevision: target.wakeRevision,
+    });
+    expect(queueWake).not.toHaveBeenCalled();
+
+    await signalCodexCapacityWakeTargets(
+      { signalCodexCapacityWorkflow: null, wakeSessionWorkflow: queueWake },
+      [target],
+    );
+    expect(queueWake).toHaveBeenCalledWith({
+      accountId: target.accountId,
+      workspaceId: target.workspaceId,
+      sessionId: target.sessionId,
+      workflowId: target.workflowId,
     });
   });
 });

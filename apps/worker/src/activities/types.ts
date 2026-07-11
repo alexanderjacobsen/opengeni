@@ -26,6 +26,14 @@ export type WakeSessionWorkflowSignal = (input: {
   workflowId: string;
 }) => Promise<void>;
 
+export type SignalCodexCapacityWorkflow = (input: {
+  accountId: string;
+  workspaceId: string;
+  sessionId: string;
+  workflowId: string;
+  wakeRevision: number;
+}) => Promise<void>;
+
 export type ActivityServices = {
   settings: Settings;
   db: Database;
@@ -35,6 +43,8 @@ export type ActivityServices = {
   documentServices: DocumentServices;
   observability: Observability;
   wakeSessionWorkflow: WakeSessionWorkflowSignal | null;
+  /** Revision-carrying capacity nudge; queue wake remains the back-compat fallback. */
+  signalCodexCapacityWorkflow?: SignalCodexCapacityWorkflow | null;
   // §7.5 P3 — host-entitlements port, the WORKER half of the same seam the API
   // edge exposes on `AppDependencies`. When set, `ensureRunAllowed` (turn-entry
   // AND the mid-stream budget valve) delegates the funding decision to

@@ -18,6 +18,7 @@ import {
   getCodexCapacityWaitForSession,
   listPendingCodexCapacityWakeTargets,
   reconcileCodexCapacityWait,
+  setSessionCodexPin,
   updateCodexRotationSettings,
   upsertCodexSubscriptionCredential,
   validateCodexCapacityResumeTurn,
@@ -313,7 +314,9 @@ describe("OPE-21 durable Codex capacity waits", () => {
       update session_turns
       set metadata = jsonb_build_object(
         'codexCredentialPolicyHash', 'accepted-policy-v1',
-        'privateAcceptedScope', jsonb_build_object('credentialId', ${credentialId}::text)
+        'privateAcceptedScope', jsonb_build_object('credentialId', ${credentialId}::text),
+        'workerDeathRedispatches', 3,
+        'codexCredentialFailovers', 7
       )
       where id = ${scenario.turnId}`;
     const armed = await arm(scenario);
@@ -383,6 +386,15 @@ describe("OPE-21 durable Codex capacity waits", () => {
       scope: { credentialId, policyHash: "accepted-policy-v1" },
       ids: [credentialId],
     });
+    const resumedResult = results.find((result) => result.action === "resumed");
+    if (resumedResult?.action !== "resumed") throw new Error("expected resumed turn");
+    expect(resumedResult.turn.metadata).toMatchObject({
+      codexCredentialPolicyHash: "accepted-policy-v1",
+      privateAcceptedScope: { credentialId },
+      codexCapacityWaiterId: armed.waiter.id,
+    });
+    expect(resumedResult.turn.metadata).not.toHaveProperty("workerDeathRedispatches");
+    expect(resumedResult.turn.metadata).not.toHaveProperty("codexCredentialFailovers");
     const [counts] = await admin<
       { turns: number; continuations: number; usage: number; resumed: number }[]
     >`
@@ -395,6 +407,39 @@ describe("OPE-21 durable Codex capacity waits", () => {
         (select count(*)::int from codex_capacity_waiters where id = ${armed.waiter.id}
           and status = 'resumed') as resumed`;
     expect(counts).toEqual({ turns: 2, continuations: 1, usage: 1, resumed: 1 });
+  });
+
+  test("a policy-pin CAS advances the waiter outbox in the same allocator transaction", async () => {
+    if (!available) return;
+    const ws = await freshWorkspace();
+    const credentialId = await connectCredential(ws, false);
+    const scenario = await seedScenario(ws);
+    const armed = await arm(scenario);
+    if (armed.action !== "waiting") throw new Error("expected waiter");
+
+    const mutation = await withCodexCapacityMutation(
+      dbA,
+      { workspaceId: ws.workspaceId, reason: "codex_policy_pin_changed" },
+      async (tx) => {
+        const changed = await setSessionCodexPin(
+          tx,
+          ws.workspaceId,
+          scenario.sessionId,
+          credentialId,
+          "policy",
+          { expected: { pinnedCredentialId: null, pinSource: null } },
+        );
+        return { result: changed, changed };
+      },
+    );
+    expect(mutation.result).toBe(true);
+    expect(mutation.wakeTargets).toEqual([
+      expect.objectContaining({
+        waiterId: armed.waiter.id,
+        generation: armed.waiter.generation,
+        wakeRevision: armed.waiter.wakeRevision + 1,
+      }),
+    ]);
   });
 
   test("manual goal pause or newer queued work supersedes without a continuation", async () => {

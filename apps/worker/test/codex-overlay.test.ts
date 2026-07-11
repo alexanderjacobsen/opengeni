@@ -1,7 +1,6 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { configuredModels, parseModelProvidersJson } from "@opengeni/config";
 import { CODEX_MODEL_CONTEXT_WINDOW_TOKENS } from "@opengeni/codex";
-import * as opengeniDb from "@opengeni/db";
 import { clientCompactionThresholdTokens } from "@opengeni/runtime";
 import { testSettings } from "@opengeni/testing";
 import type { Database } from "@opengeni/db";
@@ -10,8 +9,6 @@ import {
   withCodexAppsMcpServer,
   withCodexProvider,
 } from "../src/activities/capabilities";
-
-const BOTH_SCOPES = "api.connectors.read api.connectors.invoke";
 
 describe("withCodexProvider", () => {
   test("appends one codex-subscription provider with namespaced models", () => {
@@ -127,83 +124,54 @@ describe("settingsWithCodexCredential", () => {
   });
 
   test("active credential WITHOUT connector scopes => provider AND codex_apps server (scopes do not gate)", async () => {
-    const restore = mockCredentialStatus({ status: "active", scopes: null });
-    try {
-      const settings = testSettings({
-        codexSubscriptionEnabled: true,
-        modelProvidersJson: "[]",
-        mcpServers: [],
-      });
-      const result = await settingsWithCodexCredential({} as unknown as Database, "ws_1", settings);
-      expect(
-        parseModelProvidersJson(result.modelProvidersJson).some(
-          (p) => p.id === "codex-subscription",
-        ),
-      ).toBe(true);
-      // Connectors are account-gated server-side; a scope-less pro token still lists tools.
-      expect(result.mcpServers.some((s) => s.id === "codex_apps")).toBe(true);
-    } finally {
-      restore();
-    }
+    const settings = testSettings({
+      codexSubscriptionEnabled: true,
+      modelProvidersJson: "[]",
+      mcpServers: [],
+    });
+    const result = await settingsWithCodexCredential(
+      {} as unknown as Database,
+      "ws_1",
+      settings,
+      true,
+    );
+    expect(
+      parseModelProvidersJson(result.modelProvidersJson).some((p) => p.id === "codex-subscription"),
+    ).toBe(true);
+    // Connectors are account-gated server-side; a scope-less pro token still lists tools.
+    expect(result.mcpServers.some((s) => s.id === "codex_apps")).toBe(true);
   });
 
   test("active credential WITH connector scopes => both provider and codex_apps server", async () => {
-    const restore = mockCredentialStatus({ status: "active", scopes: BOTH_SCOPES });
-    try {
-      const settings = testSettings({
-        codexSubscriptionEnabled: true,
-        modelProvidersJson: "[]",
-        mcpServers: [],
-      });
-      const result = await settingsWithCodexCredential({} as unknown as Database, "ws_1", settings);
-      expect(
-        parseModelProvidersJson(result.modelProvidersJson).some(
-          (p) => p.id === "codex-subscription",
-        ),
-      ).toBe(true);
-      expect(result.mcpServers.some((s) => s.id === "codex_apps")).toBe(true);
-    } finally {
-      restore();
-    }
+    const settings = testSettings({
+      codexSubscriptionEnabled: true,
+      modelProvidersJson: "[]",
+      mcpServers: [],
+    });
+    const result = await settingsWithCodexCredential(
+      {} as unknown as Database,
+      "ws_1",
+      settings,
+      true,
+    );
+    expect(
+      parseModelProvidersJson(result.modelProvidersJson).some((p) => p.id === "codex-subscription"),
+    ).toBe(true);
+    expect(result.mcpServers.some((s) => s.id === "codex_apps")).toBe(true);
   });
 
   test("inactive credential => nothing new (no codex_apps server)", async () => {
-    const restore = mockCredentialStatus({ status: "needs_relogin", scopes: BOTH_SCOPES });
-    try {
-      const settings = testSettings({
-        codexSubscriptionEnabled: true,
-        modelProvidersJson: "[]",
-        mcpServers: [],
-      });
-      const result = await settingsWithCodexCredential({} as unknown as Database, "ws_1", settings);
-      expect(result).toBe(settings); // untouched
-    } finally {
-      restore();
-    }
+    const settings = testSettings({
+      codexSubscriptionEnabled: true,
+      modelProvidersJson: "[]",
+      mcpServers: [],
+    });
+    const result = await settingsWithCodexCredential(
+      {} as unknown as Database,
+      "ws_1",
+      settings,
+      false,
+    );
+    expect(result).toBe(settings); // untouched
   });
 });
-
-/**
- * Spies on @opengeni/db's getCodexCredentialStatus (the ONLY db read on the
- * overlay path) so settingsWithCodexCredential can be exercised end-to-end
- * without a live Postgres. Uses spyOn (NOT mock.module) deliberately: mock.module
- * registers a PROCESS-GLOBAL override that bleeds into other test files in the
- * same `bun test` run (notably packages/db's codex_subscription_credentials
- * integration test) and is NOT undone by mock.restore(). spyOn is scoped to the
- * namespace and the returned restorer fully reinstates the real implementation.
- */
-function mockCredentialStatus(overrides: { status: string; scopes: string | null }): () => void {
-  const spy = spyOn(opengeniDb, "getCodexCredentialStatus").mockResolvedValue({
-    connected: overrides.status === "active",
-    chatgptAccountId: "acct-1",
-    scopes: overrides.scopes,
-    planType: "pro",
-    status: overrides.status,
-    expiresAt: null,
-    lastRefreshAt: null,
-    lastError: null,
-  } as Awaited<ReturnType<typeof opengeniDb.getCodexCredentialStatus>>);
-  return () => {
-    spy.mockRestore();
-  };
-}

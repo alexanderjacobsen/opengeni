@@ -48,6 +48,33 @@ the completed tool call/full turn is never blindly replayed. Budget/credit
 exhaustion likewise idles the turn rather than failing the session, so a top-up
 lets the same session continue.
 
+Codex-subscription turns add one explicit recovery boundary before the model
+run. With workspace-local leasing enabled, the worker atomically selects and
+leases a credential under the workspace rotation-row lock; concurrent replicas
+therefore observe earlier reservations. A second 401, 403, explicit quota, or
+429 can quarantine that credential and requeue the same durable turn after a
+conversation-truth checkpoint. Network/5xx/invalid-content/partial-stream
+failures never rotate or blindly replay. The allocator, strict workspace scope,
+five-hour reset semantics, and rollout fence are canonical in
+[`codex-subscription-rotation.md`](codex-subscription-rotation.md).
+
+When every allocator-enabled Codex credential is unavailable and the session
+still has an active goal, this recovery boundary becomes a durable capacity
+wait. The worker atomically settles the blocked turn once, idles the session,
+and stores one session-scoped waiter fenced by goal version, control generation,
+accepted policy hash, and blocked turn. The workflow waits for the earliest
+authoritative provider reset or a bounded secret-safe metadata refresh, and
+capacity-affecting writes increment a same-transaction wake revision before a
+best-effort Temporal signal. Duplicate/lost signals are harmless: row-locked
+re-evaluation is the sole continuation writer, and unobserved revisions repair
+commit-to-signal loss after restart or `continueAsNew`; a signal delivered
+between waiter commit and the activity result is compared against the workflow's
+pre-dispatch wake counters and cannot be baselined away. Capacity return enqueues
+one normal, queue-respecting goal continuation with the blocked turn's effective
+model/reasoning/resources/tools while resetting execution-local worker-death and
+credential-failover counters; it does not create a user message, replay the
+failed full turn, poll with inference, or redeem a reset/boost entitlement.
+
 Provider context-window overflow is also handled inside the activity, not by a
 Temporal retry. When an OpenAI/Azure context overflow is classified,
 `runAgentTurn` forces client-side compaction through a bounded recovery

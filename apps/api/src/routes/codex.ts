@@ -33,14 +33,18 @@ import {
   fetchCodexUsageForAccount,
   getCodexCredentialStatus,
   getCodexRotationSettings,
+  listPendingCodexCapacityWakeTargets,
   listCodexAccountStatuses,
   loadCodexCredentialForRun,
   renameCodexAccount,
   setActiveCodexCredential,
+  setInitialActiveCodexCredential,
   updateCodexRotationSettings,
   upsertCodexSubscriptionCredential,
+  withCodexCapacityMutation,
   CODEX_ROTATION_STRATEGIES,
   type CodexAccountStatus,
+  type CodexCapacityWakeTarget,
   type CodexRotationStrategy,
 } from "@opengeni/db";
 
@@ -117,6 +121,38 @@ type CodexConnectState = {
   userCode?: string;
   iat?: number;
 };
+
+async function signalCodexCapacityTargets(
+  deps: ApiRouteDeps,
+  targets: CodexCapacityWakeTarget[],
+): Promise<void> {
+  await Promise.allSettled(
+    targets.map((target) =>
+      deps.workflowClient.signalCodexCapacity
+        ? deps.workflowClient.signalCodexCapacity({
+            accountId: target.accountId,
+            workspaceId: target.workspaceId,
+            sessionId: target.sessionId,
+            workflowId: target.workflowId,
+            wakeRevision: target.wakeRevision,
+          })
+        : deps.workflowClient.wakeSessionWorkflow({
+            accountId: target.accountId,
+            workspaceId: target.workspaceId,
+            sessionId: target.sessionId,
+            workflowId: target.workflowId,
+          }),
+    ),
+  );
+}
+
+async function signalPendingCodexCapacityTargets(
+  deps: ApiRouteDeps,
+  workspaceId: string,
+): Promise<void> {
+  const targets = await listPendingCodexCapacityWakeTargets(deps.db, workspaceId).catch(() => []);
+  await signalCodexCapacityTargets(deps, targets);
+}
 
 const CODEX_DEVICE_EXPIRY_SECONDS = 15 * 60; // the device code expires 15 min after start (spec §1.1)
 
@@ -211,37 +247,49 @@ export function registerCodexRoutes(app: Hono, deps: ApiRouteDeps): void {
         message: "OPENGENI_ENVIRONMENTS_ENCRYPTION_KEY is not configured",
       });
     }
-    const upserted = await upsertCodexSubscriptionCredential(db, {
-      accountId: grant.accountId,
-      workspaceId,
-      credentialEncrypted: encryptEnvironmentValue(
-        key,
-        JSON.stringify({
-          access_token: tokens.accessToken,
-          refresh_token: tokens.refreshToken,
-          id_token: tokens.idToken,
-        }),
-      ),
-      chatgptAccountId: id.chatgptAccountId,
-      scopes: null, // device grant scopes are discovered at runtime, not asserted here
-      planType: id.planType,
-      isFedramp: id.isFedramp,
-      expiresAt: accessTokenExpiry(tokens.accessToken),
-      lastRefreshAt: new Date(),
-      accountEmail: id.email ?? null,
-      label: id.email ?? id.chatgptAccountId ?? null,
-    });
+    await ensureCodexRotationSettings(db, grant.accountId, workspaceId);
+    const mutation = await withCodexCapacityMutation(
+      db,
+      { workspaceId, reason: "codex_credential_connected" },
+      async (tx) => {
+        const upserted = await upsertCodexSubscriptionCredential(tx, {
+          accountId: grant.accountId,
+          workspaceId,
+          credentialEncrypted: encryptEnvironmentValue(
+            key,
+            JSON.stringify({
+              access_token: tokens.accessToken,
+              refresh_token: tokens.refreshToken,
+              id_token: tokens.idToken,
+            }),
+          ),
+          chatgptAccountId: id.chatgptAccountId,
+          scopes: null, // device grant scopes are discovered at runtime, not asserted here
+          planType: id.planType,
+          isFedramp: id.isFedramp,
+          expiresAt: accessTokenExpiry(tokens.accessToken),
+          lastRefreshAt: new Date(),
+          accountEmail: id.email ?? null,
+          label: id.email ?? id.chatgptAccountId ?? null,
+        });
+        return { result: upserted, changed: true };
+      },
+    );
+    const upserted = mutation.result;
     // Ensure the per-workspace rotation-settings row exists, then auto-activate
     // the FIRST account only. Additional new accounts do NOT auto-activate — a
     // manual switch is required (no auto-rotation in P1). A re-connect of the
     // already-active account is a no-op for the pointer.
-    await ensureCodexRotationSettings(db, grant.accountId, workspaceId);
+    // Keep both rotation bits false on first connect. The deployment flag makes
+    // the compatible allocator available, but the workspace-local cutover bit
+    // is enabled only by an explicit settings write after every worker replica
+    // understands leasing.
     const rotation = await getCodexRotationSettings(db, workspaceId);
     let isActive = rotation?.activeCredentialId === upserted.id;
     if (!isActive && rotation?.activeCredentialId == null) {
-      await setActiveCodexCredential(db, workspaceId, upserted.id);
-      isActive = true;
+      isActive = await setInitialActiveCodexCredential(db, workspaceId, upserted.id);
     }
+    await signalCodexCapacityTargets(deps, mutation.wakeTargets);
     return c.json({ status: "connected", plan: id.planType, accountId: upserted.id, isActive });
   });
 
@@ -331,10 +379,19 @@ export function registerCodexRoutes(app: Hono, deps: ApiRouteDeps): void {
     const workspaceId = c.req.param("workspaceId");
     await requireAccessGrant(c, deps, workspaceId, "workspace:admin");
     const accountId = c.req.param("accountId");
-    const activated = await setActiveCodexCredential(db, workspaceId, accountId);
+    const mutation = await withCodexCapacityMutation(
+      db,
+      { workspaceId, reason: "codex_active_credential_changed" },
+      async (tx) => {
+        const activated = await setActiveCodexCredential(tx, workspaceId, accountId);
+        return { result: activated, changed: activated };
+      },
+    );
+    const activated = mutation.result;
     if (!activated) {
       throw new HTTPException(404, { message: "codex account not found" });
     }
+    await signalCodexCapacityTargets(deps, mutation.wakeTargets);
     return c.json({ activated: true, accountId });
   });
 
@@ -361,10 +418,19 @@ export function registerCodexRoutes(app: Hono, deps: ApiRouteDeps): void {
       throw new HTTPException(400, { message: "no settings to update" });
     }
     await ensureCodexRotationSettings(db, grant.accountId, workspaceId);
-    const updated = await updateCodexRotationSettings(db, workspaceId, patch);
+    const mutation = await withCodexCapacityMutation(
+      db,
+      { workspaceId, reason: "codex_rotation_settings_changed" },
+      async (tx) => {
+        const updated = await updateCodexRotationSettings(tx, workspaceId, patch);
+        return { result: updated, changed: updated !== null };
+      },
+    );
+    const updated = mutation.result;
     if (!updated) {
       throw new HTTPException(404, { message: "codex rotation settings not found" });
     }
+    await signalCodexCapacityTargets(deps, mutation.wakeTargets);
     return c.json({
       rotationEnabled: updated.rotationEnabled,
       rotationStrategy: updated.rotationStrategy,
@@ -397,7 +463,16 @@ export function registerCodexRoutes(app: Hono, deps: ApiRouteDeps): void {
     const workspaceId = c.req.param("workspaceId");
     await requireAccessGrant(c, deps, workspaceId, "workspace:admin");
     const accountId = c.req.param("accountId");
-    const result = await disconnectCodexAccount(db, workspaceId, accountId);
+    const mutation = await withCodexCapacityMutation(
+      db,
+      { workspaceId, reason: "codex_credential_disconnected" },
+      async (tx) => {
+        const result = await disconnectCodexAccount(tx, workspaceId, accountId);
+        return { result, changed: result.removed };
+      },
+    );
+    const result = mutation.result;
+    await signalCodexCapacityTargets(deps, mutation.wakeTargets);
     return c.json({ disconnected: result.removed, newActiveId: result.newActiveCredentialId });
   });
 
@@ -406,7 +481,16 @@ export function registerCodexRoutes(app: Hono, deps: ApiRouteDeps): void {
   app.delete("/v1/workspaces/:workspaceId/codex", async (c) => {
     const workspaceId = c.req.param("workspaceId");
     await requireAccessGrant(c, deps, workspaceId, "workspace:admin");
-    const removed = await disconnectAllCodexAccounts(db, workspaceId);
+    const mutation = await withCodexCapacityMutation(
+      db,
+      { workspaceId, reason: "codex_credentials_disconnected" },
+      async (tx) => {
+        const removed = await disconnectAllCodexAccounts(tx, workspaceId);
+        return { result: removed, changed: removed > 0 };
+      },
+    );
+    const removed = mutation.result;
+    await signalCodexCapacityTargets(deps, mutation.wakeTargets);
     return c.json({ disconnected: removed > 0 });
   });
 
@@ -421,6 +505,7 @@ export function registerCodexRoutes(app: Hono, deps: ApiRouteDeps): void {
       throw new HTTPException(404, { message: "codex subscription is not connected" });
     }
     const payload = await fetchCodexUsageForAccount(db, settings, workspaceId, status.credentialId);
+    await signalPendingCodexCapacityTargets(deps, workspaceId);
     return c.json(codexUsageJson(payload));
   });
 
@@ -437,6 +522,7 @@ export function registerCodexRoutes(app: Hono, deps: ApiRouteDeps): void {
       throw new HTTPException(404, { message: "codex account not found" });
     }
     const payload = await fetchCodexUsageForAccount(db, settings, workspaceId, accountId);
+    await signalPendingCodexCapacityTargets(deps, workspaceId);
     return c.json(codexUsageJson(payload));
   });
 
@@ -480,6 +566,7 @@ export function registerCodexRoutes(app: Hono, deps: ApiRouteDeps): void {
     await Promise.all(
       Array.from({ length: Math.min(CONCURRENCY, Math.max(1, accounts.length)) }, () => worker()),
     );
+    await signalPendingCodexCapacityTargets(deps, workspaceId);
     return c.json({ usage });
   });
 }

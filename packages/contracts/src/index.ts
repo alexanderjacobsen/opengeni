@@ -3107,6 +3107,14 @@ export const SessionEventType = z.enum([
   // (manual switch in P1; failover/rotation in P3 reuse the same event). Drives
   // the in-session "Running on:" indicator's live flip.
   "codex.account.switched",
+  // OPE-21 per-turn selection audit. Payload is metadata only: credential row
+  // id, bounded strategy/reason, and pool counts — never token material.
+  "codex.credential.selected",
+  // OPE-21 durable zero-capacity wait lifecycle. Runtime/system events only;
+  // no synthetic user message is created when capacity returns.
+  "codex.capacity.waiting",
+  "codex.capacity.resumed",
+  "codex.capacity.superseded",
   // Sandbox durability observability (sandbox-file-persistence). The 2026-07
   // incidents (mid-session box death with /workspace loss; a fatal manifest-env
   // delta on a live box) were near-unattributable because box lifecycle left no

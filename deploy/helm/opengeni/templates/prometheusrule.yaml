@@ -39,6 +39,20 @@ spec:
             severity: warning
           annotations:
             summary: OpenGeni reaper terminated provider-side orphan sandboxes
+        - alert: OpenGeniCodexCredentialPoolEmpty
+          expr: increase(opengeni_codex_pool_low_total{depth="zero"}[5m]) > 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: A Codex workspace observed no eligible subscription credentials
+        - alert: OpenGeniCodexCredentialPoolSingle
+          expr: increase(opengeni_codex_pool_low_total{depth="one"}[15m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: A Codex workspace is operating with only one eligible subscription credential
         - alert: OpenGeniServiceDown
           expr: up{job=~".*opengeni.*"} == 0
           for: 5m

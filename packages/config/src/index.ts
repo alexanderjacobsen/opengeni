@@ -280,6 +280,11 @@ const SettingsSchema = z.object({
   // tool that BM25-discloses only the matching connectors. Default OFF — a codex
   // turn is byte-for-byte unchanged until enabled. OPENGENI_CODEX_TOOL_SEARCH_ENABLED
   codexToolSearchEnabled: EnvBoolean.default(false),
+  // OPE-21 atomic, workspace-local credential allocation. Default OFF is a
+  // deliberate rolling-deploy fence: migrate + roll every worker first, then
+  // enable. Turning it off restores the legacy sticky selector without a schema
+  // rollback; the additive lease table/cursor columns become inert.
+  codexCredentialLeasingEnabled: EnvBoolean.default(false),
   // Multi-account P3 (auto-rotation): an account is "near exhaustion" — ineligible to be
   // rotated TO — when EITHER usage window (5h/weekly) is at/over this percent. Default 90 to
   // match the UI danger flip (UsageBar danger at pct >= 90). OPENGENI_CODEX_ROTATION_NEAR_EXHAUSTION_PCT.
@@ -1059,6 +1064,7 @@ export function getSettings(): Settings {
     modelProvidersJson: optional("OPENGENI_MODEL_PROVIDERS_JSON"),
     codexSubscriptionEnabled: optional("OPENGENI_CODEX_SUBSCRIPTION_ENABLED"),
     codexToolSearchEnabled: optional("OPENGENI_CODEX_TOOL_SEARCH_ENABLED"),
+    codexCredentialLeasingEnabled: optional("OPENGENI_CODEX_CREDENTIAL_LEASING_ENABLED"),
     codexProductSku: optional("OPENGENI_CODEX_PRODUCT_SKU"),
     codexRotationNearExhaustionPct: optional("OPENGENI_CODEX_ROTATION_NEAR_EXHAUSTION_PCT"),
     openaiReasoningEffort: optional("OPENGENI_OPENAI_REASONING_EFFORT"),

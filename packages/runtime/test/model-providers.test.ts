@@ -117,6 +117,23 @@ describe("buildProviderClient", () => {
     // One client per provider id (module-level cache).
     expect(buildProviderClient(provider, settings)).toBe(client);
   });
+
+  test("Codex disables blind SDK retries and leaves retry classification to its transport", () => {
+    const settings = multiProviderSettings();
+    const provider: ResolvedModelProvider = {
+      id: "codex-subscription-no-retry-test",
+      label: "Codex subscription",
+      kind: "codex-subscription",
+      api: "responses",
+      builtin: false,
+      apiKey: "placeholder",
+      baseUrl: "https://chatgpt.com/backend-api",
+      compactionMode: "client",
+    };
+    const client = buildProviderClient(provider, settings);
+    expect(settings.openaiMaxRetries).toBeGreaterThan(0);
+    expect(client.maxRetries).toBe(0);
+  });
 });
 
 describe("resolveTurnModel", () => {

@@ -26,6 +26,14 @@ export type WakeSessionWorkflowSignal = (input: {
   workflowId: string;
 }) => Promise<void>;
 
+export type SignalCodexCapacityWorkflow = (input: {
+  accountId: string;
+  workspaceId: string;
+  sessionId: string;
+  workflowId: string;
+  wakeRevision: number;
+}) => Promise<void>;
+
 export type ActivityServices = {
   settings: Settings;
   db: Database;
@@ -35,6 +43,8 @@ export type ActivityServices = {
   documentServices: DocumentServices;
   observability: Observability;
   wakeSessionWorkflow: WakeSessionWorkflowSignal | null;
+  /** Revision-carrying capacity nudge; queue wake remains the back-compat fallback. */
+  signalCodexCapacityWorkflow?: SignalCodexCapacityWorkflow | null;
   // §7.5 P3 — host-entitlements port, the WORKER half of the same seam the API
   // edge exposes on `AppDependencies`. When set, `ensureRunAllowed` (turn-entry
   // AND the mid-stream budget valve) delegates the funding decision to
@@ -66,6 +76,32 @@ export type ActivityServices = {
   // mapping bug returning tenant B's creds for a tenant-A run is caught here.
   connectionCredentials?: ConnectionCredentialsPort | null;
 };
+
+export type CodexCapacityWaitRef = {
+  waiterId: string;
+  generation: number;
+  nextCheckAt: string;
+  wakeRevision: number;
+};
+
+export type GetCodexCapacityWaitInput = {
+  workspaceId: string;
+  sessionId: string;
+};
+
+export type ReconcileCodexCapacityWaitInput = {
+  accountId: string;
+  workspaceId: string;
+  sessionId: string;
+  waiterId: string;
+  generation: number;
+  cause: "timer" | "signal" | "queue" | "recovery";
+};
+
+export type ReconcileCodexCapacityWaitResult =
+  | ({ action: "waiting" } & CodexCapacityWaitRef)
+  | { action: "resumed"; turnId: string }
+  | { action: "superseded" | "stale" };
 
 export type ActivityDependencies = Partial<ActivityServices>;
 
@@ -171,4 +207,8 @@ export type RunAgentTurnResult = {
   // "continue now" (invariant 4: NO THRASH). Distinct from a normal continueDelayMs:0
   // which legitimately means "a rotation candidate is ready, re-dispatch immediately".
   idleUntilReset?: boolean;
+  // Durable native zero-pool wait. Unlike continueDelayMs, this reference is
+  // persisted in Postgres and reconstructed after workflow/worker restart.
+  // The workflow must not call maybeContinueGoal while this waiter is active.
+  capacityWait?: CodexCapacityWaitRef;
 };

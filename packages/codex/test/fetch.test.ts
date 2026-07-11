@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  CODEX_TRANSPORT_ERROR_HEADER,
   type CodexRequestContext,
   type CodexTokenSnapshot,
   type CodexUsageHeaderSnapshot,
@@ -7,6 +8,7 @@ import {
   classifyCodexUsageLimitError,
   codexRequestStorage,
   codexSubscriptionFetch,
+  isCodexTransportError,
   parseCodexUsageHeaders,
 } from "../src";
 
@@ -107,6 +109,96 @@ describe("codexSubscriptionFetch", () => {
     expect(captures.length).toBe(2);
     expect(new Headers(captures[1]?.init?.headers).get("authorization")).toBe("Bearer AC2");
     expect(res.status).toBe(200);
+  });
+
+  test("a second 401 is returned after exactly one refresh and two requests", async () => {
+    const { base, captures } = baseRecorder([401, 401, 200]);
+    let refreshed = 0;
+    const response = await codexRequestStorage.run(
+      ctx({
+        refresh: async () => {
+          refreshed += 1;
+          return { accessToken: "AC2", chatgptAccountId: "acct_1", isFedramp: false };
+        },
+      }),
+      () =>
+        codexSubscriptionFetch(base)("https://chatgpt.com/backend-api/responses", {
+          method: "POST",
+          body: "{}",
+        }),
+    );
+    expect(response.status).toBe(401);
+    expect(response.headers.get(CODEX_TRANSPORT_ERROR_HEADER)).toBe("1");
+    expect(refreshed).toBe(1);
+    expect(captures).toHaveLength(2);
+  });
+
+  test("403 is definitive and never spends the refresh retry", async () => {
+    const { base, captures } = baseRecorder([403, 200]);
+    let refreshed = 0;
+    const response = await codexRequestStorage.run(
+      ctx({
+        refresh: async () => {
+          refreshed += 1;
+          return { accessToken: "AC2", chatgptAccountId: "acct_1", isFedramp: false };
+        },
+      }),
+      () =>
+        codexSubscriptionFetch(base)("https://chatgpt.com/backend-api/responses", {
+          method: "POST",
+          body: "{}",
+        }),
+    );
+    expect(response.status).toBe(403);
+    expect(response.headers.get(CODEX_TRANSPORT_ERROR_HEADER)).toBe("1");
+    expect(refreshed).toBe(0);
+    expect(captures).toHaveLength(1);
+  });
+
+  test("malformed non-streaming SSE is not replayed against another request", async () => {
+    let calls = 0;
+    const response = await codexRequestStorage.run(ctx(), () =>
+      codexSubscriptionFetch(async () => {
+        calls += 1;
+        return new Response("data: not-json\n\n", { status: 200 });
+      })("https://chatgpt.com/backend-api/responses", {
+        method: "POST",
+        body: JSON.stringify({ stream: false }),
+      }),
+    );
+    expect(await response.json()).toEqual({});
+    expect(calls).toBe(1);
+  });
+
+  test("partial streaming body failure is surfaced without a transport replay", async () => {
+    let calls = 0;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          new TextEncoder().encode(
+            'data: {"type":"response.output_item.done","item":{"type":"message"}}\n\n',
+          ),
+        );
+        controller.error(new Error("injected partial stream failure"));
+      },
+    });
+    const response = await codexRequestStorage.run(ctx(), () =>
+      codexSubscriptionFetch(async () => {
+        calls += 1;
+        return new Response(body, { status: 200 });
+      })("https://chatgpt.com/backend-api/responses", {
+        method: "POST",
+        body: JSON.stringify({ stream: true }),
+      }),
+    );
+    let observed: unknown;
+    try {
+      await response.text();
+    } catch (error) {
+      observed = error;
+    }
+    expect(String(observed)).toContain("injected partial stream failure");
+    expect(calls).toBe(1);
   });
 
   // A realistic codex stream: the terminal response.completed leaves output EMPTY,
@@ -242,6 +334,15 @@ describe("codexSubscriptionFetch", () => {
 });
 
 describe("classifyCodexUsageLimitError", () => {
+  test("recognizes only buffered Codex transport provenance through an SDK cause chain", () => {
+    const inner = Object.assign(new Error("provider refusal"), {
+      headers: new Headers({ [CODEX_TRANSPORT_ERROR_HEADER]: "1" }),
+    });
+    expect(isCodexTransportError(Object.assign(new Error("wrapped"), { cause: inner }))).toBe(true);
+    expect(
+      isCodexTransportError(Object.assign(new Error("unrelated MCP refusal"), { status: 403 })),
+    ).toBe(false);
+  });
   test("detects an OpenAI-shaped 429 usage_limit_reached and extracts the reset window", () => {
     const err = Object.assign(new Error("429 limit"), {
       status: 429,

@@ -603,7 +603,7 @@ Minimum production dashboards should cover:
 - API traffic: request rate, error rate, and p50/p95/p99 latency by `route`, `method`, `status`, `variable set`, and `component`.
 - Worker execution: activity run rate, failure rate, and p50/p95/p99 `runAgentTurn` duration by `activity`, `status`, `variable set`, and `component`.
 - Turn lifecycle: `opengeni_turns_total{outcome}`, `opengeni_turn_duration_seconds`, `opengeni_turns_inflight`, and `opengeni_turn_oldest_inflight_age_seconds`.
-- Model and sandbox SLIs: `opengeni_model_calls_total{provider,outcome}`, `opengeni_model_call_duration_seconds{provider}`, `opengeni_sandbox_creates_total{backend,outcome}`, `opengeni_sandbox_create_duration_seconds{backend}`, `opengeni_sandbox_leases{liveness}`, `opengeni_sandbox_warming_timeouts_total`, and `opengeni_sandbox_orphans_terminated_total`.
+- Model, Codex, and sandbox SLIs: `opengeni_model_calls_total{provider,outcome}`, `opengeni_model_call_duration_seconds{provider}`, `opengeni_codex_credential_selections_total{strategy,reason}`, `opengeni_codex_credential_failures_total{kind,outcome}`, `opengeni_codex_pool_observations_total{depth}`, `opengeni_codex_pool_low_total{depth}`, `opengeni_sandbox_creates_total{backend,outcome}`, `opengeni_sandbox_create_duration_seconds{backend}`, `opengeni_sandbox_leases{liveness}`, `opengeni_sandbox_warming_timeouts_total`, and `opengeni_sandbox_orphans_terminated_total`.
 - Queue and billing: `opengeni_turns_queued`, `opengeni_credit_balance_micros{account_id}`, `opengeni_credit_micros_total{kind}`, and `opengeni_build_info{version,revision}`.
 - Dependency health: Postgres connection health, Temporal worker poll health, NATS connectivity, object-storage write/read conformance, and sandbox backend readiness.
 - Runtime health: API/worker restarts, CPU/memory saturation, pod pending time, collector scrape/export errors, and OTLP export failures.
@@ -650,6 +650,7 @@ Minimum production alerts:
 - Turn stuck: the oldest in-flight turn is older than 15 minutes for 5 minutes.
 - Sandbox create failures: sandbox create failure ratio is above 20% for 10 minutes.
 - Sandbox orphan growth: `increase(opengeni_sandbox_orphans_terminated_total[30m]) > 0`.
+- Codex credential pool: any zero-eligible observation is critical; repeated one-eligible observations are warning-level reduced redundancy. The default PrometheusRule uses `opengeni_codex_pool_low_total{depth="zero"|"one"}`.
 - Worker failures: `runAgentTurn` failure ratio is above 5% for 10 minutes.
 - Worker duration: p95 `runAgentTurn` duration is above the expected model/tool budget for 15 minutes.
 - Scheduler health: manual scheduled-task conformance does not dispatch a session through Temporal within the configured timeout.

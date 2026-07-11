@@ -12,14 +12,10 @@
 // refresh helpers and the @opengeni/config key — keeping the refresh-CAS + RLS
 // invariants co-located with the rows they protect.
 //
-// CROSS-PROCESS SAFETY is preserved unchanged: the single-flight `inflight` map is
-// process-module-scoped, so worker and api each get their own — that is CORRECT
-// (each process coalesces its own concurrent refreshes). The real cross-process
-// guard is the (id, version) CAS inside recordCodexTokenRefresh: if the api
-// refreshes a token while a worker turn refreshes the same account, the loser's
-// CAS writes 0 rows (stale version) and it re-reads the winner's token, so the
-// one-time refresh token is never double-spent. RLS is untouched (every accessor
-// wraps withWorkspaceRls internally).
+// CROSS-PROCESS SAFETY: the process-module `inflight` map coalesces local callers,
+// while a Postgres advisory transaction lock serializes API/worker replicas. A
+// waiter re-reads after taking that lock and skips refresh when the version moved.
+// The existing (id,version) CAS remains the final stale-family write fence.
 
 import { environmentsEncryptionKeyBytes, type Settings } from "@opengeni/config";
 import {
@@ -40,6 +36,7 @@ import {
   recordCodexAccountUsage,
   recordCodexTokenRefresh,
   setCodexCredentialStatus,
+  withCodexCredentialRefreshLock,
   type CodexCredentialForRun,
   type Database,
 } from "./index";
@@ -63,6 +60,7 @@ export type CodexAuthDeps = {
   refresh: typeof refreshCodexToken;
   encrypt: typeof encryptEnvironmentValue;
   keyBytes: typeof environmentsEncryptionKeyBytes;
+  withRefreshLock: typeof withCodexCredentialRefreshLock;
 };
 
 const defaultDeps: CodexAuthDeps = {
@@ -72,6 +70,7 @@ const defaultDeps: CodexAuthDeps = {
   refresh: refreshCodexToken,
   encrypt: encryptEnvironmentValue,
   keyBytes: environmentsEncryptionKeyBytes,
+  withRefreshLock: withCodexCredentialRefreshLock,
 };
 
 export function buildCodexTokenResolver(
@@ -92,7 +91,10 @@ export function buildCodexTokenResolver(
     isFedramp: cred.isFedramp,
   });
 
-  const performRefresh = async (cred: CodexCredentialForRun): Promise<CodexTokenSnapshot> => {
+  const performRefresh = async (
+    refreshDb: Database,
+    cred: CodexCredentialForRun,
+  ): Promise<CodexTokenSnapshot> => {
     try {
       const next = await deps.refresh(cred.tokens.refreshToken);
       const tokens = {
@@ -107,7 +109,7 @@ export function buildCodexTokenResolver(
       // Compare-and-set on the loaded (id, version): if a disconnect→reconnect
       // replaced the row mid-refresh, this writes 0 rows and we must NOT clobber
       // the new credential with our now-defunct rotated tokens.
-      const persisted = await deps.recordRefresh(db, {
+      const persisted = await deps.recordRefresh(refreshDb, {
         id: cred.id,
         version: cred.version,
         workspaceId,
@@ -119,7 +121,7 @@ export function buildCodexTokenResolver(
         // The row changed under us. Our rotated tokens belong to a stale family;
         // fall back to whatever is connected NOW (a reconnect leaves an active
         // row). If nothing active remains, a relogin is genuinely required.
-        const current = await deps.loadCredential(db, settings, workspaceId, credentialId);
+        const current = await deps.loadCredential(refreshDb, settings, workspaceId, credentialId);
         if (current && current.status === "active") {
           return snapshot(current);
         }
@@ -138,7 +140,7 @@ export function buildCodexTokenResolver(
         // (compare-and-set on the loaded id+version). A relogin triggered by the
         // OLD token family must never stamp needs_relogin onto a freshly
         // reconnected credential.
-        await deps.setStatus(db, workspaceId, "needs_relogin", error.message, {
+        await deps.setStatus(refreshDb, workspaceId, "needs_relogin", error.message, {
           id: cred.id,
           version: cred.version,
         });
@@ -147,21 +149,45 @@ export function buildCodexTokenResolver(
     }
   };
 
-  // ALL refreshes — whether triggered by proactive staleness (getToken) or by a
-  // 401 retry (refresh) — coalesce onto one in-flight promise per credential
-  // instance, so concurrent calls can never double-spend the one-time refresh
-  // token (which would trigger refresh_token_reused -> needs_relogin).
+  // ALL refreshes — whether proactive or a 401 retry — coalesce locally and then
+  // serialize globally before any rotating refresh token reaches the provider.
   const doRefresh = (cred: CodexCredentialForRun): Promise<CodexTokenSnapshot> => {
     const key = `${cred.id}:${cred.version}`;
     const existing = inflight.get(key);
     if (existing) {
       return existing;
     }
-    const promise = performRefresh(cred).finally(() => {
-      if (inflight.get(key) === promise) {
-        inflight.delete(key);
-      }
-    });
+    const promise = deps
+      .withRefreshLock(db, workspaceId, credentialId, async (lockedDb) => {
+        try {
+          const current = await deps.loadCredential(lockedDb, settings, workspaceId, credentialId);
+          if (!current || current.status !== "active") {
+            throw new CodexReloginRequired(
+              "Codex credential became unavailable while waiting to refresh.",
+            );
+          }
+          if (current.version !== cred.version) {
+            return { ok: true as const, value: snapshot(current) };
+          }
+          return { ok: true as const, value: await performRefresh(lockedDb, current) };
+        } catch (error) {
+          // withCodexCredentialRefreshLock uses an advisory TRANSACTION lock.
+          // performRefresh may persist `needs_relogin` before surfacing a
+          // permanent OAuth failure; throwing from this callback would roll that
+          // status write back with the outer transaction. Return the failure so
+          // the transaction commits, then rethrow after the lock is released.
+          return { ok: false as const, error };
+        }
+      })
+      .then((outcome) => {
+        if (!outcome.ok) throw outcome.error;
+        return outcome.value;
+      })
+      .finally(() => {
+        if (inflight.get(key) === promise) {
+          inflight.delete(key);
+        }
+      });
     inflight.set(key, promise);
     return promise;
   };

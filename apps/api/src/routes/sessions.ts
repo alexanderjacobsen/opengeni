@@ -51,6 +51,7 @@ import {
   requestSessionCompaction,
   requireSession,
   setSessionCodexPin,
+  withCodexCapacityMutation,
   revokeViewer,
   setSessionGoalStatus,
   updatePtySessionActivity,
@@ -169,10 +170,36 @@ export function registerSessionRoutes(app: Hono, deps: ApiRouteDeps): void {
       throw new HTTPException(400, { message: 'target is required ("auto" or an account id)' });
     }
     const pinned = target === "auto" ? null : target;
-    const ok = await setSessionCodexPin(db, workspaceId, sessionId, pinned);
+    const mutation = await withCodexCapacityMutation(
+      db,
+      { workspaceId, reason: "codex_manual_session_pin_changed" },
+      async (tx) => {
+        const changed = await setSessionCodexPin(tx, workspaceId, sessionId, pinned);
+        return { result: changed, changed };
+      },
+    );
+    const ok = mutation.result;
     if (!ok) {
       throw new HTTPException(404, { message: "session or codex account not found" });
     }
+    await Promise.allSettled(
+      mutation.wakeTargets.map((wake) =>
+        workflowClient.signalCodexCapacity
+          ? workflowClient.signalCodexCapacity({
+              accountId: wake.accountId,
+              workspaceId: wake.workspaceId,
+              sessionId: wake.sessionId,
+              workflowId: wake.workflowId,
+              wakeRevision: wake.wakeRevision,
+            })
+          : workflowClient.wakeSessionWorkflow({
+              accountId: wake.accountId,
+              workspaceId: wake.workspaceId,
+              sessionId: wake.sessionId,
+              workflowId: wake.workflowId,
+            }),
+      ),
+    );
     return c.json({ pinned: target === "auto" ? "auto" : target });
   });
 

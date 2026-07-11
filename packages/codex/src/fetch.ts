@@ -20,6 +20,38 @@ import {
 
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
+/**
+ * Internal provenance marker copied onto buffered non-OK Codex responses.
+ * OpenAI's APIError preserves response headers, which lets the worker
+ * distinguish a model-provider refusal from an unrelated sandbox/MCP HTTP
+ * error that happened during the same Codex turn.
+ */
+export const CODEX_TRANSPORT_ERROR_HEADER = "x-opengeni-codex-transport-error";
+
+function headersCarryCodexTransportMarker(headers: unknown): boolean {
+  if (!headers || typeof headers !== "object") return false;
+  const getter = (headers as { get?: unknown }).get;
+  if (typeof getter === "function") {
+    return getter.call(headers, CODEX_TRANSPORT_ERROR_HEADER) === "1";
+  }
+  const record = headers as Record<string, unknown>;
+  return (
+    record[CODEX_TRANSPORT_ERROR_HEADER] === "1" ||
+    record[CODEX_TRANSPORT_ERROR_HEADER.toLowerCase()] === "1"
+  );
+}
+
+/** True only for an error produced from this Codex transport's non-OK response. */
+export function isCodexTransportError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 6 && current && typeof current === "object"; depth += 1) {
+    const value = current as Record<string, unknown>;
+    if (headersCarryCodexTransportMarker(value.headers)) return true;
+    current = value.cause;
+  }
+  return false;
+}
+
 /** Parse an integer header value; null when absent or not a finite integer. */
 function parseIntHeader(value: string | null): number | null {
   if (value === null) {
@@ -151,7 +183,12 @@ export function codexSubscriptionFetch(base: FetchLike = globalThis.fetch): Fetc
         ctx.onUsageHeaders?.(usage);
       }
       if (process.env.CODEX_DEBUG && !res.ok) {
-        console.error(`[codex-debug] <- ${res.status} ${await res.clone().text()}`);
+        // Never log provider bodies: they can contain request-derived content or
+        // account details. Status + request id is sufficient to correlate with
+        // the structured worker failure telemetry.
+        console.error(
+          `[codex-debug] <- ${res.status} requestId=${res.headers.get("x-request-id") ?? "unknown"}`,
+        );
       }
       // The codex backend leaves the terminal event's response.output empty and
       // delivers the assistant items via output_item.done events instead. The
@@ -236,6 +273,7 @@ async function bufferCodexErrorResponse(res: Response): Promise<Response> {
   const bodyText = await res.text().catch(() => "");
   const headers = new Headers(res.headers);
   headers.set("content-type", "application/json");
+  headers.set(CODEX_TRANSPORT_ERROR_HEADER, "1");
   headers.delete("content-length"); // body re-serialized
   headers.delete("content-encoding"); // text() already decoded any gzip
   let errorType: string | undefined;

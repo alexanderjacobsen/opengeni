@@ -130,6 +130,28 @@ describe("codex_pin_source (AM-2)", () => {
     expect(state?.pinSource).toBe("manual");
   });
 
+  test("a stale policy CAS cannot overwrite a concurrent manual pin", async () => {
+    if (!available) return;
+    const ws = await freshWorkspace();
+    const sessionId = await seedSession(ws);
+    const firstPolicyHome = await seedCodexAccount(ws);
+    const nextPolicyHome = await seedCodexAccount(ws);
+    await setSessionCodexPin(db, ws.workspaceId, sessionId, firstPolicyHome, "policy");
+    const observed = await getSessionCodexState(db, ws.workspaceId, sessionId);
+    if (!observed) throw new Error("expected session codex state");
+
+    await setSessionCodexPin(db, ws.workspaceId, sessionId, nextPolicyHome, "manual");
+    expect(
+      await setSessionCodexPin(db, ws.workspaceId, sessionId, firstPolicyHome, "policy", {
+        expected: observed,
+      }),
+    ).toBe(false);
+    expect(await getSessionCodexState(db, ws.workspaceId, sessionId)).toMatchObject({
+      pinnedCredentialId: nextPolicyHome,
+      pinSource: "manual",
+    });
+  });
+
   test("migration 0051 backfill stamps a pre-existing (unlabeled) pin 'manual', leaving policy/unpinned rows untouched", async () => {
     if (!available) return;
     const ws = await freshWorkspace();

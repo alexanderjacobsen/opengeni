@@ -236,6 +236,15 @@ export const codexSubscriptionCredentials = pgTable(
     // can't false-drop coverage. connectorsCheckedAt is the freshness clock.
     connectorNamespaces: text("connector_namespaces").array(),
     connectorsCheckedAt: timestamp("connectors_checked_at", { withTimezone: true }),
+    // Workspace-local, server-held fairness cursor. Provider usage headers are
+    // capacity hints, never the sole allocator: live lease count is ranked first
+    // and this cursor deterministically breaks equal-load/equal-capacity ties.
+    // This flag controls NEW automatic allocations only. Credential health,
+    // refresh, encrypted material, and already-frozen/in-flight turns are
+    // intentionally independent. OPE-24 owns toggle OCC/audit and product UI.
+    allocatorEnabled: boolean("allocator_enabled").notNull().default(true),
+    selectionCount: integer("selection_count").notNull().default(0),
+    lastSelectedAt: timestamp("last_selected_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -248,6 +257,12 @@ export const codexSubscriptionCredentials = pgTable(
       .on(table.workspaceId, table.chatgptAccountId)
       .where(sql`${table.chatgptAccountId} is not null`),
     workspace: index("codex_subscription_credentials_workspace_lookup_idx").on(table.workspaceId),
+    // Composite identity is the defense-in-depth FK target for workspace-local
+    // lease references in migration 0053.
+    workspaceIdentity: uniqueIndex("codex_subscription_credentials_workspace_id_idx").on(
+      table.workspaceId,
+      table.id,
+    ),
   }),
 );
 
@@ -364,13 +379,62 @@ export const codexRotationSettings = pgTable(
       .notNull()
       .references(() => workspaces.id, { onDelete: "cascade" }),
     activeCredentialId: uuid("active_credential_id"),
-    rotationEnabled: boolean("rotation_enabled").notNull().default(false), // P3, inert in P1
+    // Legacy selector bit. Keep false as the DB default forever: an old worker
+    // only understands this column, so a schema-first rollout or binary
+    // rollback must never make it enter the non-atomic rotation path.
+    rotationEnabled: boolean("rotation_enabled").notNull().default(false),
+    // Revision-aware allocator cutover. Only migration-compatible API/worker
+    // code reads this bit; old binaries safely ignore it and keep the legacy
+    // pin/rotation policy.
+    leaseRotationEnabled: boolean("lease_rotation_enabled").notNull().default(false),
     rotationStrategy: text("rotation_strategy").notNull().default("most_remaining"), // P3, inert
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
     workspace: uniqueIndex("codex_rotation_settings_workspace_idx").on(table.workspaceId),
+  }),
+);
+
+// One workspace-local short-lived holder per running Codex turn. Selection and
+// insertion happen atomically while codex_rotation_settings is locked FOR
+// UPDATE, so concurrent replicas in the SAME workspace see one another's
+// assignments before choosing. Workspaces never share or correlate lease state.
+// The composite (workspace, account), (workspace, credential), and
+// (workspace, turn) FKs are declared in migration 0053 (sessionTurns is defined
+// later in this module).
+export const codexCredentialLeases = pgTable(
+  "codex_credential_leases",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    accountId: uuid("account_id")
+      .notNull()
+      .references(() => managedAccounts.id, { onDelete: "cascade" }),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    credentialId: uuid("credential_id").notNull(),
+    turnId: uuid("turn_id").notNull(),
+    // Temporal activity execution fence. A successor dispatch for the same
+    // durable turn replaces holderId and increments generation atomically;
+    // stale/zombie heartbeats and releases must match both values.
+    holderId: text("holder_id").notNull(),
+    generation: integer("generation").notNull().default(1),
+    leasedUntil: timestamp("leased_until", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    turn: uniqueIndex("codex_credential_leases_workspace_turn_idx").on(
+      table.workspaceId,
+      table.turnId,
+    ),
+    activeCredential: index("codex_credential_leases_active_credential_idx").on(
+      table.workspaceId,
+      table.credentialId,
+      table.leasedUntil,
+    ),
+    expiry: index("codex_credential_leases_expiry_idx").on(table.leasedUntil),
   }),
 );
 
@@ -496,6 +560,7 @@ export const sessions = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    workspaceIdentity: uniqueIndex("sessions_workspace_id_idx").on(table.workspaceId, table.id),
     workspaceCreated: index("sessions_workspace_created_idx").on(
       table.workspaceId,
       table.createdAt,
@@ -832,6 +897,10 @@ export const sessionTurns = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    workspaceIdentity: uniqueIndex("session_turns_workspace_id_idx").on(
+      table.workspaceId,
+      table.id,
+    ),
     queue: index("session_turns_workspace_queue_idx").on(
       table.workspaceId,
       table.sessionId,
@@ -872,11 +941,82 @@ export const sessionGoals = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    workspaceIdentity: uniqueIndex("session_goals_workspace_id_idx").on(
+      table.workspaceId,
+      table.id,
+    ),
     workspaceSession: uniqueIndex("session_goals_workspace_session_idx").on(
       table.workspaceId,
       table.sessionId,
     ),
     status: index("session_goals_workspace_status_idx").on(table.workspaceId, table.status),
+  }),
+);
+
+// OPE-21: one durable, coalescing capacity waiter per session. The row is both
+// the wait state and the commit->signal outbox: capacity mutations increment
+// wakeRevision in the SAME transaction as the mutation, while the session
+// workflow advances observedWakeRevision only after it has re-evaluated the
+// allocator. Temporal signals are therefore repairable nudges rather than the
+// source of truth. No credential material or provider response is stored here.
+//
+// The session/goal/turn foreign keys are declared in migration 0053 so the
+// table keeps the same composite workspace-integrity posture as credential
+// leases. OPE-18 may later supply a non-zero controlGeneration; legacy rows use
+// zero and remain fenced by goal version + session/queue/turn truth. OPE-32
+// supplies policyHash when accepted-turn pool routing lands.
+export const codexCapacityWaiters = pgTable(
+  "codex_capacity_waiters",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    accountId: uuid("account_id")
+      .notNull()
+      .references(() => managedAccounts.id, { onDelete: "cascade" }),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    sessionId: uuid("session_id").notNull(),
+    goalId: uuid("goal_id").notNull(),
+    blockedTurnId: uuid("blocked_turn_id").notNull(),
+    workflowId: text("workflow_id").notNull(),
+    generation: integer("generation").notNull().default(1),
+    status: text("status").notNull().default("waiting"), // waiting | resumed | superseded
+    goalVersion: integer("goal_version").notNull(),
+    controlGeneration: integer("control_generation").notNull().default(0),
+    policyHash: text("policy_hash"),
+    earliestResetAt: timestamp("earliest_reset_at", { withTimezone: true }),
+    nextCheckAt: timestamp("next_check_at", { withTimezone: true }).notNull(),
+    resetKind: text("reset_kind").notNull(), // authoritative | bounded_refresh
+    refreshAttempt: integer("refresh_attempt").notNull().default(0),
+    // Coalescing outbox generation. Every eligibility-affecting mutation bumps
+    // wakeRevision. Duplicate/lost Temporal signals are harmless because only
+    // the row-locked evaluator moves observedWakeRevision and may enqueue work.
+    wakeRevision: integer("wake_revision").notNull().default(1),
+    observedWakeRevision: integer("observed_wake_revision").notNull().default(0),
+    lastWakeReason: text("last_wake_reason").notNull().default("capacity_wait_armed"),
+    resumedTurnId: uuid("resumed_turn_id"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    workspaceSession: uniqueIndex("codex_capacity_waiters_workspace_session_idx").on(
+      table.workspaceId,
+      table.sessionId,
+    ),
+    workspaceId: uniqueIndex("codex_capacity_waiters_workspace_id_idx").on(
+      table.workspaceId,
+      table.id,
+    ),
+    pending: index("codex_capacity_waiters_pending_idx").on(
+      table.workspaceId,
+      table.status,
+      table.nextCheckAt,
+    ),
+    wakeRepair: index("codex_capacity_waiters_wake_repair_idx").on(
+      table.status,
+      table.wakeRevision,
+      table.observedWakeRevision,
+    ),
   }),
 );
 

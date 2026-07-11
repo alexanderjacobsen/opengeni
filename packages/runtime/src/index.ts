@@ -1798,6 +1798,28 @@ export async function prepareAgentTools(
       const fetchImpl = config.connectionRef
         ? connectionBrokerFetch(baseFetch, config, options)
         : baseFetch;
+      // A server is connected BEST-EFFORT (a connect OR tools-list failure drops
+      // it — its tools go unavailable for the turn — instead of failing the turn)
+      // in two cases:
+      //  - codex_apps: connector availability is RUNTIME-DISCOVERED — the
+      //    device-code login may lack the connector scopes, and the backend can
+      //    reject the bearer at the initialize/tools-list handshake, so a 401/403
+      //    (or a missing/failed token) drops the server.
+      //  - an optional ToolRef: either an auto-attached workspace-default
+      //    capability MCP or a client/pack-selected portable ref. A
+      //    broken/expired credential or unavailable endpoint skips the server
+      //    with a warning, never killing the turn before the model runs. Bare
+      //    refs stay strict (below), preserving the fail-loud default.
+      // The connect-time drop is handled by connectMcpServers({ strict: false });
+      // the tools-list-time drop is enforced inside PrefixedMcpServer.listTools —
+      // a best-effort server whose tools/list throws (e.g. an expired connection
+      // credential surfacing as a StreamableHTTP "authentication required" 401)
+      // degrades to zero tools rather than throwing out of the SDK's run-time
+      // getAllMcpTools and failing an unrelated turn. The actionable
+      // tool.auth_needed signal is preserved: the connection-broker fetch
+      // publishes it before returning the 401 that provokes the throw.
+      const optional = tool.optional === true;
+      const bestEffort = isCodexAppsMcpServer(config) || optional || !!config.connectionRef;
       const server = new PrefixedMcpServer(
         new MCPServerStreamableHttp({
           url,
@@ -1818,22 +1840,11 @@ export async function prepareAgentTools(
         }),
         config.id,
         config.allowedTools,
+        bestEffort,
       );
-      // A server is connected BEST-EFFORT (a connect / tools-list failure drops
-      // it instead of failing the turn) in two cases:
-      //  - codex_apps: connector availability is RUNTIME-DISCOVERED — the
-      //    device-code login may lack the connector scopes, and the backend can
-      //    reject the bearer at the initialize/tools-list handshake, so a 401/403
-      //    (or a missing/failed token) drops the server.
-      //  - an optional ToolRef: either an auto-attached workspace-default
-      //    capability MCP or a client/pack-selected portable ref. A
-      //    broken/expired credential or unavailable endpoint skips the server
-      //    with a warning, never killing the turn before the model runs. Bare
-      //    refs stay strict (below), preserving the fail-loud default.
-      const optional = tool.optional === true;
       return {
         server,
-        bestEffort: isCodexAppsMcpServer(config) || optional || !!config.connectionRef,
+        bestEffort,
         optional,
       };
     }),
@@ -2412,16 +2423,24 @@ class PrefixedMcpServer implements MCPServer {
   readonly name: string;
   readonly prefix: string;
   private readonly allowedTools: Set<string> | undefined;
+  // Best-effort servers (optional refs, connectionRef-backed capability MCPs,
+  // codex_apps) must never fail a turn: a tools/list throw degrades to zero
+  // tools instead of propagating. Deduplicate the warn so one degraded server
+  // doesn't spam the log when the SDK re-lists across model turns.
+  private readonly bestEffort: boolean;
+  private loggedListToolsFailure = false;
 
   constructor(
     private readonly inner: MCPServer,
     registryId: string,
     allowedTools?: string[],
+    bestEffort = false,
   ) {
     this.name = registryId;
     this.prefix = prefixedMcpToolName(registryId, "");
     this.cacheToolsList = inner.cacheToolsList;
     this.allowedTools = allowedTools ? new Set(allowedTools) : undefined;
+    this.bestEffort = bestEffort;
   }
 
   connect(): Promise<void> {
@@ -2433,7 +2452,41 @@ class PrefixedMcpServer implements MCPServer {
   }
 
   async listTools(): Promise<RuntimeMcpTool[]> {
-    const tools = await this.inner.listTools();
+    let tools: RuntimeMcpTool[];
+    try {
+      tools = await this.inner.listTools();
+    } catch (error) {
+      // A REQUIRED server's tools/list failure is fatal (fail-loud default): the
+      // caller explicitly requested it, so its absence must fail the turn.
+      if (!this.bestEffort) {
+        throw error;
+      }
+      // Best-effort isolation. The SDK's run-time getAllMcpTools calls listTools
+      // OUTSIDE the connect-time connectMcpServers({ strict: false }) guard, so a
+      // best-effort server whose tools/list throws here — for ANY reason (an
+      // expired/failed connection credential surfacing as a StreamableHTTP
+      // "authentication required" 401, a provider 5xx, a network blip) — would
+      // otherwise take down an unrelated turn. Drop this server's tools for the
+      // turn instead. An auth failure additionally published tool.auth_needed via
+      // the connection-broker fetch before the throw (so that actionable signal
+      // is preserved), but a non-auth failure has NO such signal — the structured
+      // warn below is its only visibility, so a chronically-dead optional
+      // integration surfaces in logs/metrics rather than being silently swallowed.
+      // Warn once per degraded server per turn (instances are per-turn), so a
+      // re-list across model turns does not spam the log.
+      if (!this.loggedListToolsFailure) {
+        this.loggedListToolsFailure = true;
+        console.warn(
+          "[mcp] best-effort server tools/list failed; its tools are unavailable this turn",
+          {
+            serverId: this.name,
+            errorClass: error instanceof Error ? error.constructor.name : typeof error,
+            message: error instanceof Error ? error.message : String(error),
+          },
+        );
+      }
+      return [];
+    }
     return tools
       .filter((tool) => this.isAllowed(tool.name))
       .map((tool) => ({ ...tool, name: prefixedMcpToolName(this.name, tool.name) }));

@@ -2051,6 +2051,7 @@ export async function markFileUploadFailed(
   workspaceId: string,
   uploadId: string,
   fileId: string,
+  uploadStatus: "failed" | "expired" = "failed",
 ): Promise<void> {
   const now = new Date();
   await withWorkspaceRls(
@@ -2060,7 +2061,7 @@ export async function markFileUploadFailed(
       await scopedDb.transaction(async (tx) => {
         await tx
           .update(schema.fileUploads)
-          .set({ status: "failed", updatedAt: now })
+          .set({ status: uploadStatus, updatedAt: now })
           .where(
             and(
               eq(schema.fileUploads.workspaceId, workspaceId),
@@ -2073,6 +2074,206 @@ export async function markFileUploadFailed(
           .where(and(eq(schema.files.workspaceId, workspaceId), eq(schema.files.id, fileId)));
       }),
   );
+}
+
+export type FileUploadCleanupClaimResult =
+  | { outcome: "claimed" }
+  | { outcome: "completed"; file: FileAsset }
+  | { outcome: "unavailable"; status: FileUploadStatus };
+
+/**
+ * Atomically fence a pending direct upload before deleting its provider object.
+ * The lock order intentionally matches completeFileUpload (upload, then file),
+ * so cleanup and finalize cannot leave a ready row pointing at a deleted key.
+ */
+export async function claimFileUploadCleanup(
+  db: Database,
+  input: {
+    workspaceId: string;
+    uploadId: string;
+    fileId: string;
+  },
+): Promise<FileUploadCleanupClaimResult> {
+  return await withWorkspaceRls(
+    db,
+    input.workspaceId,
+    async (scopedDb) =>
+      await scopedDb.transaction(async (tx) => {
+        const [upload] = await tx
+          .select({ status: schema.fileUploads.status, fileId: schema.fileUploads.fileId })
+          .from(schema.fileUploads)
+          .where(
+            and(
+              eq(schema.fileUploads.workspaceId, input.workspaceId),
+              eq(schema.fileUploads.id, input.uploadId),
+            ),
+          )
+          .for("update")
+          .limit(1);
+        if (!upload || upload.fileId !== input.fileId) {
+          return { outcome: "unavailable", status: "failed" };
+        }
+        const [file] = await tx
+          .select()
+          .from(schema.files)
+          .where(
+            and(eq(schema.files.workspaceId, input.workspaceId), eq(schema.files.id, input.fileId)),
+          )
+          .for("update")
+          .limit(1);
+        if (!file) {
+          return { outcome: "unavailable", status: upload.status as FileUploadStatus };
+        }
+        if (upload.status === "completed" && file.status === "ready") {
+          return { outcome: "completed", file: mapFile(file) };
+        }
+        if (upload.status !== "pending") {
+          return { outcome: "unavailable", status: upload.status as FileUploadStatus };
+        }
+        const now = new Date();
+        await tx
+          .update(schema.fileUploads)
+          .set({ status: "cleanup_pending", updatedAt: now })
+          .where(
+            and(
+              eq(schema.fileUploads.workspaceId, input.workspaceId),
+              eq(schema.fileUploads.id, input.uploadId),
+              eq(schema.fileUploads.status, "pending"),
+            ),
+          );
+        await tx
+          .update(schema.files)
+          .set({ status: "failed", updatedAt: now })
+          .where(
+            and(eq(schema.files.workspaceId, input.workspaceId), eq(schema.files.id, input.fileId)),
+          );
+        return { outcome: "claimed" };
+      }),
+  );
+}
+
+export type ExpiredFileUploadCleanupClaim = {
+  uploadId: string;
+  accountId: string;
+  workspaceId: string;
+  fileId: string;
+  objectKey: string;
+};
+
+/**
+ * Claim a bounded cross-workspace batch of expired direct uploads for object
+ * cleanup. The SECURITY DEFINER function is the sole FORCE-RLS bypass and
+ * atomically moves each row to `cleanup_pending` under `FOR UPDATE SKIP
+ * LOCKED`. A worker crash or provider-delete failure leaves the claim
+ * reclaimable after `claimTimeoutMs`; object deletes are idempotent.
+ */
+export async function claimExpiredFileUploadCleanup(
+  db: Database,
+  input: {
+    graceMs: number;
+    claimTimeoutMs: number;
+    limit: number;
+  },
+): Promise<ExpiredFileUploadCleanupClaim[]> {
+  const rows = await rawRows<{
+    upload_id: string;
+    account_id: string;
+    workspace_id: string;
+    file_id: string;
+    object_key: string;
+  }>(
+    db,
+    sql`
+      select upload_id, account_id, workspace_id, file_id, object_key
+      from opengeni_private.claim_expired_file_upload_cleanup(
+        ${input.graceMs},
+        ${input.claimTimeoutMs},
+        ${input.limit}
+      )
+    `,
+  );
+  return rows.map((row) => ({
+    uploadId: row.upload_id,
+    accountId: row.account_id,
+    workspaceId: row.workspace_id,
+    fileId: row.file_id,
+    objectKey: row.object_key,
+  }));
+}
+
+/** Settle one successfully deleted cleanup claim. Idempotent on its terminal state. */
+export async function completeFileUploadCleanup(
+  db: Database,
+  input: {
+    accountId: string;
+    workspaceId: string;
+    uploadId: string;
+    fileId: string;
+    terminalStatus: "failed" | "expired";
+  },
+): Promise<boolean> {
+  return await withRlsContext(
+    db,
+    { accountId: input.accountId, workspaceId: input.workspaceId },
+    async (scopedDb) =>
+      await scopedDb.transaction(async (tx) => {
+        const [upload] = await tx
+          .select({ status: schema.fileUploads.status, fileId: schema.fileUploads.fileId })
+          .from(schema.fileUploads)
+          .where(
+            and(
+              eq(schema.fileUploads.workspaceId, input.workspaceId),
+              eq(schema.fileUploads.id, input.uploadId),
+            ),
+          )
+          .for("update")
+          .limit(1);
+        if (!upload || upload.fileId !== input.fileId) {
+          return false;
+        }
+        if (upload.status === input.terminalStatus) {
+          return true;
+        }
+        if (upload.status !== "cleanup_pending") {
+          return false;
+        }
+        const now = new Date();
+        const settled = await tx
+          .update(schema.fileUploads)
+          .set({ status: input.terminalStatus, updatedAt: now })
+          .where(
+            and(
+              eq(schema.fileUploads.workspaceId, input.workspaceId),
+              eq(schema.fileUploads.id, input.uploadId),
+              eq(schema.fileUploads.status, "cleanup_pending"),
+            ),
+          )
+          .returning({ id: schema.fileUploads.id });
+        if (settled.length === 0) {
+          return false;
+        }
+        await tx
+          .update(schema.files)
+          .set({ status: "failed", updatedAt: now })
+          .where(
+            and(eq(schema.files.workspaceId, input.workspaceId), eq(schema.files.id, input.fileId)),
+          );
+        return true;
+      }),
+  );
+}
+
+/** Settle one successfully deleted global expiry-reaper claim. */
+export async function completeExpiredFileUploadCleanup(
+  db: Database,
+  input: {
+    accountId: string;
+    workspaceId: string;
+    uploadId: string;
+    fileId: string;
+  },
+): Promise<boolean> {
+  return await completeFileUploadCleanup(db, { ...input, terminalStatus: "expired" });
 }
 
 export async function enablePackInstallation(

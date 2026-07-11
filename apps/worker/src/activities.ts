@@ -7,6 +7,7 @@ import { createProductionAgentRuntime } from "@opengeni/runtime";
 import { createObjectStorage } from "@opengeni/storage";
 import { createRunAgentTurnActivity } from "./activities/agent-turn";
 import { createDocumentActivities } from "./activities/documents";
+import { createFileUploadReaperActivities } from "./activities/file-upload-reaper";
 import { createGoalActivities } from "./activities/goals";
 import { createSandboxLeaseActivities } from "./activities/sandbox-lease";
 import { createScheduledTaskActivities } from "./activities/scheduled-tasks";
@@ -119,6 +120,7 @@ export function createActivities(dependencies: ActivityDependencies = {}) {
     ...createScheduledTaskActivities(services),
     ...createGoalActivities(services),
     ...createRigVerificationActivities(services),
+    ...createFileUploadReaperActivities(services),
     // P1.3: the SOLE liveness/GC/cost-stop driver. Only reapSandboxLeases — no
     // *ForViewer activities, no ownerHeartbeat, no resolveOwnerTaskQueue.
     ...createSandboxLeaseActivities(services),
@@ -139,5 +141,6 @@ export const dispatchScheduledTaskRun = defaultActivities.dispatchScheduledTaskR
 export const maybeContinueGoal = defaultActivities.maybeContinueGoal;
 export const pauseGoalForInterrupt = defaultActivities.pauseGoalForInterrupt;
 export const reapSandboxLeases = defaultActivities.reapSandboxLeases;
+export const reapExpiredFileUploads = defaultActivities.reapExpiredFileUploads;
 export const verifyRigChange = defaultActivities.verifyRigChange;
 export const verifyRigVersion = defaultActivities.verifyRigVersion;

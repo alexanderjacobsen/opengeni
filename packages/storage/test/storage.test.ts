@@ -3,7 +3,7 @@ import { getSettings } from "@opengeni/config";
 import { createObjectStorage } from "../src";
 
 describe("object storage adapters", () => {
-  test("creates S3-compatible storage from endpoint credentials", () => {
+  test("creates S3-compatible storage and signs checksum metadata once", async () => {
     const storage = withEnv(
       {
         OPENGENI_OBJECT_STORAGE_BACKEND: "s3-compatible",
@@ -16,6 +16,13 @@ describe("object storage adapters", () => {
 
     expect(storage?.backend).toBe("s3-compatible");
     expect(storage?.bucket).toBe("opengeni-files");
+    const put = await storage!.createPutUrl({
+      key: "files/file-id/original/test.txt",
+      contentType: "text/plain",
+      sha256: "checksum",
+    });
+    expect(put.requiredHeaders).toEqual({ "content-type": "text/plain" });
+    expect(new URL(put.url).searchParams.get("x-amz-meta-sha256")).toBe("checksum");
   });
 
   test("creates Azure Blob storage and signs upload/download URLs", async () => {

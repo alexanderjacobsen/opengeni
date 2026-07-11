@@ -471,7 +471,7 @@ export function ChatComposer({
                         className={cn(
                           "inline-flex size-8 items-center justify-center rounded-og-md",
                           "text-og-fg-muted transition-colors duration-150 hover:bg-og-surface-2 hover:text-og-fg",
-                          "disabled:cursor-not-allowed disabled:opacity-50",
+                          "disabled:cursor-not-allowed disabled:opacity-50 pointer-coarse:size-11",
                         )}
                       >
                         <PaperclipIcon className="size-4" />
@@ -717,7 +717,7 @@ function AttachmentChips({
               <button
                 type="button"
                 onClick={() => onRetry(attachment.id)}
-                className="shrink-0 rounded-og-xs p-1 text-og-fg-muted hover:bg-og-surface-1 hover:text-og-fg pointer-coarse:size-8"
+                className="shrink-0 rounded-og-xs p-1 text-og-fg-muted hover:bg-og-surface-1 hover:text-og-fg pointer-coarse:size-10"
                 aria-label={`Retry ${attachment.name}`}
                 title="Retry upload"
               >
@@ -727,7 +727,7 @@ function AttachmentChips({
             <button
               type="button"
               onClick={() => onRemove(attachment.id)}
-              className="shrink-0 rounded-og-xs p-1 text-og-fg-muted hover:bg-og-surface-1 hover:text-og-fg pointer-coarse:size-8"
+              className="shrink-0 rounded-og-xs p-1 text-og-fg-muted hover:bg-og-surface-1 hover:text-og-fg pointer-coarse:size-10"
               aria-label={`Remove ${attachment.name}`}
             >
               <XIcon className="size-3.5" />

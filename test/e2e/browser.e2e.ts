@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdir } from "node:fs/promises";
 import { chromium, type Browser } from "playwright";
+import { migrate } from "@opengeni/db/migrate";
 import {
   freePort,
   startProcess,
@@ -26,7 +28,7 @@ describe("browser e2e", () => {
       // The attachment journey must exercise the actual direct-to-object-store
       // path, not a mocked SDK upload. Keep the browser and API on their normal
       // separate origins so CORS/signed-PUT behavior stays representative.
-      services = await startTestServices({ temporal: true, objectStorage: true });
+      services = await startBrowserTestServices();
       await services.migrate();
       apiPort = await freePort();
       webPort = await freePort();
@@ -92,7 +94,7 @@ describe("browser e2e", () => {
     await pageA.getByRole("menuitem", { name: /^High$/ }).waitFor({ timeout: 10_000 });
     await pageA.keyboard.press("Escape");
     await pageA
-      .getByPlaceholder("Describe a task for the agent...")
+      .getByPlaceholder("Describe a task for the agent…")
       .fill("run a slow browser e2e session");
     await pageA.getByRole("button", { name: "Send" }).click();
     await waitFor(() => /\/workspaces\/[^/]+\/sessions\/[^/]+$/.test(pageA.url()), {
@@ -135,18 +137,35 @@ describe("browser e2e", () => {
   }, 120_000);
 
   test("uploads an image from the composer, persists its resource, and survives refresh", async () => {
-    const page = await browser.newPage({ viewport: { width: 375, height: 740 } });
+    const page = await browser.newPage({
+      viewport: { width: 375, height: 740 },
+      hasTouch: true,
+      isMobile: true,
+    });
+    await installThemeAndWindowOpenCapture(page, "light");
+    const providerMethods: string[] = [];
+    page.on("request", (request) => {
+      const url = new URL(request.url());
+      if (url.hostname === "127.0.0.1" && Number(url.port) === services.minioPort) {
+        providerMethods.push(request.method());
+      }
+    });
     const image = Buffer.from(
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL2GQAAAABJRU5ErkJggg==",
       "base64",
     );
     await page.goto(`http://127.0.0.1:${webPort}`);
 
-    // The control remains discoverable to assistive tech and accepts a normal
-    // picker selection. A narrow viewport must wrap the chip/control row,
-    // never introduce horizontal overflow.
-    await page.getByRole("button", { name: "Attach files" }).waitFor();
-    await page.locator('input[type="file"]').setInputFiles({
+    // Coarse-touch picker + remove first: the hidden input is driven by the
+    // actual button, and removing a completed draft attachment never makes the
+    // compact composer overflow or leaves a dead chip.
+    const attach = page.getByRole("button", { name: "Attach files" });
+    await attach.waitFor();
+    await expectCoarseTarget(attach);
+    const chooserPromise = page.waitForEvent("filechooser");
+    await attach.tap();
+    const chooser = await chooserPromise;
+    await chooser.setFiles({
       name: "e2e screenshot.png",
       mimeType: "image/png",
       buffer: image,
@@ -158,8 +177,29 @@ describe("browser e2e", () => {
     expect(
       await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
     ).toBe(true);
+    const remove = page.getByRole("button", { name: "Remove e2e screenshot.png" });
+    await expectCoarseTarget(remove);
+    await remove.focus();
+    expect(await remove.evaluate((element) => element === document.activeElement)).toBe(true);
+    await page.keyboard.press("Enter");
+    await expectCount(page.getByText("e2e screenshot.png", { exact: true }), 0);
 
-    await page.getByPlaceholder("Describe a task for the agent...").fill("inspect the screenshot");
+    // Reattach the same bytes for the durable journey, then prove the controls
+    // are keyboard reachable and visibly focused before sending.
+    await page.locator('input[type="file"]').setInputFiles({
+      name: "e2e screenshot.png",
+      mimeType: "image/png",
+      buffer: image,
+    });
+    await page.getByText("e2e screenshot.png", { exact: true }).waitFor({ timeout: 15_000 });
+    await waitFor(() => providerMethods.includes("PUT"), {
+      timeoutMs: 10_000,
+      describe: () => `observed provider methods: ${providerMethods.join(", ") || "none"}`,
+    });
+    await attach.focus();
+    expect(await attach.evaluate((element) => element === document.activeElement)).toBe(true);
+
+    await page.getByPlaceholder("Describe a task for the agent…").fill("inspect the screenshot");
     await page.getByRole("button", { name: "Send message" }).click();
     await waitFor(() => /\/workspaces\/[^/]+\/sessions\/[^/]+$/.test(page.url()), {
       timeoutMs: 15_000,
@@ -168,6 +208,57 @@ describe("browser e2e", () => {
       .getByTestId("session-timeline")
       .getByText("inspect the screenshot", { exact: true })
       .waitFor({ timeout: 15_000 });
+
+    // Composer `blob:` URLs are transient. The sent timeline preview must be a
+    // fully loaded signed object URL, and opening it via keyboard must enter the
+    // focus-trapped lightbox and restore focus after Escape.
+    const preview = page
+      .getByTestId("timeline-user")
+      .getByRole("img", { name: "e2e screenshot.png" });
+    await waitForImage(preview);
+    const signedPreviewUrl = await preview.getAttribute("src");
+    expect(signedPreviewUrl?.startsWith("blob:")).toBe(false);
+    expect(signedPreviewUrl).toContain(`127.0.0.1:${services.minioPort}`);
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+    ).toBe(true);
+    const open = page.getByRole("button", { name: "Open e2e screenshot.png" });
+    await open.focus();
+    await page.keyboard.press("Enter");
+    await page.getByRole("dialog", { name: "Screenshot" }).waitFor();
+    await page.keyboard.press("Escape");
+    await page.getByRole("dialog", { name: "Screenshot" }).waitFor({ state: "hidden" });
+    expect(await open.evaluate((element) => element === document.activeElement)).toBe(true);
+
+    // Download mints a fresh signed URL on demand. Capture window.open rather
+    // than navigating away from the E2E page, then validate it is provider-backed.
+    const download = page.getByRole("button", { name: "Download e2e screenshot.png" });
+    await expectCoarseTarget(download);
+    await download.tap();
+    await waitFor(
+      async () =>
+        (await page.evaluate(() => (window as unknown as { __openedUrls: string[] }).__openedUrls))
+          .length === 1,
+      { timeoutMs: 10_000 },
+    );
+    const [downloadUrl] = await page.evaluate(
+      () => (window as unknown as { __openedUrls: string[] }).__openedUrls,
+    );
+    expect(downloadUrl?.startsWith("blob:")).toBe(false);
+    expect(downloadUrl).toContain(`127.0.0.1:${services.minioPort}`);
+    const downloadResult = await page.evaluate(async (url) => {
+      const response = await fetch(url!);
+      return {
+        status: response.status,
+        contentType: response.headers.get("content-type"),
+        size: (await response.arrayBuffer()).byteLength,
+      };
+    }, downloadUrl);
+    expect(downloadResult).toEqual({
+      status: 200,
+      contentType: "image/png",
+      size: image.byteLength,
+    });
 
     // The session API is the agent's durable resource source. Verify it has
     // exactly one ready file reference before and after reconnect/replay.
@@ -193,9 +284,59 @@ describe("browser e2e", () => {
       .getByTestId("session-timeline")
       .getByText("inspect the screenshot", { exact: true })
       .waitFor({ timeout: 15_000 });
+    const reloadedPreview = page
+      .getByTestId("timeline-user")
+      .getByRole("img", { name: "e2e screenshot.png" });
+    await waitForImage(reloadedPreview);
+    expect((await reloadedPreview.getAttribute("src"))?.startsWith("blob:")).toBe(false);
     expect(await resourceCount()).toBe(1);
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+    ).toBe(true);
+    await captureEvidence(page, "ope19-mobile-light.png");
+
+    // Three independent clients complete the required 2×2 matrix. Each one
+    // reloads metadata + a fresh signed GET from the real backend; no blob URL
+    // or React state is borrowed from the upload client.
+    for (const variant of [
+      { name: "mobile-dark", width: 375, height: 740, theme: "dark" as const, mobile: true },
+      { name: "desktop-light", width: 1440, height: 900, theme: "light" as const, mobile: false },
+      { name: "desktop-dark", width: 1440, height: 900, theme: "dark" as const, mobile: false },
+    ]) {
+      const client = await browser.newPage({
+        viewport: { width: variant.width, height: variant.height },
+        ...(variant.mobile ? { hasTouch: true, isMobile: true } : {}),
+      });
+      await installThemeAndWindowOpenCapture(client, variant.theme);
+      await client.goto(page.url());
+      expect(
+        await client.evaluate(() => document.documentElement.getAttribute("data-og-theme")),
+      ).toBe(variant.theme);
+      const clientPreview = client
+        .getByTestId("timeline-user")
+        .getByRole("img", { name: "e2e screenshot.png" });
+      await waitForImage(clientPreview);
+      expect((await clientPreview.getAttribute("src"))?.startsWith("blob:")).toBe(false);
+      expect(
+        await client.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+      ).toBe(true);
+      if (variant.mobile) {
+        await expectCoarseTarget(
+          client.getByRole("button", { name: "Download e2e screenshot.png" }),
+        );
+      }
+      if (variant.name === "desktop-dark") {
+        await client.getByRole("button", { name: "Open e2e screenshot.png" }).click();
+        const dialog = client.getByRole("dialog", { name: "Screenshot" });
+        await dialog.waitFor();
+        await client.getByRole("button", { name: "Close" }).click();
+        await dialog.waitFor({ state: "hidden" });
+      }
+      await captureEvidence(client, `ope19-${variant.name}.png`);
+      await client.close();
+    }
     await page.close();
-  }, 120_000);
+  }, 180_000);
 });
 
 function stackEnv(
@@ -229,4 +370,105 @@ async function workerReady(process: StartedProcess | undefined): Promise<boolean
     return false;
   }
   return process.logs().includes("test worker listening");
+}
+
+async function startBrowserTestServices(): Promise<TestServices> {
+  const databaseUrl = process.env.OPENGENI_TEST_E2E_DATABASE_URL;
+  const natsUrl = process.env.OPENGENI_TEST_E2E_NATS_URL;
+  const temporalHost = process.env.OPENGENI_TEST_E2E_TEMPORAL_HOST;
+  const objectStorageEndpoint = process.env.OPENGENI_TEST_E2E_OBJECT_STORAGE_ENDPOINT;
+  const supplied = [databaseUrl, natsUrl, temporalHost, objectStorageEndpoint].filter(Boolean);
+  if (supplied.length === 0) {
+    return await startTestServices({ temporal: true, objectStorage: true });
+  }
+  if (supplied.length !== 4) {
+    throw new Error(
+      "OPENGENI_TEST_E2E_DATABASE_URL, OPENGENI_TEST_E2E_NATS_URL, OPENGENI_TEST_E2E_TEMPORAL_HOST, and OPENGENI_TEST_E2E_OBJECT_STORAGE_ENDPOINT must be set together",
+    );
+  }
+  const postgresPort = endpointPort(databaseUrl!, "postgres:");
+  const natsPort = endpointPort(natsUrl!, "nats:");
+  const temporalPort = endpointPort(temporalHost!, "grpc:");
+  const minioPort = endpointPort(objectStorageEndpoint!, "http:");
+  return {
+    projectName: "opengeni-external-browser-e2e",
+    cwd: "",
+    composeFile: "",
+    postgresPort,
+    natsPort,
+    natsMonitorPort: 0,
+    temporalPort,
+    minioPort,
+    minioConsolePort: 0,
+    databaseUrl: databaseUrl!,
+    natsUrl: natsUrl!,
+    temporalHost: temporalHost!,
+    dockerNetwork: "external",
+    objectStorageEndpoint: objectStorageEndpoint!,
+    objectStorageSandboxEndpoint: objectStorageEndpoint!,
+    migrate: async () => await migrate(databaseUrl!),
+    down: async () => {},
+  };
+}
+
+function endpointPort(value: string, fallbackProtocol: string): number {
+  const url = new URL(value.includes("://") ? value : `${fallbackProtocol}//${value}`);
+  const port = Number(url.port);
+  if (!Number.isInteger(port) || port <= 0) {
+    throw new Error(`test service endpoint must include an explicit port: ${url.origin}`);
+  }
+  return port;
+}
+
+async function installThemeAndWindowOpenCapture(
+  page: import("playwright").Page,
+  theme: "light" | "dark",
+): Promise<void> {
+  await page.addInitScript((selectedTheme) => {
+    (window as unknown as { __openedUrls: string[] }).__openedUrls = [];
+    window.open = ((url?: string | URL) => {
+      if (url) {
+        (window as unknown as { __openedUrls: string[] }).__openedUrls.push(String(url));
+      }
+      return null;
+    }) as typeof window.open;
+    const applyTheme = () => {
+      document.documentElement?.setAttribute("data-og-theme", selectedTheme);
+    };
+    applyTheme();
+    if (!document.documentElement) {
+      document.addEventListener("DOMContentLoaded", applyTheme, { once: true });
+    }
+  }, theme);
+}
+
+async function waitForImage(locator: import("playwright").Locator): Promise<void> {
+  await locator.waitFor({ timeout: 15_000 });
+  await waitFor(
+    async () =>
+      await locator.evaluate(
+        (image) => image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0,
+      ),
+    { timeoutMs: 15_000 },
+  );
+}
+
+async function expectCount(locator: import("playwright").Locator, count: number): Promise<void> {
+  await waitFor(async () => (await locator.count()) === count, { timeoutMs: 10_000 });
+}
+
+async function expectCoarseTarget(locator: import("playwright").Locator): Promise<void> {
+  const box = await locator.boundingBox();
+  expect(box).not.toBeNull();
+  expect(box!.width).toBeGreaterThanOrEqual(40);
+  expect(box!.height).toBeGreaterThanOrEqual(40);
+}
+
+async function captureEvidence(page: import("playwright").Page, filename: string): Promise<void> {
+  const directory = process.env.OPENGENI_E2E_EVIDENCE_DIR;
+  if (!directory) {
+    return;
+  }
+  await mkdir(directory, { recursive: true });
+  await page.screenshot({ path: `${directory}/${filename}`, fullPage: true });
 }

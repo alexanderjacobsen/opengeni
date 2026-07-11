@@ -32,6 +32,8 @@ import { observabilityEventLogger } from "./observability-metrics";
 // no-op — so the Schedule is registered EXACTLY ONCE per deployment regardless
 // of replica count.
 const SANDBOX_REAPER_SCHEDULE_ID = "opengeni-sandbox-lease-reaper";
+export const FILE_UPLOAD_REAPER_SCHEDULE_ID = "opengeni-file-upload-reaper";
+export const FILE_UPLOAD_REAPER_PERIOD_MS = 15 * 60 * 1_000;
 
 export type WorkerOptions = {
   settings?: Settings;
@@ -212,6 +214,51 @@ export async function registerSandboxReaperSchedule(
   }
 }
 
+/**
+ * Register the one provider-neutral expired direct-upload cleanup Schedule.
+ * Unlike sandbox GC this is always registered: file uploads can be enabled in
+ * deployments where sandbox ownership is disabled. The activity is a cheap
+ * no-op when object storage is not configured.
+ */
+export async function registerFileUploadReaperSchedule(
+  settings: Settings,
+  observability: Observability,
+): Promise<{ registered: boolean; close: () => Promise<void> }> {
+  const connection = await Connection.connect({ address: settings.temporalHost });
+  const temporal = new TemporalClient({ connection, namespace: settings.temporalNamespace });
+  try {
+    await temporal.schedule.create({
+      scheduleId: FILE_UPLOAD_REAPER_SCHEDULE_ID,
+      spec: { intervals: [{ every: FILE_UPLOAD_REAPER_PERIOD_MS }] },
+      action: {
+        type: "startWorkflow",
+        workflowType: "fileUploadReaperWorkflow",
+        taskQueue: settings.temporalTaskQueue,
+        args: [],
+      },
+      policies: {
+        overlap: ScheduleOverlapPolicy.SKIP,
+        catchupWindow: "1m",
+        pauseOnFailure: false,
+      },
+    });
+    observability.info("Registered the global file-upload reaper Schedule", {
+      scheduleId: FILE_UPLOAD_REAPER_SCHEDULE_ID,
+      reaperPeriodMs: FILE_UPLOAD_REAPER_PERIOD_MS,
+    });
+    return { registered: true, close: async () => connection.close() };
+  } catch (error) {
+    if (error instanceof ScheduleAlreadyRunning) {
+      observability.info("Global file-upload reaper Schedule already registered", {
+        scheduleId: FILE_UPLOAD_REAPER_SCHEDULE_ID,
+      });
+      return { registered: false, close: async () => connection.close() };
+    }
+    await connection.close().catch(() => undefined);
+    throw error;
+  }
+}
+
 export async function startWorker() {
   const settings = getSettings();
   const observability = createObservability(settings, { component: "worker" });
@@ -228,6 +275,9 @@ export async function startWorker() {
   let signaler: Awaited<ReturnType<typeof createWorkerWorkflowSignaler>> | undefined;
   let workerBundle: Awaited<ReturnType<typeof createOpenGeniWorker>> | undefined;
   let reaperSchedule: Awaited<ReturnType<typeof registerSandboxReaperSchedule>> | undefined;
+  let fileUploadReaperSchedule:
+    | Awaited<ReturnType<typeof registerFileUploadReaperSchedule>>
+    | undefined;
   let httpServer: ReturnType<typeof startWorkerHttpServer> | undefined;
   try {
     bus = await retryStartupDependency(
@@ -274,6 +324,11 @@ export async function startWorker() {
       () => registerSandboxReaperSchedule(settings, observability),
       { ...retryOptions, onRetry },
     );
+    fileUploadReaperSchedule = await retryStartupDependency(
+      "Temporal schedule (file upload reaper)",
+      () => registerFileUploadReaperSchedule(settings, observability),
+      { ...retryOptions, onRetry },
+    );
     observability.info("OpenGeni worker listening", {
       temporalTaskQueue: settings.temporalTaskQueue,
       httpPort: settings.workerHttpPort,
@@ -314,6 +369,7 @@ export async function startWorker() {
       workerBundle?.connection.close(),
       signaler?.close(),
       reaperSchedule?.close(),
+      fileUploadReaperSchedule?.close(),
       bus?.close(),
       dbClient.close(),
     ]);

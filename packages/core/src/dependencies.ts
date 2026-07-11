@@ -69,6 +69,8 @@ export type AppDependencies = {
   db: Database;
   bus: EventBus;
   workflowClient: SessionWorkflowClient;
+  /** Optional provider override for deterministic API/object-storage tests. */
+  objectStorage?: ObjectStorageDependency;
   documentIndexer?: DocumentIndexClient;
   documentServices?: DocumentServices;
   observability?: Observability;

@@ -66,7 +66,8 @@ export { replaySessionEvents, sseSessionStream } from "./http/sse";
 
 export function createApp(deps: AppDependencies): Hono {
   const managedAuth = deps.managedAuth ?? createManagedAuth(deps.settings, deps.db);
-  const objectStorage = createObjectStorage(deps.settings);
+  const objectStorage =
+    deps.objectStorage === undefined ? createObjectStorage(deps.settings) : deps.objectStorage;
   let documentServices: DocumentServices | null = deps.documentServices ?? null;
   const getDocumentServices = () => {
     documentServices ??= createDocumentServices(deps.settings);

@@ -277,7 +277,17 @@ if (args.skipStorage) {
     if (downloaded !== content) {
       throw new Error("downloaded object did not match uploaded content");
     }
-    return `file ${fileId} uploaded and downloaded`;
+    const foreignWorkspace = crypto.randomUUID();
+    const foreignRead = await fetch(
+      new URL(`/v1/workspaces/${foreignWorkspace}/files/${fileId}`, args.baseUrl),
+      { headers: requestHeaders(true) },
+    );
+    if (foreignRead.status !== 403 && foreignRead.status !== 404) {
+      throw new Error(
+        `cross-workspace file read returned HTTP ${foreignRead.status}, expected 403 or 404`,
+      );
+    }
+    return `file ${fileId} uploaded/downloaded and cross-workspace read denied`;
   });
 }
 

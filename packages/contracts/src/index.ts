@@ -1368,7 +1368,13 @@ export type ResourceRef = z.infer<typeof ResourceRef>;
 export const FileStatus = z.enum(["pending_upload", "ready", "failed", "expired", "deleted"]);
 export type FileStatus = z.infer<typeof FileStatus>;
 
-export const FileUploadStatus = z.enum(["pending", "completed", "expired", "failed"]);
+export const FileUploadStatus = z.enum([
+  "pending",
+  "cleanup_pending",
+  "completed",
+  "expired",
+  "failed",
+]);
 export type FileUploadStatus = z.infer<typeof FileUploadStatus>;
 
 export const FileAsset = z.object({

@@ -16493,6 +16493,21 @@ export async function claimNextQueuedTurn(
     workspaceId,
     async (scopedDb) =>
       await scopedDb.transaction(async (tx) => {
+        // Capacity settlement and resume use session -> turn after their
+        // workspace rotation lock. Claiming must preserve that shared order:
+        // taking a queued turn first can deadlock with a settlement that owns
+        // the session and is waiting for the same turn.
+        const [session] = await tx
+          .select({ id: schema.sessions.id })
+          .from(schema.sessions)
+          .where(
+            and(eq(schema.sessions.workspaceId, workspaceId), eq(schema.sessions.id, sessionId)),
+          )
+          .for("update")
+          .limit(1);
+        if (!session) {
+          return null;
+        }
         const rows = await tx.execute(sql<{ id: string }>`
       select id from session_turns
       where workspace_id = ${workspaceId} and session_id = ${sessionId} and status = 'queued'

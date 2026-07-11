@@ -123,7 +123,11 @@ import {
 } from "./codex-rotation";
 import type { CodexAccountStatus } from "@opengeni/db";
 import { buildCodexTokenResolver } from "./codex-auth";
-import { signalCodexCapacityWakeTargets } from "./codex-capacity";
+import {
+  refreshCodexUsageAndRepairCapacityWaiters,
+  signalCodexCapacityWakeTargets,
+  signalPendingCodexCapacityWakeTargets,
+} from "./codex-capacity";
 import {
   buildModelResolver,
   CODEX_CLIENT_VERSION,
@@ -1037,6 +1041,10 @@ async function refreshCappedCodexUsageRows(
   settings: Settings,
   workspaceId: string,
   accounts: CodexAccountStatus[],
+  capacitySignals: {
+    signalCodexCapacityWorkflow?: ActivityServices["signalCodexCapacityWorkflow"] | undefined;
+    wakeSessionWorkflow: ActivityServices["wakeSessionWorkflow"];
+  },
 ): Promise<CodexAccountStatus[]> {
   const nearPct = settings.codexRotationNearExhaustionPct;
   const stale = accounts.filter(
@@ -1047,10 +1055,9 @@ async function refreshCappedCodexUsageRows(
   if (stale.length === 0) {
     return accounts;
   }
-  await Promise.all(
-    stale.map((a) =>
-      fetchCodexUsageForAccount(db, settings, workspaceId, a.id).catch(() => undefined),
-    ),
+  await refreshCodexUsageAndRepairCapacityWaiters(
+    stale.map((account) => () => fetchCodexUsageForAccount(db, settings, workspaceId, account.id)),
+    () => signalPendingCodexCapacityWakeTargets({ db, ...capacitySignals }, workspaceId),
   );
   return listCodexAccountStatuses(db, workspaceId).catch(() => accounts);
 }
@@ -1805,7 +1812,10 @@ export function createRunAgentTurnActivity(services: () => Promise<ActivityServi
         }
         if (leased.decision.kind === "allCapped") {
           // Bounded self-heal of stale usage cache, then ONE new atomic selection.
-          await refreshCappedCodexUsageRows(db, settings, input.workspaceId, leased.accounts);
+          await refreshCappedCodexUsageRows(db, settings, input.workspaceId, leased.accounts, {
+            signalCodexCapacityWorkflow,
+            wakeSessionWorkflow,
+          });
           if (settings.codexCredentialLeasingEnabled) {
             leaseAcquisitionStartedAtMs = performance.now();
             leased = await acquireCodexCredentialLease(

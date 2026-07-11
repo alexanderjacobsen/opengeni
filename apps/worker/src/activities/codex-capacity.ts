@@ -28,6 +28,20 @@ type CodexCapacitySignalServices = {
   wakeSessionWorkflow: ActivityServices["wakeSessionWorkflow"];
 };
 
+/**
+ * Run a bounded set of usage refreshes, then repair every committed waiter
+ * revision even when an individual provider refresh failed. The database
+ * outbox remains authoritative; this helper only guarantees that every worker
+ * refresh path reaches the same post-commit delivery seam.
+ */
+export async function refreshCodexUsageAndRepairCapacityWaiters(
+  refreshes: readonly (() => Promise<unknown>)[],
+  repairPendingWakes: () => Promise<void>,
+): Promise<void> {
+  await Promise.all(refreshes.map((refresh) => refresh().catch(() => undefined)));
+  await repairPendingWakes();
+}
+
 /** Deliver committed waiter revisions; Postgres remains the repairable outbox. */
 export async function signalCodexCapacityWakeTargets(
   services: CodexCapacitySignalServices,
@@ -124,14 +138,13 @@ async function refreshCapacityMetadata(
         (account.secondaryUsedPercent ?? 0) >= services.settings.codexRotationNearExhaustionPct ||
         account.usageCheckedAt === null),
   );
-  await Promise.all(
-    stale.map((account) =>
-      fetchCodexUsageForAccount(services.db, services.settings, workspaceId, account.id).catch(
-        () => undefined,
-      ),
+  await refreshCodexUsageAndRepairCapacityWaiters(
+    stale.map(
+      (account) => () =>
+        fetchCodexUsageForAccount(services.db, services.settings, workspaceId, account.id),
     ),
+    () => signalPendingCodexCapacityWakeTargets(services, workspaceId),
   );
-  await signalPendingCodexCapacityWakeTargets(services, workspaceId);
 }
 
 export function createCodexCapacityActivities(services: () => Promise<ActivityServices>) {

@@ -3,6 +3,7 @@ import type { CodexCapacitySelectionContext, CodexLeaseAccountStatus } from "@op
 import { testSettings } from "@opengeni/testing";
 import {
   codexCapacityDecision,
+  refreshCodexUsageAndRepairCapacityWaiters,
   signalCodexCapacityWakeTargets,
 } from "../src/activities/codex-capacity";
 
@@ -110,5 +111,26 @@ describe("Codex capacity availability diagnostics", () => {
       sessionId: target.sessionId,
       workflowId: target.workflowId,
     });
+  });
+
+  test("worker usage refresh always repairs committed waiter revisions", async () => {
+    const order: string[] = [];
+    const firstRefresh = mock(async () => {
+      order.push("refresh-1");
+    });
+    const failedRefresh = mock(async () => {
+      order.push("refresh-2");
+      throw new Error("provider unavailable");
+    });
+    const repair = mock(async () => {
+      order.push("repair");
+    });
+
+    await refreshCodexUsageAndRepairCapacityWaiters([firstRefresh, failedRefresh], repair);
+
+    expect(firstRefresh).toHaveBeenCalledTimes(1);
+    expect(failedRefresh).toHaveBeenCalledTimes(1);
+    expect(repair).toHaveBeenCalledTimes(1);
+    expect(order.at(-1)).toBe("repair");
   });
 });

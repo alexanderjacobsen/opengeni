@@ -33,10 +33,13 @@ import {
 let available = true;
 let shared: SharedTestDatabase | null = null;
 let admin: postgres.Sql;
+let monitor: postgres.Sql;
 let clientA: DbClient;
 let clientB: DbClient;
+let claimClient: DbClient;
 let dbA: Database;
 let dbB: Database;
+let claimDb: Database;
 
 const settings = testSettings({
   codexSubscriptionEnabled: true,
@@ -139,6 +142,24 @@ async function arm(scenario: CapacityScenario, resetAt: Date | null = null) {
   });
 }
 
+async function waitForAppSessionLockWait(): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const [row] = await monitor<{ waiting: number }[]>`
+      select count(*)::int as waiting
+      from pg_stat_activity
+      where datname = current_database()
+        and usename = 'opengeni_app'
+        and wait_event_type = 'Lock'
+        and query ilike '%sessions%'`;
+    if ((row?.waiting ?? 0) > 0) {
+      return;
+    }
+    await Bun.sleep(10);
+  }
+  throw new Error("claim did not block on the session row");
+}
+
 function availableDecision(credentialId: string): CodexCapacityAvailabilityDecision {
   return { kind: "available", credentialId };
 }
@@ -157,15 +178,20 @@ beforeAll(async () => {
     return;
   }
   admin = shared.admin;
+  monitor = postgres(shared.adminUrl, { max: 1 });
   clientA = createDb(shared.appUrl, { max: 12 });
   clientB = createDb(shared.appUrl, { max: 12 });
+  claimClient = createDb(shared.appUrl, { max: 1 });
   dbA = clientA.db;
   dbB = clientB.db;
+  claimDb = claimClient.db;
 }, 180_000);
 
 afterAll(async () => {
+  await claimClient?.close().catch(() => undefined);
   await clientA?.close().catch(() => undefined);
   await clientB?.close().catch(() => undefined);
+  await monitor?.end().catch(() => undefined);
   await shared?.release();
 });
 
@@ -217,6 +243,55 @@ describe("OPE-21 durable Codex capacity waits", () => {
     const [eventCount] = await admin<{ count: number }[]>`
       select count(*)::int as count from session_events where session_id = ${scenario.sessionId}`;
     expect(eventCount?.count).toBe(3);
+  });
+
+  test("claim locks session before turn and cannot deadlock capacity settlement", async () => {
+    if (!available) return;
+    const ws = await freshWorkspace();
+    const credentialId = await connectCredential(ws, true);
+    const scenario = await seedScenario(ws);
+    const armed = await arm(scenario);
+    if (armed.action !== "waiting") throw new Error("expected waiter");
+    const resumed = await reconcileCodexCapacityWait(
+      dbA,
+      {
+        accountId: scenario.accountId,
+        workspaceId: scenario.workspaceId,
+        sessionId: scenario.sessionId,
+        waiterId: armed.waiter.id,
+        generation: armed.waiter.generation,
+      },
+      () => availableDecision(credentialId),
+    );
+    if (resumed.action !== "resumed") throw new Error("expected resumed turn");
+
+    let claim: ReturnType<typeof claimNextQueuedTurn> | null = null;
+    await admin.begin(async (lockTx) => {
+      await lockTx`
+        select id from sessions
+        where workspace_id = ${scenario.workspaceId} and id = ${scenario.sessionId}
+        for update`;
+      claim = claimNextQueuedTurn(
+        claimDb,
+        scenario.workspaceId,
+        scenario.sessionId,
+        scenario.workflowId,
+      );
+      await waitForAppSessionLockWait();
+
+      // If claim took the queued turn before waiting for the session, this
+      // statement forms turn -> session / session -> turn and times out. The
+      // corrected session-first claim leaves the turn immediately lockable.
+      await lockTx`set local lock_timeout = '250ms'`;
+      const locked = await lockTx<{ id: string }[]>`
+        select id from session_turns
+        where workspace_id = ${scenario.workspaceId} and id = ${resumed.turn.id}
+        for update`;
+      expect(locked.map((row) => row.id)).toEqual([resumed.turn.id]);
+    });
+
+    const claimed = await claim!;
+    expect(claimed?.id).toBe(resumed.turn.id);
   });
 
   test("reactive arm is fenced by the live holder, generation, and worker redispatch", async () => {

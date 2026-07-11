@@ -110,7 +110,6 @@ import {
 import {
   authoritativeCodexCapacityResetAt,
   chooseRotationActive,
-  chooseShardedHome,
   classifyCodexPin,
   computeIdleDelayMs,
   computeReactiveRotationResume,

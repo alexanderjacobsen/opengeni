@@ -9,6 +9,7 @@ import {
 import type { Settings } from "@opengeni/config";
 import {
   authoritativeCodexCapacityResetAt,
+  isCodexCredentialEligible,
   selectCodexCredentialLeaseForTurn,
 } from "./codex-rotation";
 import type {
@@ -18,7 +19,7 @@ import type {
   ReconcileCodexCapacityWaitResult,
 } from "./types";
 
-function capacityDecision(
+export function codexCapacityDecision(
   context: CodexCapacitySelectionContext,
   settings: Settings,
 ): ReturnType<Parameters<typeof reconcileCodexCapacityWaitDb>[2]> {
@@ -40,8 +41,8 @@ function capacityDecision(
       credentialId: selected.credentialId,
       diagnostic: {
         connectedCount: context.accounts.length,
-        eligibleCount: context.accounts.filter(
-          (account) => account.allocatorEnabled && account.status === "active",
+        eligibleCount: context.accounts.filter((account) =>
+          isCodexCredentialEligible(account, settings.codexRotationNearExhaustionPct, now),
         ).length,
       },
     };
@@ -147,7 +148,7 @@ export function createCodexCapacityActivities(services: () => Promise<ActivitySe
         waiterId: input.waiterId,
         generation: input.generation,
       },
-      (context) => capacityDecision(context, resolved.settings),
+      (context) => codexCapacityDecision(context, resolved.settings),
     );
     if (result.events.length > 0) {
       try {

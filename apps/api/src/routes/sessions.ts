@@ -144,12 +144,11 @@ export function registerSessionRoutes(app: Hono, deps: ApiRouteDeps): void {
   app.get("/v1/workspaces/:workspaceId/sessions/:sessionId", async (c) => {
     const workspaceId = c.req.param("workspaceId");
     const grant = await requireAccessGrant(c, deps, workspaceId, "sessions:read");
-    const session = await getSessionForSubject(
-      db,
-      workspaceId,
-      c.req.param("sessionId"),
-      grant.subjectId,
-    );
+    const sessionId = c.req.param("sessionId");
+    if (!z.string().uuid().safeParse(sessionId).success) {
+      throw new HTTPException(404, { message: "session not found" });
+    }
+    const session = await getSessionForSubject(db, workspaceId, sessionId, grant.subjectId);
     if (!session) {
       throw new HTTPException(404, { message: "session not found" });
     }
@@ -162,7 +161,11 @@ export function registerSessionRoutes(app: Hono, deps: ApiRouteDeps): void {
   app.put("/v1/workspaces/:workspaceId/sessions/:sessionId/pin", async (c) => {
     const workspaceId = c.req.param("workspaceId");
     const grant = await requireAccessGrant(c, deps, workspaceId, "sessions:read");
-    const parsed = UpdateSessionPinRequest.safeParse(await c.req.json());
+    const sessionId = c.req.param("sessionId");
+    if (!z.string().uuid().safeParse(sessionId).success) {
+      throw new HTTPException(404, { message: "session not found" });
+    }
+    const parsed = UpdateSessionPinRequest.safeParse(await c.req.json().catch(() => null));
     if (!parsed.success) {
       throw new HTTPException(400, { message: "invalid session pin request" });
     }
@@ -170,7 +173,7 @@ export function registerSessionRoutes(app: Hono, deps: ApiRouteDeps): void {
       const session = await setSessionPin(db, {
         workspaceId,
         subjectId: grant.subjectId,
-        sessionId: c.req.param("sessionId"),
+        sessionId,
         ...parsed.data,
       });
       if (!session) {

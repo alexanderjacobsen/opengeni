@@ -3,9 +3,10 @@
 -- independently organize the same durable session rows. Deleting a session or
 -- workspace cleans pins through FKs; no session activity/history field changes.
 
--- The large parent index is already built online by the preceding transactionless
--- migration. Bound the remaining brief catalog/table locks so production migration
--- contention fails closed and retries rather than blocking API writes indefinitely.
+-- Bound the brief catalog/table locks needed for the additive table and foreign keys
+-- so production migration contention fails closed and retries rather than blocking
+-- API writes indefinitely. The composite sessions parent index is owned by the
+-- preceding 0053 migration on current main.
 SET lock_timeout = '5s';
 SET statement_timeout = '10min';
 

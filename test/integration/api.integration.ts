@@ -293,6 +293,25 @@ describe("API component integration", () => {
     expect(await staleAfterRepin.json()).toMatchObject({
       current: { pinned: true, pinVersion: 3 },
     });
+
+    const malformedSessionId = await app.request(
+      workspacePath(workspaceId, "/sessions/not-a-uuid/pin"),
+      {
+        method: "PUT",
+        body: JSON.stringify({ pinned: true }),
+        headers: { "content-type": "application/json" },
+      },
+    );
+    expect(malformedSessionId.status).toBe(404);
+    const malformedBody = await app.request(
+      workspacePath(workspaceId, `/sessions/${pinnedTarget.id}/pin`),
+      {
+        method: "PUT",
+        body: "{",
+        headers: { "content-type": "application/json" },
+      },
+    );
+    expect(malformedBody.status).toBe(400);
   });
 
   test("create-with-instructions persists and reads back the field without leaking a timeline event", async () => {

@@ -5,8 +5,7 @@ import postgres from "postgres";
 
 import { migrate } from "../src/migrate";
 
-const indexMigrationName = "0049_session_pins_parent_index.sql";
-const tableMigrationName = "0049_session_pins_table.sql";
+const migrationName = "0054_session_pins.sql";
 const requireRealDatabase = process.env.OPENGENI_REQUIRE_REAL_DB === "1";
 
 let available = true;
@@ -14,16 +13,16 @@ let blank: BlankTestDatabase | null = null;
 let admin: postgres.Sql;
 
 beforeAll(async () => {
-  blank = await acquireBlankTestDatabase("migration-0049-pins");
+  blank = await acquireBlankTestDatabase("migration-0054-pins");
   if (!blank) {
     if (requireRealDatabase) {
       throw new Error(
-        "[migration-0049-session-pins] OPENGENI_REQUIRE_REAL_DB=1 but PostgreSQL is unavailable",
+        "[migration-0054-session-pins] OPENGENI_REQUIRE_REAL_DB=1 but PostgreSQL is unavailable",
       );
     }
     available = false;
     // eslint-disable-next-line no-console
-    console.warn("[migration-0049-session-pins] docker unavailable, skipping");
+    console.warn("[migration-0054-session-pins] docker unavailable, skipping");
     return;
   }
   admin = postgres(blank.databaseUrl, { max: 4 });
@@ -35,7 +34,7 @@ beforeAll(async () => {
   `);
   const migrationsUrl = new URL("../drizzle/", import.meta.url);
   const prior = (await readdir(migrationsUrl))
-    .filter((file) => file.endsWith(".sql") && file.localeCompare(indexMigrationName) < 0)
+    .filter((file) => file.endsWith(".sql") && file.localeCompare(migrationName) < 0)
     .sort();
   for (const file of prior) {
     await admin.unsafe(await readFile(new URL(file, migrationsUrl), "utf8"));
@@ -48,7 +47,7 @@ afterAll(async () => {
   await blank?.release();
 });
 
-describe("0049 session pin migration (real PostgreSQL)", () => {
+describe("0054 session pin migration (real PostgreSQL)", () => {
   test("bounds production lock contention and cleanly retries", async () => {
     if (!available || !blank) return;
     const blocker = postgres(blank.databaseUrl, { max: 1 });
@@ -70,7 +69,7 @@ describe("0049 session pin migration (real PostgreSQL)", () => {
     expect(elapsedMs).toBeLessThan(15_000);
     const [failedRecord] = await admin<{ count: number }[]>`
       select count(*)::int as count from schema_migrations
-      where name in (${indexMigrationName}, ${tableMigrationName})`;
+      where name = ${migrationName}`;
     expect(failedRecord?.count).toBe(0);
 
     await migrate(blank.databaseUrl);
@@ -83,8 +82,8 @@ describe("0049 session pin migration (real PostgreSQL)", () => {
       }[]
     >`
       select
-        (select count(*) = 2 from schema_migrations
-          where name in (${indexMigrationName}, ${tableMigrationName})) as applied,
+        (select count(*) = 1 from schema_migrations
+          where name = ${migrationName}) as applied,
         coalesce((
           select i.indisvalid
           from pg_index i

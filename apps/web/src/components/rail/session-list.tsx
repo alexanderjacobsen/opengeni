@@ -118,18 +118,20 @@ export function SessionList() {
     () => allSessions.filter((session) => !session.pinned),
     [allSessions],
   );
+  const openSessionId = context.session?.id;
+  const openSessionWorkspaceId = context.session?.workspaceId;
+  const setContextSession = context.setSession;
 
   // The route header and rail intentionally keep separate projections. Merge
   // the canonical pin fields from each successful page poll into the open
   // session so a pin changed on another device cannot leave those affordances
   // disagreeing. Preserve the route/SSE-owned lifecycle and content fields.
   useEffect(() => {
-    const open = context.session;
-    if (!open || open.workspaceId !== rail.workspaceId) return;
-    const projected = allSessions.find((candidate) => candidate.id === open.id);
+    if (!openSessionId || openSessionWorkspaceId !== rail.workspaceId) return;
+    const projected = allSessions.find((candidate) => candidate.id === openSessionId);
     if (!projected) return;
-    context.setSession((current) => applySessionPinProjection(current, projected));
-  }, [allSessions, context.session?.id, context.setSession, rail.workspaceId]);
+    setContextSession((current) => applySessionPinProjection(current, projected));
+  }, [allSessions, openSessionId, openSessionWorkspaceId, rail.workspaceId, setContextSession]);
 
   const activeSessionId = useRouterState({
     select: (state): string | null => {
@@ -846,7 +848,7 @@ function SessionRow(props: {
         </ContextMenuItem>
         <ContextMenuItem
           className="pointer-coarse:min-h-11"
-          onSelect={() => void props.onPin(props.session, !Boolean(props.session.pinned))}
+          onSelect={() => void props.onPin(props.session, !props.session.pinned)}
         >
           <PinIcon className={props.session.pinned ? "size-4 fill-current" : "size-4"} />
           {props.session.pinned ? "Unpin" : "Pin"}
@@ -916,7 +918,7 @@ function RowActionsMenu({
         </DropdownMenuItem>
         <DropdownMenuItem
           className="pointer-coarse:min-h-11"
-          onSelect={() => void onPin(session, !Boolean(session.pinned))}
+          onSelect={() => void onPin(session, !session.pinned)}
           onClick={(event) => event.stopPropagation()}
         >
           <PinIcon className={session.pinned ? "size-4 fill-current" : "size-4"} />

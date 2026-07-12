@@ -151,7 +151,7 @@ function SessionPinButton({
         disabled={busy}
         className="pointer-coarse:size-11"
         onClick={() => {
-          const nextPinned = !Boolean(session.pinned);
+          const nextPinned = !session.pinned;
           setBusy(true);
           void onPin(session, nextPinned)
             .then((updated) => {

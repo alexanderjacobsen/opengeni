@@ -536,6 +536,12 @@ export function RootRouteComponent() {
       if (authoritative) {
         setSession((current) => reconcileFailedSessionPin(current, optimistic, authoritative));
         notifySessionPinChanged(workspaceId, sessionId);
+        // A lost response after commit is a successful desired-state mutation,
+        // not a failed pin. Returning the point-read result keeps the UI
+        // announcement honest while preserving the same idempotent retry path.
+        if (Boolean(authoritative.pinned) === pinned) {
+          return authoritative;
+        }
       } else if (optimistic) {
         // If reconciliation is also unavailable (for example while offline),
         // roll back only the exact optimistic projection this call installed.

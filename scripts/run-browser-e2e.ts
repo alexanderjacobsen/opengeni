@@ -1,6 +1,11 @@
 import { spawnSync } from "node:child_process";
 
-const testArgs = ["test", "./test/e2e/browser.e2e.ts"];
+const testArgs = [
+  "test",
+  "--max-concurrency=1",
+  "./test/e2e/browser.e2e.ts",
+  "./test/e2e/session-pins.browser.e2e.ts",
+];
 const first = spawnSync("bun", testArgs, {
   encoding: "utf8",
   stdio: ["ignore", "pipe", "pipe"],

@@ -2,6 +2,8 @@ import { sql } from "drizzle-orm";
 import {
   bigint,
   boolean,
+  check,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -577,6 +579,117 @@ export const sessions = pgTable(
     createIdempotency: uniqueIndex("sessions_workspace_create_idempotency_idx")
       .on(table.workspaceId, table.createIdempotencyKey)
       .where(sql`${table.createIdempotencyKey} is not null`),
+  }),
+);
+
+// Per-authenticated-subject session organization. This is deliberately a
+// relation instead of a session column: one member's pin must never reorder a
+// shared workspace for another member, and a session's own activity timestamps
+// must remain agent/runtime truth. `subjectId` is the trusted AccessGrant
+// subject, which is text because configured/delegated principals are not always
+// UUIDs. The account/workspace pair carries the standard forced-RLS boundary.
+export const sessionPins = pgTable(
+  "session_pins",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    accountId: uuid("account_id")
+      .notNull()
+      .references(() => managedAccounts.id, { onDelete: "cascade" }),
+    workspaceId: uuid("workspace_id")
+      .notNull()
+      .references(() => workspaces.id, { onDelete: "cascade" }),
+    subjectId: text("subject_id").notNull(),
+    sessionId: uuid("session_id")
+      .notNull()
+      .references(() => sessions.id, { onDelete: "cascade" }),
+    // Keep an unpinned tombstone (pinned=false, pinned_at=null) rather than
+    // deleting it. That preserves a monotonic version and prevents an ABA race:
+    // a stale client that saw pin version 1 cannot silently overwrite a later
+    // unpin+re-pin that would otherwise recreate version 1.
+    pinned: boolean("pinned").notNull().default(true),
+    pinnedAt: timestamp("pinned_at", { withTimezone: true }).defaultNow(),
+    version: integer("version").notNull().default(1),
+  },
+  (table) => ({
+    subjectNonempty: check(
+      "session_pins_subject_nonempty",
+      sql`length(btrim(${table.subjectId})) > 0`,
+    ),
+    versionPositive: check("session_pins_version_positive", sql`${table.version} >= 1`),
+    stateConsistent: check(
+      "session_pins_state_consistent",
+      sql`((${table.pinned}) and (${table.pinnedAt}) is not null) or ((not ${table.pinned}) and (${table.pinnedAt}) is null)`,
+    ),
+    workspaceAccount: foreignKey({
+      name: "session_pins_workspace_account_fk",
+      columns: [table.workspaceId, table.accountId],
+      foreignColumns: [workspaces.id, workspaces.accountId],
+    }).onDelete("cascade"),
+    workspaceSession: foreignKey({
+      name: "session_pins_workspace_session_fk",
+      columns: [table.workspaceId, table.sessionId],
+      foreignColumns: [sessions.workspaceId, sessions.id],
+    }).onDelete("cascade"),
+    subjectSession: uniqueIndex("session_pins_subject_workspace_session_idx").on(
+      table.subjectId,
+      table.workspaceId,
+      table.sessionId,
+    ),
+    subjectPinned: index("session_pins_workspace_subject_pinned_idx").on(
+      table.workspaceId,
+      table.subjectId,
+      table.pinned,
+      table.pinnedAt.desc(),
+      table.sessionId.desc(),
+    ),
+  }),
+);
+
+// A short-lived server-owned continuation snapshot for the pin-aware session
+// list. The ordinary list is ordered by mutable activity, so a cursor cannot
+// safely replay that order from updated_at alone across HTTP requests. The
+// snapshot stores the already-ordered ordinary ids; the list query still joins
+// live session rows for current lifecycle/title data and expires snapshots
+// opportunistically.
+export const sessionListSnapshots = pgTable(
+  "session_list_snapshots",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    accountId: uuid("account_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    subjectId: text("subject_id").notNull(),
+    parentSessionFilter: text("parent_session_filter").notNull().default("all"),
+    search: text("search"),
+    ordinarySessionIds: uuid("ordinary_session_ids")
+      .array()
+      .notNull()
+      .default(sql`'{}'::uuid[]`),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    workspaceAccount: foreignKey({
+      name: "session_list_snapshots_workspace_account_fk",
+      columns: [table.workspaceId, table.accountId],
+      foreignColumns: [workspaces.id, workspaces.accountId],
+    }).onDelete("cascade"),
+    subjectNonempty: check(
+      "session_list_snapshots_subject_nonempty",
+      sql`length(btrim(${table.subjectId})) > 0`,
+    ),
+    parentFilterValid: check(
+      "session_list_snapshots_parent_filter_valid",
+      sql`${table.parentSessionFilter} = 'all' or ${table.parentSessionFilter} = 'null' or ${table.parentSessionFilter} ~ '^[0-9a-fA-F-]{36}$'`,
+    ),
+    searchLength: check(
+      "session_list_snapshots_search_length",
+      sql`${table.search} is null or length(${table.search}) <= 200`,
+    ),
+    workspaceExpiry: index("session_list_snapshots_workspace_expiry_idx").on(
+      table.workspaceId,
+      table.subjectId,
+      table.expiresAt,
+    ),
   }),
 );
 

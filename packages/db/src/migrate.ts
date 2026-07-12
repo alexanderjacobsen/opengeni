@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import postgres from "postgres";
 
 const DEFAULT_DATABASE_URL = "postgres://opengeni:opengeni@127.0.0.1:5432/opengeni";
+const concurrentIndexDirective = /^-- opengeni:concurrent-index lock-timeout=(\d+(?:ms|s|min))$/;
 
 /** A bare Postgres identifier (schema/role name) safe to interpolate into DDL. */
 function assertIdentifier(name: string, value: string): string {
@@ -11,6 +12,56 @@ function assertIdentifier(name: string, value: string): string {
     throw new Error(`${name} is not a valid Postgres identifier: ${value}`);
   }
   return value;
+}
+
+/**
+ * Most migration files intentionally execute as one implicit transaction.
+ * PostgreSQL forbids CREATE INDEX CONCURRENTLY there, so a migration may opt
+ * into one narrowly validated transactionless statement with:
+ *
+ *   -- opengeni:concurrent-index lock-timeout=5s
+ *   CREATE [UNIQUE] INDEX CONCURRENTLY ...;
+ *
+ * The directive is deliberately not a generic "no transaction" escape hatch:
+ * only one concurrent-index statement is accepted, and lock acquisition is
+ * always bounded. This keeps additive large-table indexes online without making
+ * arbitrary partially-applied migration scripts possible.
+ */
+async function executeMigrationFile(
+  sql: postgres.Sql,
+  file: string,
+  sqlText: string,
+): Promise<void> {
+  const [firstLine = "", ...remainingLines] = sqlText.replaceAll("\r\n", "\n").split("\n");
+  const directive = concurrentIndexDirective.exec(firstLine.trim());
+  if (!directive) {
+    if (firstLine.trim().startsWith("-- opengeni:")) {
+      throw new Error(`Unsupported OpenGeni migration directive in ${file}`);
+    }
+    await sql.unsafe(sqlText);
+    return;
+  }
+
+  const lockTimeout = directive[1]!;
+  const statement = remainingLines.join("\n").trim();
+  const withoutTrailingSemicolon = statement.endsWith(";")
+    ? statement.slice(0, -1).trimEnd()
+    : statement;
+  if (
+    !/^CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\b/is.test(withoutTrailingSemicolon) ||
+    withoutTrailingSemicolon.includes(";")
+  ) {
+    throw new Error(
+      `${file}: opengeni:concurrent-index requires exactly one CREATE [UNIQUE] INDEX CONCURRENTLY statement`,
+    );
+  }
+
+  await sql`select set_config('lock_timeout', ${lockTimeout}, false)`;
+  try {
+    await sql.unsafe(statement);
+  } finally {
+    await sql`select set_config('lock_timeout', '0', false)`;
+  }
 }
 
 /**
@@ -73,7 +124,7 @@ export async function migrate(
         continue;
       }
       const sqlText = await readFile(join(migrationsDir, file), "utf8");
-      await sql.unsafe(sqlText);
+      await executeMigrationFile(sql, file, sqlText);
       await sql`INSERT INTO "schema_migrations" ("name") VALUES (${file}) ON CONFLICT DO NOTHING`;
     }
   } finally {

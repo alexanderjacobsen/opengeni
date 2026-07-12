@@ -309,6 +309,9 @@ function session(status: SessionStatus): Session {
     lastSequence: 1,
     codexPinnedCredentialId: null,
     codexLastCredentialId: null,
+    pinned: false,
+    pinnedAt: null,
+    pinVersion: 0,
     createdAt: "2026-07-10T00:00:00.000Z",
     updatedAt: "2026-07-10T00:00:00.000Z",
   };

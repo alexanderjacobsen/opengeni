@@ -191,10 +191,19 @@ describe("OpenGeniClient", () => {
     expect(requests[0]!.headers.authorization).toBe("Bearer og_test_key");
   });
 
-  test("listSessions sends parent filters and getSessionLineage hits lineage route", async () => {
-    const { client, requests } = makeClient(() => jsonResponse([]));
+  test("legacy listSessions stays array-shaped while listSessionPage adds pin cursors", async () => {
+    const { client, requests } = makeClient((request) =>
+      request.url.includes("view=page")
+        ? jsonResponse({ pinned: [], sessions: [], nextCursor: null })
+        : jsonResponse([]),
+    );
     await client.listSessions(WORKSPACE_ID, { limit: 5, parentSessionId: null });
     await client.listSessions(WORKSPACE_ID, { parentSessionId: SESSION_ID });
+    await client.listSessionPage(WORKSPACE_ID, {
+      limit: 7,
+      cursor: "opaque-cursor",
+      search: "  pinned work  ",
+    });
     await client.getSessionLineage(WORKSPACE_ID, SESSION_ID);
     expect(requests[0]!.url).toBe(
       `https://api.example.test/v1/workspaces/${WORKSPACE_ID}/sessions?limit=5&parentSessionId=null`,
@@ -203,8 +212,32 @@ describe("OpenGeniClient", () => {
       `https://api.example.test/v1/workspaces/${WORKSPACE_ID}/sessions?parentSessionId=${SESSION_ID}`,
     );
     expect(requests[2]!.url).toBe(
+      `https://api.example.test/v1/workspaces/${WORKSPACE_ID}/sessions?view=page&limit=7&cursor=opaque-cursor&search=pinned+work`,
+    );
+    expect(requests[3]!.url).toBe(
       `https://api.example.test/v1/workspaces/${WORKSPACE_ID}/sessions/${SESSION_ID}/lineage`,
     );
+  });
+
+  test("listSessionPage falls back to an older server's array endpoint", async () => {
+    const legacy = [
+      { id: SESSION_ID, workspaceId: WORKSPACE_ID },
+    ] as unknown as import("../src/types").Session[];
+    const { client, requests } = makeClient(() => jsonResponse(legacy));
+    await expect(client.listSessionPage(WORKSPACE_ID, { limit: 5 })).resolves.toEqual({
+      pinned: [],
+      sessions: legacy,
+      nextCursor: null,
+    });
+    expect(requests.map((request) => request.url)).toEqual([
+      `https://api.example.test/v1/workspaces/${WORKSPACE_ID}/sessions?view=page&limit=5`,
+    ]);
+    await expect(
+      client.listSessionPage(WORKSPACE_ID, { cursor: "unsupported-on-legacy" }),
+    ).rejects.toThrow("does not support stable session-page cursors");
+    await expect(
+      client.listSessionPage(WORKSPACE_ID, { search: "unsupported-on-legacy" }),
+    ).rejects.toThrow("does not support session search");
   });
 
   test("streamEvents consumes the SSE endpoint end to end through fetch", async () => {

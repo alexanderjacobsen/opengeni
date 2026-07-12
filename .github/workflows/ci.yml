@@ -40,7 +40,33 @@ jobs:
         run: bun run format:check
 
       - name: Test
+        env:
+          # OPE-26's per-subject FORCE-RLS/OCC suite is a required security gate.
+          # Never turn a missing Docker/PostgreSQL runner into green skipped tests.
+          OPENGENI_REQUIRE_REAL_DB: "1"
         run: bun test
+
+      - name: Install pinned Playwright Chromium runtime
+        run: bunx playwright install --with-deps chromium
+
+      - name: OPE-26 session pin browser acceptance
+        env:
+          # This browser gate must fail when its real PostgreSQL boundary is unavailable.
+          OPENGENI_REQUIRE_REAL_DB: "1"
+        run: bun test --max-concurrency=1 --timeout 180000 ./test/e2e/session-pins.browser.e2e.ts
+
+      - name: Upload OPE-26 visual evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ope26-session-pin-visual-evidence
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            /tmp/ope26-session-pin-desktop-light.png
+            /tmp/ope26-session-pin-desktop-dark.png
+            /tmp/ope26-session-pin-mobile-light.png
+            /tmp/ope26-session-pin-mobile-dark.png
 
       # OPE-22 production regressions cross the activity/DB/event boundary and
       # therefore are not discovered by the unit-test command above. Keep the

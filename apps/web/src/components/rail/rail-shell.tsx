@@ -231,6 +231,7 @@ export function RailShell({ children }: { children: ReactNode }) {
             <SheetContent
               side="left"
               showCloseButton={false}
+              aria-label="Session navigation"
               className="w-[260px] max-w-[85vw] gap-0 p-0"
               onCloseAutoFocus={(event) => {
                 event.preventDefault();
@@ -287,6 +288,7 @@ function CanvasTopStrip({ hamburgerRef }: { hamburgerRef: RefObject<HTMLButtonEl
       size="icon-sm"
       aria-label="Open navigation"
       onClick={() => rail.setDrawerOpen(true)}
+      className="pointer-coarse:size-11"
     >
       <MenuIcon className="size-4" />
     </Button>
@@ -308,6 +310,9 @@ function CanvasTopStrip({ hamburgerRef }: { hamburgerRef: RefObject<HTMLButtonEl
         inspectorOpen={context.inspectorOpen}
         onToggleInspector={() => context.setInspectorOpen((open) => !open)}
         onRename={context.updateSessionTitle}
+        onPin={(target, pinned) =>
+          context.updateSessionPin(target.workspaceId, target.id, pinned, target.pinVersion ?? 0)
+        }
         leading={hamburger}
         sandboxSlot={
           <SessionSandboxSwitcher workspaceId={session.workspaceId} sessionId={session.id} />

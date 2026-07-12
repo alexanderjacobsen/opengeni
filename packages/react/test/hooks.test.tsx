@@ -15,6 +15,7 @@ import { useComposer } from "../src/hooks/use-composer";
 import { useEnvironments } from "../src/hooks/use-environments";
 import { useGoal } from "../src/hooks/use-goal";
 import { usePacks } from "../src/hooks/use-packs";
+import { useWorkspaceSessions } from "../src/hooks/use-workspace-sessions";
 import { useSessionControl } from "../src/hooks/use-session-control";
 import { useSessionLineage } from "../src/hooks/use-session-lineage";
 import { useTurnQueue } from "../src/hooks/use-turn-queue";
@@ -39,6 +40,33 @@ function makeEvent(
 }
 
 const noEvents: SessionEvent[] = [];
+
+describe("useWorkspaceSessions", () => {
+  test("keeps pinned rows in the historical sessions result while exposing the section", async () => {
+    const pinned = { id: "pinned", pinned: true } as never;
+    const ordinary = { id: "ordinary", pinned: false } as never;
+    const client = fakeClient({
+      listSessionPage: async () => ({
+        pinned: [pinned],
+        sessions: [ordinary],
+        nextCursor: "next-page",
+      }),
+    });
+    const hook = await renderHook(
+      () => useWorkspaceSessions({ client, workspaceId: WORKSPACE_ID }),
+      undefined,
+    );
+    await flush();
+
+    expect(hook.result.current.sessions.map((session) => session.id)).toEqual([
+      "pinned",
+      "ordinary",
+    ]);
+    expect(hook.result.current.pinned.map((session) => session.id)).toEqual(["pinned"]);
+    expect(hook.result.current.nextCursor).toBe("next-page");
+    await hook.unmount();
+  });
+});
 
 describe("useTurnQueue", () => {
   test("loads turns and projects queue + activeTurn", async () => {

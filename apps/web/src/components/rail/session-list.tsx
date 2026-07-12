@@ -10,7 +10,9 @@ import {
   EllipsisIcon,
   MessagesSquareIcon,
   PencilIcon,
+  PinIcon,
   PlusIcon,
+  SearchIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -30,7 +32,15 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useAppContext } from "@/context";
+import {
+  activeSessionContinuation,
+  advanceSessionPageIdentity,
+  emptySessionContinuation,
+  mergeSessionContinuation,
+  sessionPageKey,
+} from "@/lib/session-pagination";
 import { SESSION_TITLE_MAX_LENGTH, useInlineRename } from "@/lib/session-rename";
+import { applySessionPinProjection, subscribeToSessionPinChanges } from "@/lib/session-pins";
 import {
   buildRailForest,
   groupSessionsForRail,
@@ -42,16 +52,89 @@ import { cn } from "@/lib/utils";
 import type { Session } from "@/types";
 
 type RenameFn = (workspaceId: string, sessionId: string, title: string) => Promise<Session | null>;
+type PinFn = (session: Session, pinned: boolean) => Promise<Session | null>;
+type PinOverride = { session: Session; operation: number };
 
 export function SessionList() {
   const rail = useRail();
   const context = useAppContext();
   // Poll so running sessions surface and move to the top without a manual
   // refresh; the previous index relied on a one-shot load.
-  const { sessions, loading, error, refresh } = useWorkspaceSessions({
+  const [searchDraft, setSearchDraft] = useState("");
+  const [search, setSearch] = useState("");
+  useEffect(() => {
+    const timer = window.setTimeout(() => setSearch(searchDraft.trim()), 200);
+    return () => window.clearTimeout(timer);
+  }, [searchDraft]);
+  const { sessions, pinned, nextCursor, loading, error, refresh } = useWorkspaceSessions({
     limit: 50,
+    search,
     pollIntervalMs: 15_000,
   });
+  // Ordinary rows page independently of the complete pinned section. The
+  // polled hook owns page one; additional pages are appended and deduplicated.
+  // A filter change starts a fresh cursor chain rather than mixing snapshots.
+  // The server cursor carries the first page's short-lived snapshot identity.
+  // If a poll replaces that snapshot, any continuation loaded from the old
+  // activity order is stale even when workspace/search are unchanged.
+  const paginationKey = `${sessionPageKey(rail.workspaceId, search)}\u0000${nextCursor ?? "complete"}`;
+  const paginationIdentity = useRef({ key: paginationKey, generation: 0 });
+  paginationIdentity.current = advanceSessionPageIdentity(
+    paginationIdentity.current,
+    paginationKey,
+  );
+  const pageGeneration = paginationIdentity.current.generation;
+  const [continuation, setContinuation] = useState(() => emptySessionContinuation(pageGeneration));
+  const activeContinuation = activeSessionContinuation(continuation, pageGeneration);
+  const extraSessions = activeContinuation.sessions;
+  const continuationCursor =
+    activeContinuation.nextCursor === undefined ? nextCursor : activeContinuation.nextCursor;
+  const [loadingMoreGeneration, setLoadingMoreGeneration] = useState<number | null>(null);
+  const loadingMore = loadingMoreGeneration === pageGeneration;
+  const loadMoreAttempt = useRef(0);
+  const loadMoreError = activeContinuation.failed;
+  const [announcement, setAnnouncement] = useState("");
+  // Short-lived optimistic projections only. The page returned by the server
+  // remains canonical; after each mutation we replace the projection with that
+  // returned row and refresh once to reconcile tabs/devices/offline recovery.
+  const [pinOverrides, setPinOverrides] = useState<ReadonlyMap<string, PinOverride>>(
+    () => new Map(),
+  );
+  const pinOperation = useRef(0);
+  const pinning = useRef(new Set<string>());
+  const allSessions = useMemo(() => {
+    const source = new Map<string, Session>();
+    // Precedence is extra page < current first page < current pinned section;
+    // a row that became pinned since it was loaded as an old ordinary page must
+    // never be overwritten by that stale extra-page projection.
+    for (const session of [...extraSessions, ...sessions, ...pinned]) {
+      source.set(session.id, session);
+    }
+    for (const [id, override] of pinOverrides) source.set(id, override.session);
+    return [...source.values()];
+  }, [pinned, sessions, extraSessions, pinOverrides]);
+  const pinnedSessions = useMemo(
+    () => allSessions.filter((session) => Boolean(session.pinned)),
+    [allSessions],
+  );
+  const ordinarySessions = useMemo(
+    () => allSessions.filter((session) => !session.pinned),
+    [allSessions],
+  );
+  const openSessionId = context.session?.id;
+  const openSessionWorkspaceId = context.session?.workspaceId;
+  const setContextSession = context.setSession;
+
+  // The route header and rail intentionally keep separate projections. Merge
+  // the canonical pin fields from each successful page poll into the open
+  // session so a pin changed on another device cannot leave those affordances
+  // disagreeing. Preserve the route/SSE-owned lifecycle and content fields.
+  useEffect(() => {
+    if (!openSessionId || openSessionWorkspaceId !== rail.workspaceId) return;
+    const projected = allSessions.find((candidate) => candidate.id === openSessionId);
+    if (!projected) return;
+    setContextSession((current) => applySessionPinProjection(current, projected));
+  }, [allSessions, openSessionId, openSessionWorkspaceId, rail.workspaceId, setContextSession]);
 
   const activeSessionId = useRouterState({
     select: (state): string | null => {
@@ -63,21 +146,35 @@ export function SessionList() {
   // Lineage forest: spawned workers nest under their manager (parentSessionId),
   // running roots pinned. The keyboard navigation walks the VISIBLE rows given
   // the current expand state; the render nests them back into sections.
-  const forest = useMemo(() => buildRailForest(sessions), [sessions]);
+  const forest = useMemo(() => buildRailForest(ordinarySessions), [ordinarySessions]);
+  // The API already returns pins in stable pinnedAt DESC/id DESC order. Keep
+  // this compact section flat: a pinned child is intentionally surfaced rather
+  // than hidden under an ordinary parent that was excluded from this section.
+  const pinnedNodes = useMemo<SessionTreeNode[]>(
+    () =>
+      [...pinnedSessions]
+        .sort(
+          (left, right) =>
+            Date.parse(right.pinnedAt ?? "") - Date.parse(left.pinnedAt ?? "") ||
+            right.id.localeCompare(left.id),
+        )
+        .map((session) => ({ session, children: [], hasActiveDescendant: false })),
+    [pinnedSessions],
+  );
 
   // Which parents are expanded. Children start collapsed (the rail stays quiet);
   // the active session's ancestors auto-expand so a deep child is never hidden.
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
   const parentOf = useMemo(() => {
     const map = new Map<string, string>();
-    const byId = new Set(sessions.map((session) => session.id));
-    for (const session of sessions) {
+    const byId = new Set(allSessions.map((session) => session.id));
+    for (const session of allSessions) {
       if (session.parentSessionId && byId.has(session.parentSessionId)) {
         map.set(session.id, session.parentSessionId);
       }
     }
     return map;
-  }, [sessions]);
+  }, [allSessions]);
   useEffect(() => {
     if (!activeSessionId) {
       return;
@@ -110,19 +207,164 @@ export function SessionList() {
     });
   }, []);
 
-  const visibleRows = useMemo(() => visibleForestRows(forest, expanded), [forest, expanded]);
+  const visibleRows = useMemo(
+    () => [
+      ...pinnedNodes.map((node) => ({ node, depth: 0 })),
+      ...visibleForestRows(forest, expanded),
+    ],
+    [pinnedNodes, forest, expanded],
+  );
   const flat = useMemo<Session[]>(() => visibleRows.map((row) => row.node.session), [visibleRows]);
 
-  const listRef = useRef<HTMLDivElement>(null);
-  const [focusIndex, setFocusIndex] = useState<number>(-1);
+  const onPin = useCallback<PinFn>(
+    async (target, nextPinned) => {
+      if (pinning.current.has(target.id)) {
+        return target;
+      }
+      pinning.current.add(target.id);
+      const operation = ++pinOperation.current;
+      const optimistic: Session = {
+        ...target,
+        pinned: nextPinned,
+        pinnedAt: nextPinned ? new Date().toISOString() : null,
+        pinVersion: (target.pinVersion ?? 0) + 1,
+      };
+      setPinOverrides((current) =>
+        new Map(current).set(target.id, { session: optimistic, operation }),
+      );
+      try {
+        const updated = await context.updateSessionPin(
+          target.workspaceId,
+          target.id,
+          nextPinned,
+          target.pinVersion ?? 0,
+        );
+        if (updated) {
+          setPinOverrides((current) => {
+            if (current.get(target.id)?.operation !== operation) return current;
+            return new Map(current).set(target.id, { session: updated, operation });
+          });
+        }
+        await refresh();
+        const label = target.title?.trim() || target.initialMessage?.trim() || "Untitled session";
+        setAnnouncement(
+          updated
+            ? `${nextPinned ? "Pinned" : "Unpinned"} ${label}.`
+            : `${label} was not ${nextPinned ? "pinned" : "unpinned"}. Server state refreshed.`,
+        );
+        return updated;
+      } finally {
+        pinning.current.delete(target.id);
+        setPinOverrides((current) => {
+          if (current.get(target.id)?.operation !== operation) return current;
+          const next = new Map(current);
+          next.delete(target.id);
+          return next;
+        });
+      }
+    },
+    [context, refresh],
+  );
 
-  // Keep the keyboard focus index pinned to the active session when the route
-  // changes (so ArrowDown continues from where the user is).
-  useEffect(() => {
-    const index = flat.findIndex((session) => session.id === activeSessionId);
-    if (index >= 0) {
-      setFocusIndex(index);
+  const loadMore = useCallback(async () => {
+    if (!continuationCursor || loadingMore) return;
+    const requestGeneration = pageGeneration;
+    const attempt = ++loadMoreAttempt.current;
+    setLoadingMoreGeneration(requestGeneration);
+    setContinuation((current) => ({
+      ...activeSessionContinuation(current, requestGeneration),
+      failed: false,
+    }));
+    try {
+      const page = await context.client.listSessionPage(rail.workspaceId, {
+        limit: 50,
+        cursor: continuationCursor,
+        ...(search ? { search } : {}),
+      });
+      if (
+        paginationIdentity.current.generation !== requestGeneration ||
+        loadMoreAttempt.current !== attempt
+      ) {
+        return;
+      }
+      setContinuation((current) =>
+        mergeSessionContinuation(current, pageGeneration, requestGeneration, page),
+      );
+      setAnnouncement(
+        page.sessions.length === 0
+          ? "No more older sessions."
+          : `Loaded ${page.sessions.length} older session${page.sessions.length === 1 ? "" : "s"}.`,
+      );
+    } catch {
+      if (
+        paginationIdentity.current.generation !== requestGeneration ||
+        loadMoreAttempt.current !== attempt
+      ) {
+        return;
+      }
+      // Keep already loaded rows and make this bounded page explicitly
+      // retryable; a silent no-op would look like pagination had ended.
+      setContinuation((current) => ({
+        ...activeSessionContinuation(current, requestGeneration),
+        failed: true,
+      }));
+      setAnnouncement("Older sessions did not load. Retry is available.");
+    } finally {
+      if (
+        paginationIdentity.current.generation === requestGeneration &&
+        loadMoreAttempt.current === attempt
+      ) {
+        setLoadingMoreGeneration(null);
+      }
     }
+  }, [context.client, continuationCursor, loadingMore, pageGeneration, rail.workspaceId, search]);
+
+  // Cross-tab invalidation and lifecycle reconciliation. Cross-device changes
+  // arrive on the 15s poll; returning to a tab or reconnecting refreshes now.
+  useEffect(
+    () => subscribeToSessionPinChanges(rail.workspaceId, () => void refresh()),
+    [rail.workspaceId, refresh],
+  );
+  useEffect(() => {
+    const reconcile = () => void refresh();
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") reconcile();
+    };
+    window.addEventListener("focus", reconcile);
+    window.addEventListener("online", reconcile);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("focus", reconcile);
+      window.removeEventListener("online", reconcile);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [refresh]);
+
+  const listRef = useRef<HTMLDivElement>(null);
+  const [focusedSessionId, setFocusedSessionId] = useState<string | null>(null);
+  const focusIndex = useMemo(() => {
+    const preferredId = focusedSessionId ?? activeSessionId;
+    const preferred = preferredId ? flat.findIndex((session) => session.id === preferredId) : -1;
+    return preferred >= 0 ? preferred : flat.length > 0 ? 0 : -1;
+  }, [activeSessionId, flat, focusedSessionId]);
+
+  // Follow the active session only when the ROUTE changes. Polls, pagination,
+  // pin reorder, and cross-device reconciliation also replace `flat`; those
+  // refreshes must preserve a keyboard user's still-visible roving target
+  // instead of stealing focus back to the route-active row.
+  const previousActiveSessionId = useRef(activeSessionId);
+  useEffect(() => {
+    const routeChanged = previousActiveSessionId.current !== activeSessionId;
+    previousActiveSessionId.current = activeSessionId;
+    setFocusedSessionId((current) => {
+      if (!routeChanged && current && flat.some((session) => session.id === current)) {
+        return current;
+      }
+      if (activeSessionId && flat.some((session) => session.id === activeSessionId)) {
+        return activeSessionId;
+      }
+      return flat[0]?.id ?? null;
+    });
   }, [activeSessionId, flat]);
 
   const onKeyDown = useCallback(
@@ -130,21 +372,30 @@ export function SessionList() {
       if (flat.length === 0) {
         return;
       }
+      const target = event.target as HTMLElement | null;
+      if (!target?.hasAttribute("data-session-focus")) {
+        return;
+      }
+      let nextIndex: number | null = null;
       if (event.key === "ArrowDown") {
         event.preventDefault();
-        setFocusIndex((current) => Math.min(flat.length - 1, current + 1));
+        nextIndex = Math.min(flat.length - 1, focusIndex + 1);
       } else if (event.key === "ArrowUp") {
         event.preventDefault();
-        setFocusIndex((current) => Math.max(0, current <= 0 ? 0 : current - 1));
-      } else if (event.key === "Enter" && focusIndex >= 0 && focusIndex < flat.length) {
+        nextIndex = Math.max(0, focusIndex - 1);
+      } else if (event.key === "Home") {
         event.preventDefault();
-        const session = flat[focusIndex];
-        if (session) {
-          rail.openSession(session.id);
-        }
+        nextIndex = 0;
+      } else if (event.key === "End") {
+        event.preventDefault();
+        nextIndex = flat.length - 1;
+      }
+      const next = nextIndex === null ? null : flat[nextIndex];
+      if (next) {
+        setFocusedSessionId(next.id);
       }
     },
-    [flat, focusIndex, rail],
+    [flat, focusIndex],
   );
 
   // Scroll the keyboard-focused row into view.
@@ -152,14 +403,28 @@ export function SessionList() {
     if (focusIndex < 0 || !listRef.current) {
       return;
     }
-    const row = listRef.current.querySelector<HTMLElement>(`[data-session-index="${focusIndex}"]`);
+    const row = listRef.current.querySelector<HTMLElement>(
+      `[data-session-index="${focusIndex}"][data-session-focus]`,
+    );
     row?.scrollIntoView({ block: "nearest" });
+    // Arrow/Home/End navigation must move real DOM focus, not just paint a
+    // visual highlight. Do not steal focus when a route/poll changes while the
+    // user is typing elsewhere.
+    if (listRef.current.contains(document.activeElement) && row !== document.activeElement) {
+      row?.focus();
+    }
   }, [focusIndex]);
+
+  useEffect(() => {
+    if (loading || !search) return;
+    const count = pinnedSessions.length + ordinarySessions.length;
+    setAnnouncement(`${count} matching session${count === 1 ? "" : "s"}.`);
+  }, [loading, ordinarySessions.length, pinnedSessions.length, search]);
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <div className="flex min-w-0 items-center justify-between gap-2 px-3 pb-1 pt-1">
-        <span className="text-2xs font-semibold uppercase tracking-wider text-fg-subtle">
+        <span className="text-2xs font-semibold uppercase tracking-wider text-fg-muted">
           Sessions
         </span>
         <Tooltip>
@@ -170,7 +435,7 @@ export function SessionList() {
               size="icon-xs"
               aria-label="New session"
               onClick={rail.startNewSession}
-              className="text-fg-muted hover:text-fg"
+              className="text-fg-muted hover:text-fg pointer-coarse:size-11"
             >
               <PlusIcon className="size-3.5" />
             </Button>
@@ -179,18 +444,44 @@ export function SessionList() {
         </Tooltip>
       </div>
 
+      <label className="relative mx-2 mb-1 block shrink-0">
+        <span className="sr-only">Search sessions</span>
+        <SearchIcon
+          aria-hidden="true"
+          className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-fg-subtle"
+        />
+        <input
+          type="search"
+          value={searchDraft}
+          onChange={(event) => setSearchDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Escape" && searchDraft) {
+              event.preventDefault();
+              setSearchDraft("");
+            }
+          }}
+          maxLength={200}
+          placeholder="Search"
+          aria-label="Search sessions"
+          className="h-7 w-full min-w-0 rounded-md border border-border bg-bg/45 pl-7 pr-2 text-xs text-fg outline-none placeholder:text-fg-subtle hover:border-border-strong focus-visible:border-ring focus-visible:ring-1 focus-visible:ring-ring/40 pointer-coarse:h-11 pointer-coarse:text-base"
+        />
+      </label>
+
       <div
         ref={listRef}
-        role="list"
+        role="region"
         aria-label="Sessions"
-        tabIndex={0}
+        data-ope26-session-list
         onKeyDown={onKeyDown}
-        className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto px-2 pb-2 outline-none focus-visible:ring-1 focus-visible:ring-ring/40"
+        className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto px-2 pb-2"
       >
-        {loading && sessions.length === 0 ? (
+        <p className="sr-only" aria-live="polite" aria-atomic="true">
+          {announcement}
+        </p>
+        {loading && allSessions.length === 0 ? (
           <SessionListSkeleton />
-        ) : error && sessions.length === 0 ? (
-          <div className="px-2 py-3 text-xs text-fg-subtle">
+        ) : error && allSessions.length === 0 ? (
+          <div role="alert" className="px-2 py-3 text-xs text-fg-subtle">
             Session history is unavailable.{" "}
             <button
               type="button"
@@ -200,10 +491,36 @@ export function SessionList() {
               Retry
             </button>
           </div>
+        ) : flat.length === 0 && search ? (
+          <div className="px-2 py-4 text-center text-xs text-fg-subtle">
+            <p>No matching sessions.</p>
+            <button
+              type="button"
+              className="mt-2 min-h-8 rounded px-2 underline hover:text-fg pointer-coarse:min-h-11"
+              onClick={() => setSearchDraft("")}
+            >
+              Clear search
+            </button>
+          </div>
         ) : flat.length === 0 ? (
           <EmptySessions onStart={rail.startNewSession} />
         ) : (
           <>
+            {pinnedNodes.length > 0 ? (
+              <SessionGroup
+                label="Pinned"
+                nodes={pinnedNodes}
+                flat={flat}
+                activeSessionId={activeSessionId}
+                focusIndex={focusIndex}
+                onFocusSession={setFocusedSessionId}
+                expanded={expanded}
+                onToggleExpand={toggleExpand}
+                onSelect={rail.openSession}
+                onRename={context.updateSessionTitle}
+                onPin={onPin}
+              />
+            ) : null}
             {forest.running.length > 0 ? (
               <SessionGroup
                 label="Running"
@@ -211,10 +528,12 @@ export function SessionList() {
                 flat={flat}
                 activeSessionId={activeSessionId}
                 focusIndex={focusIndex}
+                onFocusSession={setFocusedSessionId}
                 expanded={expanded}
                 onToggleExpand={toggleExpand}
                 onSelect={rail.openSession}
                 onRename={context.updateSessionTitle}
+                onPin={onPin}
               />
             ) : null}
             {forest.grouped.map((bucket) => (
@@ -225,12 +544,35 @@ export function SessionList() {
                 flat={flat}
                 activeSessionId={activeSessionId}
                 focusIndex={focusIndex}
+                onFocusSession={setFocusedSessionId}
                 expanded={expanded}
                 onToggleExpand={toggleExpand}
                 onSelect={rail.openSession}
                 onRename={context.updateSessionTitle}
+                onPin={onPin}
               />
             ))}
+            {continuationCursor ? (
+              <div className="px-2 py-2 text-center">
+                <button
+                  type="button"
+                  disabled={loadingMore}
+                  onClick={() => void loadMore()}
+                  className="min-h-8 rounded-md px-2 text-xs font-medium text-fg-subtle hover:bg-surface-2 hover:text-fg disabled:opacity-60 pointer-coarse:min-h-11"
+                >
+                  {loadingMore
+                    ? "Loading…"
+                    : loadMoreError
+                      ? "Retry older sessions"
+                      : "Load older sessions"}
+                </button>
+                {loadMoreError ? (
+                  <p role="status" className="mt-1 text-2xs text-status-failed">
+                    Older sessions didn&apos;t load.
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
           </>
         )}
       </div>
@@ -244,17 +586,26 @@ function SessionGroup(props: {
   flat: Session[];
   activeSessionId: string | null;
   focusIndex: number;
+  onFocusSession: (sessionId: string) => void;
   expanded: ReadonlySet<string>;
   onToggleExpand: (sessionId: string) => void;
   onSelect: (sessionId: string) => void;
   onRename: RenameFn;
+  onPin: PinFn;
 }) {
   return (
-    <div className="mb-1.5 min-w-0">
-      <p className="px-2 pb-0.5 pt-2 text-2xs font-medium uppercase tracking-wider text-fg-subtle">
+    <div role="group" aria-label={props.label} className="mb-1.5 min-w-0">
+      <p
+        id={`session-group-${props.label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`}
+        className="px-2 pb-0.5 pt-2 text-2xs font-medium uppercase tracking-wider text-fg-muted"
+      >
         {props.label}
       </p>
-      <div className="grid min-w-0 grid-cols-1 gap-px">
+      <div
+        role="list"
+        aria-label={`${props.label} sessions`}
+        className="grid min-w-0 grid-cols-1 gap-px"
+      >
         {props.nodes.map((node) => (
           <SessionTreeRow
             key={node.session.id}
@@ -263,10 +614,12 @@ function SessionGroup(props: {
             flat={props.flat}
             activeSessionId={props.activeSessionId}
             focusIndex={props.focusIndex}
+            onFocusSession={props.onFocusSession}
             expanded={props.expanded}
             onToggleExpand={props.onToggleExpand}
             onSelect={props.onSelect}
             onRename={props.onRename}
+            onPin={props.onPin}
           />
         ))}
       </div>
@@ -289,10 +642,12 @@ function SessionTreeRow(props: {
   flat: Session[];
   activeSessionId: string | null;
   focusIndex: number;
+  onFocusSession: (sessionId: string) => void;
   expanded: ReadonlySet<string>;
   onToggleExpand: (sessionId: string) => void;
   onSelect: (sessionId: string) => void;
   onRename: RenameFn;
+  onPin: PinFn;
 }) {
   const { node } = props;
   const index = props.flat.indexOf(node.session);
@@ -316,8 +671,10 @@ function SessionTreeRow(props: {
         onToggleExpand={() => props.onToggleExpand(node.session.id)}
         active={node.session.id === props.activeSessionId || representsHiddenActive}
         focused={index >= 0 && index === props.focusIndex}
+        onFocus={() => props.onFocusSession(node.session.id)}
         onSelect={props.onSelect}
         onRename={props.onRename}
+        onPin={props.onPin}
       />
       {childCount > 0 && isExpanded
         ? node.children.map((child) => (
@@ -328,10 +685,12 @@ function SessionTreeRow(props: {
               flat={props.flat}
               activeSessionId={props.activeSessionId}
               focusIndex={props.focusIndex}
+              onFocusSession={props.onFocusSession}
               expanded={props.expanded}
               onToggleExpand={props.onToggleExpand}
               onSelect={props.onSelect}
               onRename={props.onRename}
+              onPin={props.onPin}
             />
           ))
         : null}
@@ -352,8 +711,10 @@ function SessionRow(props: {
   onToggleExpand: () => void;
   active: boolean;
   focused: boolean;
+  onFocus: () => void;
   onSelect: (sessionId: string) => void;
   onRename: RenameFn;
+  onPin: PinFn;
 }) {
   const title =
     props.session.title?.trim() || props.session.initialMessage?.trim() || "Untitled session";
@@ -366,7 +727,7 @@ function SessionRow(props: {
   const indentStyle = props.depth > 0 ? { paddingLeft: props.depth * 14 } : undefined;
 
   const rowClassName = cn(
-    "group relative flex h-8 w-full items-center gap-1.5 rounded-md py-1 pl-2.5 pr-1.5 text-left text-sm transition-colors pointer-coarse:h-10",
+    "group relative flex h-8 w-full items-center gap-1.5 rounded-md py-1 pl-2.5 pr-1.5 text-left text-sm transition-colors pointer-coarse:h-11 pointer-coarse:py-0",
     "hover:bg-surface-2",
     props.active ? "bg-surface-3 font-medium text-fg" : "text-fg-muted",
     props.focused && !props.active ? "bg-surface-2/60" : "",
@@ -383,7 +744,7 @@ function SessionRow(props: {
             event.stopPropagation();
             props.onToggleExpand();
           }}
-          className="inline-flex size-4 items-center justify-center rounded text-fg-subtle outline-none hover:text-fg focus-visible:ring-1 focus-visible:ring-ring"
+          className="inline-flex size-4 items-center justify-center rounded text-fg-subtle outline-none hover:text-fg focus-visible:ring-1 focus-visible:ring-ring pointer-coarse:size-11"
         >
           <ChevronRightIcon
             className={cn("size-3 transition-transform", props.expanded && "rotate-90")}
@@ -399,12 +760,16 @@ function SessionRow(props: {
   // listitem so the surrounding list semantics and the active accent bar hold.
   if (rename.editing) {
     return (
-      <div role="listitem" data-session-index={props.index} className={rowClassName}>
+      <div role="listitem" className={rowClassName}>
         <ActiveAccent active={props.active} />
         {lead}
         <RailStatusDot status={props.session.status} />
         <input
           ref={rename.inputRef}
+          data-session-index={props.index}
+          data-session-focus
+          tabIndex={props.focused ? 0 : -1}
+          onFocus={props.onFocus}
           value={rename.draft}
           onChange={(event) => rename.setDraft(event.target.value)}
           onBlur={() => void rename.commit()}
@@ -431,52 +796,65 @@ function SessionRow(props: {
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
-        <div
-          role="listitem"
-          data-session-index={props.index}
-          onClick={() => props.onSelect(props.session.id)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              props.onSelect(props.session.id);
-            }
-          }}
-          tabIndex={-1}
-          title={title}
-          className={cn(rowClassName, "cursor-pointer")}
-        >
+        <div role="listitem" title={title} className={rowClassName}>
           <ActiveAccent active={props.active} />
           {lead}
-          <RailStatusDot status={props.session.status} />
-          {/* min-w-0 + truncate: the title must always ellipsis, never butt the
-              rail border. */}
-          <span className="min-w-0 flex-1 truncate pr-1">{title}</span>
-          {/* A collapsed parent with a live child shows a quiet pulsing dot so
-              the activity isn't hidden with the subtree; the count badge sits
-              beside it. Both stay visible on hover (the time yields instead). */}
-          {hasChildren ? (
-            <span className="flex shrink-0 items-center gap-1 text-2xs tabular-nums text-fg-subtle">
-              {!props.expanded && props.hasActiveDescendant ? (
-                <span className="relative inline-flex size-1.5 rounded-full bg-status-running">
-                  <span className="absolute inset-0 animate-og-pulse rounded-full bg-status-running" />
-                </span>
-              ) : null}
-              {props.childCount}
+          <button
+            type="button"
+            data-session-index={props.index}
+            data-session-focus
+            tabIndex={props.focused ? 0 : -1}
+            aria-current={props.active ? "page" : undefined}
+            aria-label={`Open ${title}. ${props.session.status}${
+              props.session.pinned ? ". Pinned" : ""
+            }${hasChildren ? `. ${props.childCount} spawned sessions` : ""}`}
+            onFocus={props.onFocus}
+            onClick={() => props.onSelect(props.session.id)}
+            className="flex h-full min-w-0 flex-1 items-center gap-1.5 rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:ring-offset-1 focus-visible:ring-offset-surface"
+          >
+            <RailStatusDot status={props.session.status} />
+            <span className="sr-only">{props.session.status}. </span>
+            {/* min-w-0 + truncate: the title must always ellipsis, never butt the
+                rail border. */}
+            <span className="min-w-0 flex-1 truncate pr-1">{title}</span>
+            {/* A collapsed parent with a live child shows a quiet pulsing dot so
+                the activity isn't hidden with the subtree; the count badge sits
+                beside it. Both stay visible on hover (the time yields instead). */}
+            {hasChildren ? (
+              <span className="flex shrink-0 items-center gap-1 text-2xs tabular-nums text-fg-muted">
+                {!props.expanded && props.hasActiveDescendant ? (
+                  <span className="relative inline-flex size-1.5 rounded-full bg-status-running">
+                    <span className="absolute inset-0 animate-og-pulse rounded-full bg-status-running" />
+                  </span>
+                ) : null}
+                <span aria-label={`${props.childCount} spawned sessions`}>{props.childCount}</span>
+              </span>
+            ) : null}
+            {/* Relative time is visible at rest (the list is grouped by recency),
+                and steps aside on hover/focus so the rename overflow can slot in.
+                On coarse pointers there is no hover, so the time stays visible. */}
+            <span className="shrink-0 text-2xs tabular-nums text-fg-muted transition-opacity group-hover:opacity-0 group-focus-within:opacity-0 pointer-coarse:group-hover:opacity-100">
+              {relativeTimeLabel(props.session.updatedAt)}
             </span>
-          ) : null}
-          {/* Relative time is visible at rest (the list is grouped by recency),
-              and steps aside on hover/focus so the rename overflow can slot in.
-              On coarse pointers there is no hover, so the time stays visible. */}
-          <span className="shrink-0 text-2xs tabular-nums text-fg-subtle transition-opacity group-hover:opacity-0 group-focus-within:opacity-0 pointer-coarse:group-hover:opacity-100">
-            {relativeTimeLabel(props.session.updatedAt)}
-          </span>
-          <RowRenameMenu onRename={rename.startEditing} />
+          </button>
+          <RowActionsMenu
+            session={props.session}
+            onRename={rename.startEditing}
+            onPin={props.onPin}
+          />
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent className="min-w-40">
-        <ContextMenuItem onSelect={rename.startEditing}>
+        <ContextMenuItem className="pointer-coarse:min-h-11" onSelect={rename.startEditing}>
           <PencilIcon className="size-4" />
           Rename
+        </ContextMenuItem>
+        <ContextMenuItem
+          className="pointer-coarse:min-h-11"
+          onSelect={() => void props.onPin(props.session, !props.session.pinned)}
+        >
+          <PinIcon className={props.session.pinned ? "size-4 fill-current" : "size-4"} />
+          {props.session.pinned ? "Unpin" : "Pin"}
         </ContextMenuItem>
       </ContextMenuContent>
     </ContextMenu>
@@ -501,7 +879,15 @@ function ActiveAccent({ active }: { active: boolean }) {
  * minimal menu whose primary action is Rename. The button stops click
  * propagation so opening the menu never opens the session.
  */
-function RowRenameMenu({ onRename }: { onRename: () => void }) {
+function RowActionsMenu({
+  session,
+  onRename,
+  onPin,
+}: {
+  session: Session;
+  onRename: () => void;
+  onPin: PinFn;
+}) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -509,9 +895,11 @@ function RowRenameMenu({ onRename }: { onRename: () => void }) {
           type="button"
           variant="ghost"
           size="icon-xs"
-          aria-label="Session actions"
+          aria-label={`Actions for ${
+            session.title?.trim() || session.initialMessage?.trim() || "Untitled session"
+          }`}
           onClick={(event) => event.stopPropagation()}
-          className="shrink-0 text-fg-subtle opacity-0 transition-opacity hover:text-fg focus-visible:opacity-100 group-hover:opacity-100 data-[state=open]:opacity-100"
+          className="shrink-0 text-fg-subtle opacity-0 transition-opacity hover:text-fg focus-visible:opacity-100 group-hover:opacity-100 data-[state=open]:opacity-100 pointer-coarse:size-11 pointer-coarse:opacity-100"
         >
           <EllipsisIcon className="size-3.5" />
         </Button>
@@ -522,6 +910,7 @@ function RowRenameMenu({ onRename }: { onRename: () => void }) {
         onClick={(event) => event.stopPropagation()}
       >
         <DropdownMenuItem
+          className="pointer-coarse:min-h-11"
           onSelect={onRename}
           // The menu item lives inside the row; stop the synthetic click from
           // bubbling to the row's onSelect (open-session).
@@ -529,6 +918,14 @@ function RowRenameMenu({ onRename }: { onRename: () => void }) {
         >
           <PencilIcon className="size-4" />
           Rename
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          className="pointer-coarse:min-h-11"
+          onSelect={() => void onPin(session, !session.pinned)}
+          onClick={(event) => event.stopPropagation()}
+        >
+          <PinIcon className={session.pinned ? "size-4 fill-current" : "size-4"} />
+          {session.pinned ? "Unpin" : "Pin"}
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
@@ -578,7 +975,10 @@ function EmptySessions({ onStart }: { onStart: () => void }) {
  */
 export function CollapsedSessionsButton() {
   const rail = useRail();
-  const { sessions, loading, error } = useWorkspaceSessions({ limit: 50, pollIntervalMs: 15_000 });
+  const { sessions, loading, error } = useWorkspaceSessions({
+    limit: 50,
+    pollIntervalMs: 15_000,
+  });
   const runningCount = useMemo(() => groupSessionsForRail(sessions).running.length, [sessions]);
   // The collapsed rail can't render the expanded list's loading/error copy, so
   // it mirrors those states: a failed load shows a failed-tone marker + tooltip

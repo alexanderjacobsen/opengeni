@@ -2,7 +2,7 @@
 // token / managed session), workspace access, and the cross-route console
 // state (model choice, repo selection, tool toggles). Everything below the
 // workspace shell consumes this through `useAppContext`.
-import type { OpenGeniClient } from "@opengeni/sdk";
+import { OpenGeniApiError, type OpenGeniClient } from "@opengeni/sdk";
 import type { SessionEventsConnectionState } from "@opengeni/react";
 import { Outlet, useNavigate, useRouterState } from "@tanstack/react-router";
 import { TanStackRouterDevtools } from "@tanstack/react-router-devtools";
@@ -37,6 +37,11 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { sameSessionForContext } from "@/lib/session-context";
+import {
+  applySessionPinProjection,
+  notifySessionPinChanged,
+  reconcileFailedSessionPin,
+} from "@/lib/session-pins";
 import {
   buildResources,
   buildTools,
@@ -133,6 +138,13 @@ export type AppContextValue = {
     workspaceId: string,
     sessionId: string,
     title: string,
+  ) => Promise<Session | null>;
+  /** Optimistically set the current member's personal session pin. */
+  updateSessionPin: (
+    workspaceId: string,
+    sessionId: string,
+    pinned: boolean,
+    expectedVersion?: number,
   ) => Promise<Session | null>;
   deleteWorkspace: (workspaceId: string) => Promise<boolean>;
   refreshGitHub: (
@@ -481,6 +493,80 @@ export function RootRouteComponent() {
     }
   }
 
+  // Personal session pinning never changes shared session activity. Keep the
+  // header immediate on this device, use its known revision when available, and
+  // restore the authoritative prior state if the request (including a stale-tab
+  // 409) fails. The rail owns its own corresponding optimistic list projection.
+  async function updateSessionPin(
+    workspaceId: string,
+    sessionId: string,
+    pinned: boolean,
+    expectedVersion?: number,
+  ): Promise<Session | null> {
+    const before = session;
+    const optimisticVersion = (expectedVersion ?? before?.pinVersion ?? 0) + 1;
+    const optimistic: Session | null =
+      before && before.id === sessionId
+        ? {
+            ...before,
+            pinned,
+            pinnedAt: pinned ? new Date().toISOString() : null,
+            pinVersion: optimisticVersion,
+          }
+        : null;
+    if (optimistic) {
+      setSession(optimistic);
+    }
+    try {
+      const updated = await client.updateSessionPin(workspaceId, sessionId, {
+        pinned,
+        ...(expectedVersion !== undefined ? { expectedVersion } : {}),
+      });
+      // The mutation can race a newer page poll/other-device write, and its
+      // full Session projection can lag lifecycle/SSE fields. Merge only the
+      // monotonic personal pin fields rather than replacing the open session.
+      setSession((current) => applySessionPinProjection(current, updated));
+      notifySessionPinChanged(workspaceId, sessionId);
+      return updated;
+    } catch (error) {
+      // Re-read on every failure, not only OCC conflicts. A transport failure
+      // may have happened after the server committed; blindly restoring
+      // `before` would temporarily lie and could overwrite a newer device.
+      const authoritative = await client.getSession(workspaceId, sessionId).catch(() => null);
+      if (authoritative) {
+        setSession((current) => reconcileFailedSessionPin(current, optimistic, authoritative));
+        notifySessionPinChanged(workspaceId, sessionId);
+        // A lost response after commit is a successful desired-state mutation,
+        // not a failed pin. Returning the point-read result keeps the UI
+        // announcement honest while preserving the same idempotent retry path.
+        if (Boolean(authoritative.pinned) === pinned) {
+          return authoritative;
+        }
+      } else if (optimistic) {
+        // If reconciliation is also unavailable (for example while offline),
+        // roll back only the exact optimistic projection this call installed.
+        // Any intervening poll/device response remains untouched.
+        setSession((current) =>
+          current?.id === sessionId &&
+          Boolean(current.pinned) === Boolean(optimistic.pinned) &&
+          (current.pinnedAt ?? null) === (optimistic.pinnedAt ?? null) &&
+          (current.pinVersion ?? 0) === (optimistic.pinVersion ?? 0)
+            ? before
+            : current,
+        );
+      }
+      toast.error(
+        error instanceof OpenGeniApiError && error.status === 409
+          ? "Session pin changed elsewhere"
+          : `Couldn't ${pinned ? "pin" : "unpin"} session`,
+        {
+          description: error instanceof Error ? error.message : String(error),
+        },
+      );
+      return null;
+    }
+  }
+
   // Delete drops the workspace from the cached list and refreshes grants (the
   // owner grant for the deleted workspace is gone). The caller navigates away.
   async function deleteWorkspace(workspaceId: string): Promise<boolean> {
@@ -799,6 +885,7 @@ export function RootRouteComponent() {
           updateWorkspaceSettings,
           setWorkspaceDefaultRig,
           updateSessionTitle,
+          updateSessionPin,
           deleteWorkspace,
           refreshGitHub,
           refreshWorkspaceMcpServers,

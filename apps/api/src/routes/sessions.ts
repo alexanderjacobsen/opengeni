@@ -20,6 +20,7 @@ import {
   PtyWriteRequest,
   ReorderSessionTurnsRequest,
   TerminalExecRequest,
+  UpdateSessionPinRequest,
   UpdateSessionGoalRequest,
   UpdateSessionRequest,
   UpdateSessionTurnRequest,
@@ -39,12 +40,13 @@ import {
   getOpenPtySession,
   getSandbox,
   getSession,
+  getSessionForSubject,
   getSessionGoal,
   getStreamAcknowledgment,
   insertPtySession,
   listSessionEvents,
   listSessionIdsInGroup,
-  listSessions,
+  listSessionsForSubject,
   listSessionTurns,
   recordStreamAcknowledgment,
   reorderQueuedSessionTurns,
@@ -52,6 +54,12 @@ import {
   requireSession,
   setSessionCodexPin,
   withCodexCapacityMutation,
+  setSessionPin,
+  SessionPinVersionConflictError,
+  SessionPinAccessError,
+  SessionListAccessError,
+  SessionListCursorError,
+  decodeSessionListCursor,
   revokeViewer,
   setSessionGoalStatus,
   updatePtySessionActivity,
@@ -115,38 +123,89 @@ export function registerSessionRoutes(app: Hono, deps: ApiRouteDeps): void {
 
   app.get("/v1/workspaces/:workspaceId/sessions", async (c) => {
     const workspaceId = c.req.param("workspaceId");
-    await requireAccessGrant(c, deps, workspaceId, "sessions:read");
-    const parentSessionId = c.req.query("parentSessionId");
-    // "null" = roots only; a uuid = children of that session; anything else is
-    // a client error (an unvalidated value would surface as a Postgres uuid
-    // cast failure -> 500).
-    if (
-      parentSessionId !== undefined &&
-      parentSessionId !== "null" &&
-      !z.string().uuid().safeParse(parentSessionId).success
-    ) {
-      throw new HTTPException(400, {
-        message: 'parentSessionId must be a session id or the literal "null"',
+    const grant = await requireAccessGrant(c, deps, workspaceId, "sessions:read");
+    const pageView = c.req.query("view") === "page";
+    const query = sessionListQuery(c.req.query(), pageView);
+    let page: Awaited<ReturnType<typeof listSessionsForSubject>>;
+    try {
+      page = await listSessionsForSubject(db, workspaceId, {
+        subjectId: grant.subjectId,
+        limit: boundedLimit(query.limit),
+        ...(query.cursor ? { cursor: query.cursor } : {}),
+        ...(query.search ? { search: query.search } : {}),
+        ...(query.parentSessionId !== undefined ? { parentSessionId: query.parentSessionId } : {}),
       });
+    } catch (error) {
+      if (error instanceof SessionListAccessError) {
+        throw new HTTPException(403, { message: error.message });
+      }
+      if (error instanceof SessionListCursorError) {
+        throw new HTTPException(400, { message: error.message });
+      }
+      throw error;
     }
-    return c.json(
-      await listSessions(db, workspaceId, {
-        limit: boundedLimit(c.req.query("limit")),
-        ...(parentSessionId !== undefined
-          ? { parentSessionId: parentSessionId === "null" ? null : parentSessionId }
-          : {}),
-      }),
-    );
+    if (pageView) {
+      return c.json(page);
+    }
+    // Same-major compatibility: listSessions() has historically returned an
+    // array. Preserve that wire shape while adding personal pin metadata/order;
+    // cursor consumers opt into the additive page view. A query flag rather
+    // than a /sessions/page path is deliberate: an older API safely ignores it
+    // and returns its historical array instead of treating "page" as a UUID.
+    return c.json([...page.pinned, ...page.sessions]);
   });
 
   app.get("/v1/workspaces/:workspaceId/sessions/:sessionId", async (c) => {
     const workspaceId = c.req.param("workspaceId");
-    await requireAccessGrant(c, deps, workspaceId, "sessions:read");
-    const session = await getSession(db, workspaceId, c.req.param("sessionId"));
+    const grant = await requireAccessGrant(c, deps, workspaceId, "sessions:read");
+    const sessionId = c.req.param("sessionId");
+    if (!z.string().uuid().safeParse(sessionId).success) {
+      throw new HTTPException(404, { message: "session not found" });
+    }
+    const session = await getSessionForSubject(db, workspaceId, sessionId, grant.subjectId);
     if (!session) {
       throw new HTTPException(404, { message: "session not found" });
     }
     return c.json(session);
+  });
+
+  // Personal pin only: this is organization state for the authenticated member,
+  // not a mutation of the shared session. It deliberately requires read access
+  // (not session control) and returns 404 for a foreign/inaccessible session.
+  app.put("/v1/workspaces/:workspaceId/sessions/:sessionId/pin", async (c) => {
+    const workspaceId = c.req.param("workspaceId");
+    const grant = await requireAccessGrant(c, deps, workspaceId, "sessions:read");
+    const sessionId = c.req.param("sessionId");
+    if (!z.string().uuid().safeParse(sessionId).success) {
+      throw new HTTPException(404, { message: "session not found" });
+    }
+    const parsed = UpdateSessionPinRequest.safeParse(await c.req.json().catch(() => null));
+    if (!parsed.success) {
+      throw new HTTPException(400, { message: "invalid session pin request" });
+    }
+    try {
+      const session = await setSessionPin(db, {
+        workspaceId,
+        subjectId: grant.subjectId,
+        sessionId,
+        ...parsed.data,
+      });
+      if (!session) {
+        throw new HTTPException(404, { message: "session not found" });
+      }
+      return c.json(session);
+    } catch (error) {
+      if (error instanceof SessionPinAccessError) {
+        throw new HTTPException(403, { message: error.message });
+      }
+      if (error instanceof SessionPinVersionConflictError) {
+        return c.json(
+          { message: "session pin changed in another client", current: error.current },
+          409,
+        );
+      }
+      throw error;
+    }
   });
 
   app.get("/v1/workspaces/:workspaceId/sessions/:sessionId/lineage", async (c) => {
@@ -208,12 +267,15 @@ export function registerSessionRoutes(app: Hono, deps: ApiRouteDeps): void {
   // agent writes. Returns the refreshed session, mirroring GET detail.
   app.patch("/v1/workspaces/:workspaceId/sessions/:sessionId", async (c) => {
     const workspaceId = c.req.param("workspaceId");
-    await requireAccessGrant(c, deps, workspaceId, "sessions:control");
+    const grant = await requireAccessGrant(c, deps, workspaceId, "sessions:control");
     const sessionId = c.req.param("sessionId");
     await assertSessionExists(db, workspaceId, sessionId);
     const payload = UpdateSessionRequest.parse(await c.req.json());
     await updateSessionTitle({ db, bus }, workspaceId, sessionId, payload.title, "user");
-    const session = await getSession(db, workspaceId, sessionId);
+    // A session-returning member route must preserve the caller's private pin
+    // projection. Returning the generic mapSession() default here would reset a
+    // pinned React consumer to false/version 0 after a harmless rename.
+    const session = await getSessionForSubject(db, workspaceId, sessionId, grant.subjectId);
     if (!session) {
       throw new HTTPException(404, { message: "session not found" });
     }
@@ -1440,6 +1502,50 @@ function eventListLimit(raw: string | undefined, max = 2000): number {
     return 500;
   }
   return Math.min(max, Math.max(1, Math.floor(limit)));
+}
+
+function sessionListQuery(
+  query: Record<string, string>,
+  allowCursor = true,
+): {
+  limit: string | undefined;
+  parentSessionId: string | null | undefined;
+  cursor: ReturnType<typeof decodeSessionListCursor> | undefined;
+  search: string | undefined;
+} {
+  const parentSessionId = query.parentSessionId;
+  // "null" = roots only; a uuid = children of that session; anything else is
+  // a client error (an unvalidated value would surface as a Postgres uuid cast
+  // failure -> 500 rather than an honest 400).
+  if (
+    parentSessionId !== undefined &&
+    parentSessionId !== "null" &&
+    !z.string().uuid().safeParse(parentSessionId).success
+  ) {
+    throw new HTTPException(400, {
+      message: 'parentSessionId must be a session id or the literal "null"',
+    });
+  }
+  const rawCursor = allowCursor ? query.cursor : undefined;
+  const cursor = rawCursor ? decodeSessionListCursor(rawCursor) : undefined;
+  if (rawCursor && !cursor) {
+    throw new HTTPException(400, { message: "cursor is invalid" });
+  }
+  const search = query.search?.trim();
+  if (search && search.length > 200) {
+    throw new HTTPException(400, { message: "search must be at most 200 characters" });
+  }
+  return {
+    limit: query.limit,
+    parentSessionId:
+      parentSessionId === undefined
+        ? undefined
+        : parentSessionId === "null"
+          ? null
+          : parentSessionId,
+    cursor,
+    search: search || undefined,
+  };
 }
 
 function compactEvents(raw: string | undefined): boolean {

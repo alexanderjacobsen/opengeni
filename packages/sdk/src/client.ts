@@ -82,6 +82,8 @@ import type {
   ScheduledTask,
   ScheduledTaskRun,
   Session,
+  SessionListResponse,
+  UpdateSessionPinRequest,
   SessionEvent,
   SessionGoal,
   SessionLineageResponse,
@@ -239,7 +241,11 @@ export class OpenGeniClient {
 
   async listSessions(
     workspaceId: string,
-    options: { limit?: number; parentSessionId?: string | null } = {},
+    options: {
+      limit?: number;
+      parentSessionId?: string | null;
+      search?: string;
+    } = {},
   ): Promise<Session[]> {
     return await this.requestJson<Session[]>(
       "GET",
@@ -247,6 +253,7 @@ export class OpenGeniClient {
       undefined,
       {
         ...(options.limit !== undefined ? { limit: String(options.limit) } : {}),
+        ...(options.search?.trim() ? { search: options.search.trim() } : {}),
         ...(Object.prototype.hasOwnProperty.call(options, "parentSessionId") &&
         options.parentSessionId !== undefined
           ? {
@@ -255,6 +262,66 @@ export class OpenGeniClient {
             }
           : {}),
       },
+    );
+  }
+
+  /** Pin-aware ordinary-session page with a stable keyset cursor. */
+  async listSessionPage(
+    workspaceId: string,
+    options: {
+      limit?: number;
+      parentSessionId?: string | null;
+      cursor?: string;
+      search?: string;
+    } = {},
+  ): Promise<SessionListResponse> {
+    const response = await this.requestJson<SessionListResponse | Session[]>(
+      "GET",
+      `/v1/workspaces/${workspaceId}/sessions`,
+      undefined,
+      {
+        view: "page",
+        ...(options.limit !== undefined ? { limit: String(options.limit) } : {}),
+        ...(options.cursor !== undefined ? { cursor: options.cursor } : {}),
+        ...(options.search?.trim() ? { search: options.search.trim() } : {}),
+        ...(Object.prototype.hasOwnProperty.call(options, "parentSessionId") &&
+        options.parentSessionId !== undefined
+          ? {
+              parentSessionId:
+                options.parentSessionId === null ? "null" : String(options.parentSessionId),
+            }
+          : {}),
+      },
+    );
+    if (Array.isArray(response)) {
+      // Rolling/same-major compatibility: an older API ignores `view=page` and
+      // returns the historical array. That is an honest one-page projection;
+      // never pretend it honored a cursor supplied directly by a caller.
+      if (options.cursor) {
+        throw new Error("The connected OpenGeni API does not support stable session-page cursors");
+      }
+      // Older APIs ignore unknown query parameters. Treating their unfiltered
+      // array as a successful search would be worse than an explicit rolling-
+      // upgrade error (and client-side filtering cannot recover matches beyond
+      // the old endpoint's bounded first page).
+      if (options.search?.trim()) {
+        throw new Error("The connected OpenGeni API does not support session search");
+      }
+      return { pinned: [], sessions: response, nextCursor: null };
+    }
+    return response;
+  }
+
+  /** Set this authenticated member's personal workspace pin for a session. */
+  async updateSessionPin(
+    workspaceId: string,
+    sessionId: string,
+    request: UpdateSessionPinRequest,
+  ): Promise<Session> {
+    return await this.requestJson<Session>(
+      "PUT",
+      `/v1/workspaces/${workspaceId}/sessions/${sessionId}/pin`,
+      request,
     );
   }
 

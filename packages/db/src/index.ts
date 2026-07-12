@@ -37,6 +37,7 @@ import type {
   ScheduledTaskStatus,
   ScheduledTaskTriggerType,
   Session,
+  SessionListResponse,
   SessionEvent,
   SessionEventType,
   SessionGoal,
@@ -87,6 +88,7 @@ import {
   gte,
   inArray,
   isNotNull,
+  ilike,
   isNull,
   lt,
   ne,
@@ -94,7 +96,7 @@ import {
   sql,
   type SQL,
 } from "drizzle-orm";
-import type { PgDatabase } from "drizzle-orm/pg-core";
+import type { PgDatabase, PgTransactionConfig } from "drizzle-orm/pg-core";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import { decryptEnvironmentValue } from "./environment-crypto";
@@ -333,6 +335,7 @@ export async function withRlsContext<T>(
   db: Database,
   context: RlsContext,
   fn: (db: Database) => Promise<T>,
+  transactionConfig?: PgTransactionConfig,
 ): Promise<T> {
   return await db.transaction(async (tx) => {
     const scoped = tx as unknown as Database;
@@ -356,7 +359,7 @@ export async function withRlsContext<T>(
       );
     }
     return await fn(scoped);
-  });
+  }, transactionConfig);
 }
 
 export async function rlsContextForWorkspace(
@@ -380,6 +383,39 @@ export async function withWorkspaceRls<T>(
   fn: (db: Database) => Promise<T>,
 ): Promise<T> {
   return await withRlsContext(db, await rlsContextForWorkspace(db, workspaceId), fn);
+}
+
+/**
+ * Personal workspace data needs both tenant and authenticated-principal GUCs.
+ * `session_pins` uses this helper so FORCE RLS rejects another member's rows
+ * even if a future query accidentally omits its explicit subject predicate.
+ */
+export async function withWorkspaceSubjectRls<T>(
+  db: Database,
+  workspaceId: string,
+  subjectId: string,
+  fn: (db: Database) => Promise<T>,
+  transactionConfig?: PgTransactionConfig,
+): Promise<T> {
+  if (!subjectId.trim()) {
+    throw new Error("withWorkspaceSubjectRls: a non-empty subjectId is required");
+  }
+  const context = await rlsContextForWorkspace(db, workspaceId);
+  return await withRlsContext(
+    db,
+    context,
+    async (scopedDb) => {
+      await scopedDb.execute(sql`select set_config('opengeni.subject_id', ${subjectId}, true)`);
+      const applied = await scopedDb.execute<{ subject_id: string | null }>(
+        sql`select current_setting('opengeni.subject_id', true) as subject_id`,
+      );
+      if ((applied[0]?.subject_id ?? "") !== subjectId) {
+        throw new Error("Authenticated subject RLS context was not applied on the active backend");
+      }
+      return await fn(scopedDb);
+    },
+    transactionConfig,
+  );
 }
 
 export async function withWorkspaceUsageLock<T>(
@@ -878,7 +914,46 @@ export async function removeWorkspaceMember(
   workspaceId: string,
   subjectId: string,
 ): Promise<boolean> {
-  return await withWorkspaceRls(db, workspaceId, async (scopedDb) => {
+  // A removed principal must not regain stale organization preferences if the
+  // same stable subject is invited again later. Set the target subject GUC so
+  // FORCE RLS permits deleting only that member's personal rows, and make the
+  // cleanup + membership removal one transaction.
+  return await withWorkspaceSubjectRls(db, workspaceId, subjectId, async (scopedDb) => {
+    // Lock the membership before cleanup so concurrent removals preserve the
+    // previous one-winner/one-no-op behavior while snapshots are still visible
+    // to the subject-scoped FORCE-RLS policy.
+    const [membership] = await scopedDb
+      .select({ id: schema.workspaceMemberships.id })
+      .from(schema.workspaceMemberships)
+      .where(
+        and(
+          eq(schema.workspaceMemberships.workspaceId, workspaceId),
+          eq(schema.workspaceMemberships.subjectId, subjectId),
+        ),
+      )
+      .for("update")
+      .limit(1);
+    if (!membership) {
+      return false;
+    }
+
+    await scopedDb
+      .delete(schema.sessionListSnapshots)
+      .where(
+        and(
+          eq(schema.sessionListSnapshots.workspaceId, workspaceId),
+          eq(schema.sessionListSnapshots.subjectId, subjectId),
+        ),
+      );
+    await scopedDb
+      .delete(schema.sessionPins)
+      .where(
+        and(
+          eq(schema.sessionPins.workspaceId, workspaceId),
+          eq(schema.sessionPins.subjectId, subjectId),
+        ),
+      );
+
     const rows = await scopedDb
       .delete(schema.workspaceMemberships)
       .where(
@@ -10442,6 +10517,537 @@ export type ListSessionsOptions = {
   parentSessionId?: string | null;
 };
 
+export type SessionListCursor = {
+  snapshotId: string;
+  offset: number;
+  parentSessionFilter: string;
+  search: string | null;
+};
+
+export type ListSessionsForSubjectOptions = ListSessionsOptions & {
+  subjectId: string;
+  cursor?: SessionListCursor | undefined;
+  search?: string | undefined;
+};
+
+export class SessionPinVersionConflictError extends Error {
+  constructor(readonly current: Pick<Session, "pinned" | "pinnedAt" | "pinVersion">) {
+    super("session pin version conflict");
+    this.name = "SessionPinVersionConflictError";
+  }
+}
+
+export class SessionListCursorError extends Error {
+  constructor(message = "session list cursor is invalid or expired") {
+    super(message);
+    this.name = "SessionListCursorError";
+  }
+}
+
+export class SessionListAccessError extends Error {
+  constructor(message = "workspace access denied") {
+    super(message);
+    this.name = "SessionListAccessError";
+  }
+}
+
+export class SessionPinAccessError extends Error {
+  constructor(message = "workspace access denied") {
+    super(message);
+    this.name = "SessionPinAccessError";
+  }
+}
+
+function isPostgresSerializationFailure(error: unknown): boolean {
+  const seen = new Set<object>();
+  let candidate: unknown = error;
+  while (typeof candidate === "object" && candidate !== null && !seen.has(candidate)) {
+    seen.add(candidate);
+    if ("code" in candidate && (candidate as { code?: unknown }).code === "40001") {
+      return true;
+    }
+    candidate = "cause" in candidate ? (candidate as { cause?: unknown }).cause : undefined;
+  }
+  return false;
+}
+
+type SessionPinRow = Pick<
+  typeof schema.sessionPins.$inferSelect,
+  "pinned" | "pinnedAt" | "version"
+>;
+
+function mapSessionPin(
+  row: SessionPinRow | null | undefined,
+): Pick<Session, "pinned" | "pinnedAt" | "pinVersion"> {
+  return row
+    ? {
+        pinned: row.pinned,
+        pinnedAt: row.pinnedAt?.toISOString() ?? null,
+        pinVersion: Number(row.version),
+      }
+    : { pinned: false, pinnedAt: null, pinVersion: 0 };
+}
+
+function sessionFilters(
+  options: Pick<ListSessionsForSubjectOptions, "parentSessionId" | "search">,
+): SQL[] {
+  const filters: SQL[] = [];
+  if (Object.prototype.hasOwnProperty.call(options, "parentSessionId")) {
+    const parentSessionId = options.parentSessionId;
+    if (parentSessionId === null) {
+      filters.push(isNull(schema.sessions.parentSessionId));
+    } else if (parentSessionId !== undefined) {
+      filters.push(eq(schema.sessions.parentSessionId, parentSessionId));
+    }
+  }
+  const search = options.search?.trim();
+  if (search) {
+    // PostgreSQL LIKE uses backslash as its default escape. Escape it first so
+    // a literal trailing slash cannot consume our surrounding wildcard; then
+    // escape the two wildcard metacharacters. The resulting search is literal,
+    // case-insensitive substring matching rather than user-authored SQL globbing.
+    const pattern = `%${search
+      .replaceAll("\\", "\\\\")
+      .replaceAll("%", "\\%")
+      .replaceAll("_", "\\_")}%`;
+    filters.push(
+      or(ilike(schema.sessions.title, pattern), ilike(schema.sessions.initialMessage, pattern))!,
+    );
+  }
+  return filters;
+}
+
+const SESSION_LIST_SNAPSHOT_TTL_MS = 10 * 60 * 1000;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function sessionParentFilter(parentSessionId: string | null | undefined): string {
+  return parentSessionId === undefined
+    ? "all"
+    : parentSessionId === null
+      ? "null"
+      : parentSessionId;
+}
+
+function sessionSearchFilter(search: string | undefined): string | null {
+  const trimmed = search?.trim();
+  return trimmed ? trimmed : null;
+}
+
+/** Opaque, URL-safe cursor encoding for a server-owned activity snapshot. */
+export function encodeSessionListCursor(cursor: SessionListCursor): string {
+  return Buffer.from(
+    JSON.stringify({
+      snapshotId: cursor.snapshotId,
+      offset: cursor.offset,
+      parentSessionFilter: cursor.parentSessionFilter,
+      search: cursor.search,
+    }),
+  ).toString("base64url");
+}
+
+/** Decode and validate a cursor before it reaches any SQL predicate. */
+export function decodeSessionListCursor(value: string): SessionListCursor | null {
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as {
+      snapshotId?: unknown;
+      offset?: unknown;
+      parentSessionFilter?: unknown;
+      search?: unknown;
+    };
+    const parentSessionFilter = parsed.parentSessionFilter;
+    const search = parsed.search;
+    const offset = parsed.offset;
+    if (
+      typeof parsed.snapshotId !== "string" ||
+      !UUID_PATTERN.test(parsed.snapshotId) ||
+      typeof offset !== "number" ||
+      !Number.isSafeInteger(offset) ||
+      offset < 0 ||
+      (parentSessionFilter !== "all" &&
+        parentSessionFilter !== "null" &&
+        (typeof parentSessionFilter !== "string" || !UUID_PATTERN.test(parentSessionFilter))) ||
+      (search !== null && (typeof search !== "string" || search.length > 200))
+    ) {
+      return null;
+    }
+    return {
+      snapshotId: parsed.snapshotId,
+      offset,
+      parentSessionFilter: parentSessionFilter as string,
+      search: search as string | null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Server-authoritative member-specific page. Pinned rows are returned separately
+ * and omitted from ordinary pages, so list pagination cannot duplicate a
+ * session. The first page materializes the complete ordinary activity order in
+ * a short-lived, subject-scoped snapshot; continuation cursors carry only that
+ * snapshot id and offset, while the page joins live session rows for current
+ * lifecycle/title data.
+ */
+export async function listSessionsForSubject(
+  db: Database,
+  workspaceId: string,
+  options: ListSessionsForSubjectOptions,
+): Promise<SessionListResponse> {
+  const limit = Math.max(1, options.limit ?? 50);
+  let membershipCheckSerializationFailure = false;
+  const listInTransaction = async (): Promise<SessionListResponse> => {
+    membershipCheckSerializationFailure = false;
+    return await withWorkspaceSubjectRls(
+      db,
+      workspaceId,
+      options.subjectId,
+      async (tx) => {
+        // Authorization is resolved before this helper by the API, but that
+        // grant can be stale by the time this transaction starts. Lock the live
+        // membership before touching snapshots so removal and listing serialize:
+        // listing first lets removal clean its committed snapshot, while removal
+        // first makes listing observe the missing membership and do no writes.
+        let membership: { id: string } | undefined;
+        try {
+          [membership] = await tx
+            .select({ id: schema.workspaceMemberships.id })
+            .from(schema.workspaceMemberships)
+            .where(
+              and(
+                eq(schema.workspaceMemberships.workspaceId, workspaceId),
+                eq(schema.workspaceMemberships.subjectId, options.subjectId),
+              ),
+            )
+            .for("update")
+            .limit(1);
+        } catch (error) {
+          membershipCheckSerializationFailure = isPostgresSerializationFailure(error);
+          throw error;
+        }
+        if (!membership) {
+          throw new SessionListAccessError();
+        }
+
+        const filters = [eq(schema.sessions.workspaceId, workspaceId), ...sessionFilters(options)];
+        const parentFilter = sessionParentFilter(options.parentSessionId);
+        const searchFilter = sessionSearchFilter(options.search);
+        const now = new Date();
+        await tx
+          .delete(schema.sessionListSnapshots)
+          .where(lt(schema.sessionListSnapshots.expiresAt, now));
+
+        let pageIds: string[];
+        let nextCursor: string | null = null;
+        if (options.cursor) {
+          const cursor = options.cursor;
+          if (cursor.parentSessionFilter !== parentFilter || cursor.search !== searchFilter) {
+            throw new SessionListCursorError("session list cursor does not match its filters");
+          }
+          const [snapshot] = await tx
+            .select()
+            .from(schema.sessionListSnapshots)
+            .where(
+              and(
+                eq(schema.sessionListSnapshots.id, cursor.snapshotId),
+                eq(schema.sessionListSnapshots.workspaceId, workspaceId),
+                eq(schema.sessionListSnapshots.subjectId, options.subjectId),
+              ),
+            )
+            .limit(1);
+          if (!snapshot || snapshot.expiresAt.getTime() <= now.getTime()) {
+            throw new SessionListCursorError();
+          }
+          if (
+            snapshot.parentSessionFilter !== parentFilter ||
+            (snapshot.search ?? null) !== searchFilter ||
+            cursor.offset > snapshot.ordinarySessionIds.length
+          ) {
+            throw new SessionListCursorError();
+          }
+          pageIds = snapshot.ordinarySessionIds.slice(cursor.offset, cursor.offset + limit);
+          const nextOffset = cursor.offset + pageIds.length;
+          if (nextOffset < snapshot.ordinarySessionIds.length) {
+            nextCursor = encodeSessionListCursor({
+              snapshotId: snapshot.id,
+              offset: nextOffset,
+              parentSessionFilter: snapshot.parentSessionFilter,
+              search: snapshot.search ?? null,
+            });
+          }
+        } else {
+          const ordinaryIdRows = await tx
+            .select({ id: schema.sessions.id })
+            .from(schema.sessions)
+            .leftJoin(
+              schema.sessionPins,
+              and(
+                eq(schema.sessionPins.workspaceId, workspaceId),
+                eq(schema.sessionPins.subjectId, options.subjectId),
+                eq(schema.sessionPins.sessionId, schema.sessions.id),
+              ),
+            )
+            .where(
+              and(
+                ...filters,
+                or(isNull(schema.sessionPins.id), eq(schema.sessionPins.pinned, false)),
+              ),
+            )
+            .orderBy(desc(schema.sessions.updatedAt), desc(schema.sessions.id));
+          const ordinaryIds = ordinaryIdRows.map((row) => row.id);
+          pageIds = ordinaryIds.slice(0, limit);
+          if (ordinaryIds.length > limit) {
+            const [workspace] = await tx
+              .select({ accountId: schema.workspaces.accountId })
+              .from(schema.workspaces)
+              .where(eq(schema.workspaces.id, workspaceId))
+              .limit(1);
+            if (!workspace) {
+              throw new SessionListCursorError();
+            }
+            const [snapshot] = await tx
+              .insert(schema.sessionListSnapshots)
+              .values({
+                accountId: workspace.accountId,
+                workspaceId,
+                subjectId: options.subjectId,
+                parentSessionFilter: parentFilter,
+                search: searchFilter,
+                ordinarySessionIds: ordinaryIds,
+                expiresAt: new Date(now.getTime() + SESSION_LIST_SNAPSHOT_TTL_MS),
+              })
+              .returning();
+            if (!snapshot) {
+              throw new SessionListCursorError();
+            }
+            nextCursor = encodeSessionListCursor({
+              snapshotId: snapshot.id,
+              offset: limit,
+              parentSessionFilter: parentFilter,
+              search: searchFilter,
+            });
+          }
+        }
+        const pinnedRows = await tx
+          .select({ session: schema.sessions, pin: schema.sessionPins })
+          .from(schema.sessionPins)
+          .innerJoin(schema.sessions, eq(schema.sessions.id, schema.sessionPins.sessionId))
+          .where(
+            and(
+              eq(schema.sessionPins.workspaceId, workspaceId),
+              eq(schema.sessionPins.subjectId, options.subjectId),
+              eq(schema.sessionPins.pinned, true),
+              ...filters,
+            ),
+          )
+          .orderBy(desc(schema.sessionPins.pinnedAt), desc(schema.sessions.id));
+        const ordinaryRows =
+          pageIds.length === 0
+            ? []
+            : await tx
+                .select({ session: schema.sessions, pin: schema.sessionPins })
+                .from(schema.sessions)
+                .leftJoin(
+                  schema.sessionPins,
+                  and(
+                    eq(schema.sessionPins.workspaceId, workspaceId),
+                    eq(schema.sessionPins.subjectId, options.subjectId),
+                    eq(schema.sessionPins.sessionId, schema.sessions.id),
+                  ),
+                )
+                .where(
+                  and(
+                    eq(schema.sessions.workspaceId, workspaceId),
+                    inArray(schema.sessions.id, pageIds),
+                    or(isNull(schema.sessionPins.id), eq(schema.sessionPins.pinned, false)),
+                  ),
+                );
+        const ordinaryById = new Map(ordinaryRows.map((row) => [row.session.id, row]));
+        const pageRows = pageIds.flatMap((id) => {
+          const row = ordinaryById.get(id);
+          return row ? [row] : [];
+        });
+        const ids = [
+          ...pinnedRows.map((row) => row.session.id),
+          ...pageRows.map((row) => row.session.id),
+        ];
+        const mcpServers = await sessionMcpServerMetadataForSessions(tx, workspaceId, ids);
+        return {
+          pinned: pinnedRows.map((row) =>
+            mapSession(row.session, mcpServers.get(row.session.id) ?? [], mapSessionPin(row.pin)),
+          ),
+          sessions: pageRows.map((row) =>
+            mapSession(row.session, mcpServers.get(row.session.id) ?? [], mapSessionPin(row.pin)),
+          ),
+          nextCursor,
+        };
+      },
+      { isolationLevel: "repeatable read" },
+    );
+  };
+
+  try {
+    return await listInTransaction();
+  } catch (error) {
+    if (!membershipCheckSerializationFailure || !isPostgresSerializationFailure(error)) {
+      throw error;
+    }
+    // PostgreSQL has already aborted and rolled back the first transaction.
+    // Retry exactly once so the fresh snapshot can observe a membership that
+    // removal committed while the listing was waiting on its row lock.
+    return await listInTransaction();
+  }
+}
+
+/** Read a session with the caller subject's personal pin projection. */
+export async function getSessionForSubject(
+  db: Database,
+  workspaceId: string,
+  sessionId: string,
+  subjectId: string,
+): Promise<Session | null> {
+  return await withWorkspaceSubjectRls(db, workspaceId, subjectId, async (scopedDb) => {
+    const [row] = await scopedDb
+      .select({ session: schema.sessions, pin: schema.sessionPins })
+      .from(schema.sessions)
+      .leftJoin(
+        schema.sessionPins,
+        and(
+          eq(schema.sessionPins.workspaceId, workspaceId),
+          eq(schema.sessionPins.subjectId, subjectId),
+          eq(schema.sessionPins.sessionId, schema.sessions.id),
+        ),
+      )
+      .where(and(eq(schema.sessions.workspaceId, workspaceId), eq(schema.sessions.id, sessionId)))
+      .limit(1);
+    if (!row) return null;
+    const mcpServers = await sessionMcpServerMetadataForSessions(scopedDb, workspaceId, [
+      sessionId,
+    ]);
+    return mapSession(row.session, mcpServers.get(sessionId) ?? [], mapSessionPin(row.pin));
+  });
+}
+
+/**
+ * Idempotently set a member's pin without mutating the session's lifecycle or
+ * activity timestamps. A transaction advisory lock serializes same-subject,
+ * same-session actions across API replicas; expectedVersion rejects stale tabs.
+ */
+export async function setSessionPin(
+  db: Database,
+  input: {
+    workspaceId: string;
+    subjectId: string;
+    sessionId: string;
+    pinned: boolean;
+    expectedVersion?: number | undefined;
+  },
+): Promise<Session | null> {
+  return await withWorkspaceSubjectRls(
+    db,
+    input.workspaceId,
+    input.subjectId,
+    async (scopedDb) =>
+      await scopedDb.transaction(async (tx) => {
+        // Serialize with removeWorkspaceMember(), which locks this row before
+        // cleaning personal state and deleting the membership. A stale API
+        // grant must not be able to recreate a pin after removal commits.
+        const [membership] = await tx
+          .select({ id: schema.workspaceMemberships.id })
+          .from(schema.workspaceMemberships)
+          .where(
+            and(
+              eq(schema.workspaceMemberships.workspaceId, input.workspaceId),
+              eq(schema.workspaceMemberships.subjectId, input.subjectId),
+            ),
+          )
+          .for("update")
+          .limit(1);
+        if (!membership) {
+          throw new SessionPinAccessError();
+        }
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${`session-pin:${input.workspaceId}:${input.subjectId}:${input.sessionId}`}, 0))`,
+        );
+        const [session] = await tx
+          .select()
+          .from(schema.sessions)
+          .where(
+            and(
+              eq(schema.sessions.workspaceId, input.workspaceId),
+              eq(schema.sessions.id, input.sessionId),
+            ),
+          )
+          .limit(1);
+        if (!session) return null;
+        const [existing] = await tx
+          .select()
+          .from(schema.sessionPins)
+          .where(
+            and(
+              eq(schema.sessionPins.workspaceId, input.workspaceId),
+              eq(schema.sessionPins.subjectId, input.subjectId),
+              eq(schema.sessionPins.sessionId, input.sessionId),
+            ),
+          )
+          .limit(1);
+        const current = mapSessionPin(existing);
+        // Desired-state retries are idempotent even when their OCC revision is
+        // stale. This is essential for a client that timed out after the server
+        // committed: retrying the same pin/unpin must observe success, not a
+        // conflict. OCC only protects a request that would CHANGE current state.
+        if (current.pinned === input.pinned) {
+          const mcpServers = await sessionMcpServerMetadataForSessions(tx, input.workspaceId, [
+            session.id,
+          ]);
+          return mapSession(session, mcpServers.get(session.id) ?? [], mapSessionPin(existing));
+        }
+        if (input.expectedVersion !== undefined && input.expectedVersion !== current.pinVersion) {
+          throw new SessionPinVersionConflictError(current);
+        }
+        let pin = existing ?? null;
+        if (!existing) {
+          const [inserted] = await tx
+            .insert(schema.sessionPins)
+            .values({
+              accountId: session.accountId,
+              workspaceId: input.workspaceId,
+              subjectId: input.subjectId,
+              sessionId: input.sessionId,
+              // The equal-state return above means an absent row can only
+              // transition false -> true here; initial unpin stays row-free at
+              // version zero instead of manufacturing an OCC revision.
+              pinned: true,
+              pinnedAt: new Date(),
+            })
+            .returning();
+          pin = inserted ?? null;
+        } else if (existing.pinned !== input.pinned) {
+          const [updated] = await tx
+            .update(schema.sessionPins)
+            .set({
+              pinned: input.pinned,
+              pinnedAt: input.pinned ? new Date() : null,
+              version: sql`${schema.sessionPins.version} + 1`,
+            })
+            .where(
+              and(
+                eq(schema.sessionPins.workspaceId, input.workspaceId),
+                eq(schema.sessionPins.subjectId, input.subjectId),
+                eq(schema.sessionPins.sessionId, input.sessionId),
+              ),
+            )
+            .returning();
+          pin = updated ?? null;
+        }
+        const mcpServers = await sessionMcpServerMetadataForSessions(tx, input.workspaceId, [
+          session.id,
+        ]);
+        return mapSession(session, mcpServers.get(session.id) ?? [], mapSessionPin(pin));
+      }),
+  );
+}
+
 export async function listSessions(
   db: Database,
   workspaceId: string,
@@ -18034,6 +18640,7 @@ export function sessionSubject(workspaceId: string, sessionId: string): string {
 function mapSession(
   row: typeof schema.sessions.$inferSelect,
   mcpServers: SessionMcpServerMetadata[] = [],
+  pin: Pick<Session, "pinned" | "pinnedAt" | "pinVersion"> = mapSessionPin(null),
 ): Session {
   return {
     id: row.id,
@@ -18072,6 +18679,7 @@ function mapSession(
     lastSequence: row.lastSequence,
     codexPinnedCredentialId: row.codexPinnedCredentialId ?? null,
     codexLastCredentialId: row.codexLastCredentialId ?? null,
+    ...pin,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };

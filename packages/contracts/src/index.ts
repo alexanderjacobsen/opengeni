@@ -1911,6 +1911,18 @@ export const UpdateSessionRequest = z.object({
 });
 export type UpdateSessionRequest = z.infer<typeof UpdateSessionRequest>;
 
+/**
+ * A member's personal pin preference for a session. `expectedVersion` is
+ * optional: ordinary pin/unpin actions are idempotent last-write-wins, while a
+ * client that has a known version can fail closed rather than overwrite a newer
+ * action from another browser.
+ */
+export const UpdateSessionPinRequest = z.object({
+  pinned: z.boolean(),
+  expectedVersion: z.number().int().nonnegative().optional(),
+});
+export type UpdateSessionPinRequest = z.infer<typeof UpdateSessionPinRequest>;
+
 // Operator context controls (slash-command palette: /clear, /compact). These
 // are session/operator actions, NOT a structured way to talk to the agent —
 // the human↔agent channel stays plain chat. Both require `sessions:control`.
@@ -3004,12 +3016,31 @@ export const Session = z.object({
   // "Running on:" indicator's source). Both are credential-row ids, null until set.
   codexPinnedCredentialId: z.string().uuid().nullable(),
   codexLastCredentialId: z.string().uuid().nullable(),
+  /** Personal (authenticated subject) workspace pin state, never workspace-global. */
+  pinned: z.boolean().default(false),
+  /** Stable pin ordering key; null when this subject has not pinned the session. */
+  pinnedAt: z.string().nullable().default(null),
+  /** Optimistic pin-state revision; zero represents an absent pin relation. */
+  pinVersion: z.number().int().nonnegative().default(0),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
 export type Session = z.infer<typeof Session>;
 
 export type SessionSummary = Session;
+
+/**
+ * The canonical session-list page. Pinned rows are returned separately and are
+ * excluded from `sessions`, so a cursor can page ordinary recency rows without
+ * duplicating a pin. Pins are filtered by the same parent/search predicates as
+ * ordinary rows and ordered by pinnedAt DESC, id DESC.
+ */
+export const SessionListResponse = z.object({
+  pinned: z.array(Session),
+  sessions: z.array(Session),
+  nextCursor: z.string().nullable(),
+});
+export type SessionListResponse = z.infer<typeof SessionListResponse>;
 
 // Recursive: the TS type is declared first so the schema annotation can carry
 // the FULL recursive shape (a shallow annotation loses type information for

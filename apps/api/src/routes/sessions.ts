@@ -56,6 +56,7 @@ import {
   withCodexCapacityMutation,
   setSessionPin,
   SessionPinVersionConflictError,
+  SessionPinAccessError,
   SessionListAccessError,
   SessionListCursorError,
   decodeSessionListCursor,
@@ -194,6 +195,9 @@ export function registerSessionRoutes(app: Hono, deps: ApiRouteDeps): void {
       }
       return c.json(session);
     } catch (error) {
+      if (error instanceof SessionPinAccessError) {
+        throw new HTTPException(403, { message: error.message });
+      }
       if (error instanceof SessionPinVersionConflictError) {
         return c.json(
           { message: "session pin changed in another client", current: error.current },

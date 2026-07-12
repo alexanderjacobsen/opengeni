@@ -11,6 +11,7 @@ import {
   listSessionsForSubject,
   removeWorkspaceMember,
   SessionListAccessError,
+  SessionPinAccessError,
   SessionPinVersionConflictError,
   setSessionPin,
   withWorkspaceRls,
@@ -254,6 +255,7 @@ describe("session pins (real PostgreSQL + FORCE RLS)", () => {
   test("serializes concurrent same-state retries to one monotonic revision", async () => {
     if (!available) return;
     const workspace = await freshWorkspace();
+    await grantMember(workspace, "user:race");
     const target = await session({ ...workspace, message: "concurrent target" });
     const results = await Promise.all(
       Array.from({ length: 12 }, () =>
@@ -825,10 +827,208 @@ describe("session pins (real PostgreSQL + FORCE RLS)", () => {
     }
   }, 60_000);
 
+  test("rejects a stale pin mutation after removal wins the membership lock", async () => {
+    if (!available || !shared) return;
+    const workspace = await freshWorkspace();
+    const foreign = await freshWorkspace();
+    const subjectId = "user:pin-removal-first";
+    const retainedSubject = "user:pin-removal-retained";
+    await grantMember(workspace, subjectId);
+    await grantMember(workspace, retainedSubject);
+    await grantMember(foreign, subjectId);
+    const target = await session({ ...workspace, message: "pin removal-first target" });
+    const retainedTarget = await session({ ...workspace, message: "pin retained target" });
+    const foreignTarget = await session({ ...foreign, message: "pin foreign target" });
+    await setSessionPin(db, {
+      workspaceId: workspace.workspaceId,
+      subjectId: retainedSubject,
+      sessionId: retainedTarget.id,
+      pinned: true,
+    });
+    await setSessionPin(db, {
+      workspaceId: foreign.workspaceId,
+      subjectId,
+      sessionId: foreignTarget.id,
+      pinned: true,
+    });
+
+    const barrier = postgres(shared.adminUrl, { max: 1 });
+    const removalClient = createDb(shared.appUrl, { max: 1 });
+    const pinClient = createDb(shared.appUrl, { max: 1 });
+    const barrierClass = 81326029;
+    const removalLock = 1;
+    const triggerFunction = "ope26_test_pin_removal_first_barrier";
+    const triggerName = "ope26_test_pin_removal_first_membership_barrier";
+    let removalPromise: Promise<boolean> | null = null;
+    let pinPromise: Promise<Awaited<ReturnType<typeof setSessionPin>>> | null = null;
+    try {
+      await barrier.unsafe(`
+        create function ${triggerFunction}() returns trigger
+        language plpgsql as $$
+        begin
+          perform pg_advisory_xact_lock(${barrierClass}, ${removalLock});
+          return old;
+        end
+        $$;
+        create trigger ${triggerName}
+          before delete on workspace_memberships
+          for each row when (
+            old.workspace_id = '${workspace.workspaceId}'::uuid
+            and old.subject_id = '${subjectId}'
+          ) execute function ${triggerFunction}();
+      `);
+      await barrier`select pg_advisory_lock(${barrierClass}, ${removalLock})`;
+
+      removalPromise = removeWorkspaceMember(removalClient.db, workspace.workspaceId, subjectId);
+      await waitForAdvisoryWait(admin, barrierClass, removalLock);
+
+      // The API grant is intentionally stale: the pin transaction must wait on
+      // the same membership row rather than recreate a pin after removal.
+      pinPromise = setSessionPin(pinClient.db, {
+        workspaceId: workspace.workspaceId,
+        subjectId,
+        sessionId: target.id,
+        pinned: true,
+      });
+      await waitForDatabaseQueryWait(admin, "workspace_memberships");
+
+      await barrier`select pg_advisory_unlock(${barrierClass}, ${removalLock})`;
+      expect(await removalPromise).toBe(true);
+      await expect(pinPromise).rejects.toBeInstanceOf(SessionPinAccessError);
+
+      const [counts] = await admin<
+        {
+          memberships: number;
+          removedPins: number;
+          retainedPins: number;
+          foreignPins: number;
+          orphans: number;
+        }[]
+      >`
+        select
+          (select count(*)::int from workspace_memberships
+            where workspace_id = ${workspace.workspaceId} and subject_id = ${subjectId}) as memberships,
+          (select count(*)::int from session_pins
+            where workspace_id = ${workspace.workspaceId} and subject_id = ${subjectId}) as "removedPins",
+          (select count(*)::int from session_pins
+            where workspace_id = ${workspace.workspaceId} and subject_id = ${retainedSubject}) as "retainedPins",
+          (select count(*)::int from session_pins
+            where workspace_id = ${foreign.workspaceId} and subject_id = ${subjectId}) as "foreignPins",
+          (select count(*)::int
+            from session_pins pin
+            left join workspace_memberships membership
+              on membership.workspace_id = pin.workspace_id
+             and membership.subject_id = pin.subject_id
+            where pin.workspace_id = ${workspace.workspaceId}
+              and membership.id is null) as orphans`;
+      expect(counts).toEqual({
+        memberships: 0,
+        removedPins: 0,
+        retainedPins: 1,
+        foreignPins: 1,
+        orphans: 0,
+      });
+    } finally {
+      await barrier`select pg_advisory_unlock_all()`.catch(() => undefined);
+      await barrier
+        .unsafe(`
+        drop trigger if exists ${triggerName} on workspace_memberships;
+        drop function if exists ${triggerFunction}();
+      `)
+        .catch(() => undefined);
+      await barrier.end().catch(() => undefined);
+      await Promise.allSettled([pinPromise, removalPromise].filter(Boolean));
+      await pinClient.close().catch(() => undefined);
+      await removalClient.close().catch(() => undefined);
+    }
+  }, 60_000);
+
+  test("lets removal clean a pin committed while it waits on the membership lock", async () => {
+    if (!available || !shared) return;
+    const workspace = await freshWorkspace();
+    const subjectId = "user:pin-mutation-first";
+    await grantMember(workspace, subjectId);
+    const target = await session({ ...workspace, message: "pin mutation-first target" });
+
+    const barrier = postgres(shared.adminUrl, { max: 1 });
+    const removalClient = createDb(shared.appUrl, { max: 1 });
+    const pinClient = createDb(shared.appUrl, { max: 1 });
+    const barrierClass = 81326030;
+    const pinInsertLock = 1;
+    const triggerFunction = "ope26_test_pin_mutation_first_barrier";
+    const triggerName = "ope26_test_pin_mutation_first_insert_barrier";
+    let removalPromise: Promise<boolean> | null = null;
+    let pinPromise: Promise<Awaited<ReturnType<typeof setSessionPin>>> | null = null;
+    try {
+      await barrier.unsafe(`
+        create function ${triggerFunction}() returns trigger
+        language plpgsql as $$
+        begin
+          perform pg_advisory_xact_lock(${barrierClass}, ${pinInsertLock});
+          return new;
+        end
+        $$;
+        create trigger ${triggerName}
+          before insert on session_pins
+          for each row when (
+            new.workspace_id = '${workspace.workspaceId}'::uuid
+            and new.subject_id = '${subjectId}'
+          ) execute function ${triggerFunction}();
+      `);
+      await barrier`select pg_advisory_lock(${barrierClass}, ${pinInsertLock})`;
+
+      pinPromise = setSessionPin(pinClient.db, {
+        workspaceId: workspace.workspaceId,
+        subjectId,
+        sessionId: target.id,
+        pinned: true,
+      });
+      await waitForAdvisoryWait(admin, barrierClass, pinInsertLock);
+
+      // Pin mutation owns membership first; removal waits, then cleans the
+      // committed pin after the insert barrier is released.
+      removalPromise = removeWorkspaceMember(removalClient.db, workspace.workspaceId, subjectId);
+      await waitForDatabaseQueryWait(admin, "workspace_memberships");
+
+      await barrier`select pg_advisory_unlock(${barrierClass}, ${pinInsertLock})`;
+      expect(await pinPromise).not.toBeNull();
+      expect(await removalPromise).toBe(true);
+
+      const [counts] = await admin<{ memberships: number; pins: number; orphans: number }[]>`
+        select
+          (select count(*)::int from workspace_memberships
+            where workspace_id = ${workspace.workspaceId} and subject_id = ${subjectId}) as memberships,
+          (select count(*)::int from session_pins
+            where workspace_id = ${workspace.workspaceId} and subject_id = ${subjectId}) as pins,
+          (select count(*)::int
+            from session_pins pin
+            left join workspace_memberships membership
+              on membership.workspace_id = pin.workspace_id
+             and membership.subject_id = pin.subject_id
+            where pin.workspace_id = ${workspace.workspaceId}
+              and membership.id is null) as orphans`;
+      expect(counts).toEqual({ memberships: 0, pins: 0, orphans: 0 });
+    } finally {
+      await barrier`select pg_advisory_unlock_all()`.catch(() => undefined);
+      await barrier
+        .unsafe(`
+        drop trigger if exists ${triggerName} on session_pins;
+        drop function if exists ${triggerFunction}();
+      `)
+        .catch(() => undefined);
+      await barrier.end().catch(() => undefined);
+      await Promise.allSettled([pinPromise, removalPromise].filter(Boolean));
+      await pinClient.close().catch(() => undefined);
+      await removalClient.close().catch(() => undefined);
+    }
+  }, 60_000);
+
   test("returns no cross-workspace target and cascades a deleted session's pins", async () => {
     if (!available) return;
     const workspace = await freshWorkspace();
     const foreign = await freshWorkspace();
+    await grantMember(workspace, "user:one");
+    await grantMember(foreign, "user:one");
     const target = await session({ ...workspace, message: "delete pin target" });
     await setSessionPin(db, {
       workspaceId: workspace.workspaceId,

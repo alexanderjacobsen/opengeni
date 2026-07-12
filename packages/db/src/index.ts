@@ -10551,6 +10551,13 @@ export class SessionListAccessError extends Error {
   }
 }
 
+export class SessionPinAccessError extends Error {
+  constructor(message = "workspace access denied") {
+    super(message);
+    this.name = "SessionPinAccessError";
+  }
+}
+
 function isPostgresSerializationFailure(error: unknown): boolean {
   const seen = new Set<object>();
   let candidate: unknown = error;
@@ -10942,6 +10949,23 @@ export async function setSessionPin(
     input.subjectId,
     async (scopedDb) =>
       await scopedDb.transaction(async (tx) => {
+        // Serialize with removeWorkspaceMember(), which locks this row before
+        // cleaning personal state and deleting the membership. A stale API
+        // grant must not be able to recreate a pin after removal commits.
+        const [membership] = await tx
+          .select({ id: schema.workspaceMemberships.id })
+          .from(schema.workspaceMemberships)
+          .where(
+            and(
+              eq(schema.workspaceMemberships.workspaceId, input.workspaceId),
+              eq(schema.workspaceMemberships.subjectId, input.subjectId),
+            ),
+          )
+          .for("update")
+          .limit(1);
+        if (!membership) {
+          throw new SessionPinAccessError();
+        }
         await tx.execute(
           sql`select pg_advisory_xact_lock(hashtextextended(${`session-pin:${input.workspaceId}:${input.subjectId}:${input.sessionId}`}, 0))`,
         );

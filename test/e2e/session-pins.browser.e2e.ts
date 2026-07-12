@@ -468,6 +468,121 @@ describe("session pins browser e2e (real API + non-superuser PostgreSQL)", () =>
       await context.close().catch(() => undefined);
     }
   }, 60_000);
+
+  test("returns authenticated 403 when removal wins a concurrent pin mutation", async () => {
+    const context = await configuredContext(browser, {
+      viewport: { width: 1280, height: 800 },
+      extraHTTPHeaders: ownerHeaders,
+    });
+    const page = await context.newPage();
+    const barrier = postgres(shared.adminUrl, { max: 1 });
+    const removalClient = createDb(shared.appUrl, { max: 1 });
+    const raceSecret = "ope26-browser-pin-race-secret";
+    const raceSubject = "configured:ope26-browser-pin-race";
+    const barrierClass = 81326031;
+    const removalLock = 1;
+    const triggerFunction = "ope26_browser_pin_removal_first_barrier";
+    const triggerName = "ope26_browser_pin_removal_first_membership_barrier";
+    let removalPromise: Promise<boolean> | null = null;
+    try {
+      await page.goto(webBaseUrl);
+      const workspaceId = await workspaceFromPage(page);
+      const [workspace] = await shared.admin<{ accountId: string }[]>`
+        select account_id as "accountId" from workspaces where id = ${workspaceId}`;
+      expect(workspace?.accountId).toBeTruthy();
+      await grantWorkspaceAccess(dbClient.db, {
+        accountId: workspace!.accountId,
+        workspaceId,
+        subjectId: raceSubject,
+        permissions: ["sessions:read"] satisfies Permission[],
+      });
+      const target = await createSessionThroughApi(page, apiBaseUrl, workspaceId, "API pin race");
+
+      const raceApp = createApp({
+        settings: testSettings({
+          databaseUrl: shared.appUrl,
+          productAccessMode: "configured",
+          delegationSecret: raceSecret,
+        }),
+        db: dbClient.db,
+        bus: new MemoryEventBus(),
+        workflowClient,
+      });
+      const token = await signDelegatedAccessToken(raceSecret, {
+        accountId: workspace!.accountId,
+        workspaceId,
+        subjectId: raceSubject,
+        permissions: ["sessions:read"],
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      });
+
+      await barrier.unsafe(`
+        create function ${triggerFunction}() returns trigger
+        language plpgsql as $$
+        begin
+          perform pg_advisory_xact_lock(${barrierClass}, ${removalLock});
+          return old;
+        end
+        $$;
+        create trigger ${triggerName}
+          before delete on workspace_memberships
+          for each row when (
+            old.workspace_id = '${workspaceId}'::uuid
+            and old.subject_id = '${raceSubject}'
+          ) execute function ${triggerFunction}();
+      `);
+      await barrier`select pg_advisory_lock(${barrierClass}, ${removalLock})`;
+
+      removalPromise = removeWorkspaceMember(removalClient.db, workspaceId, raceSubject);
+      await waitForAdvisoryWait(barrier, barrierClass, removalLock);
+
+      const pinPromise = raceApp.request(
+        `/v1/workspaces/${workspaceId}/sessions/${target.id}/pin`,
+        {
+          method: "PUT",
+          headers: {
+            authorization: `Bearer ${token}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ pinned: true, expectedVersion: 0 }),
+        },
+      );
+      await waitForDatabaseQueryWait(barrier, "workspace_memberships");
+      await barrier`select pg_advisory_unlock(${barrierClass}, ${removalLock})`;
+      expect(await removalPromise).toBe(true);
+
+      const response = await pinPromise;
+      expect(response.status).toBe(403);
+      expect(await response.text()).toContain("workspace access denied");
+
+      const [counts] = await shared.admin<{ memberships: number; pins: number; orphans: number }[]>`
+        select
+          (select count(*)::int from workspace_memberships
+            where workspace_id = ${workspaceId} and subject_id = ${raceSubject}) as memberships,
+          (select count(*)::int from session_pins
+            where workspace_id = ${workspaceId} and subject_id = ${raceSubject}) as pins,
+          (select count(*)::int
+            from session_pins pin
+            left join workspace_memberships membership
+              on membership.workspace_id = pin.workspace_id
+             and membership.subject_id = pin.subject_id
+            where pin.workspace_id = ${workspaceId}
+              and membership.id is null) as orphans`;
+      expect(counts).toEqual({ memberships: 0, pins: 0, orphans: 0 });
+    } finally {
+      await barrier`select pg_advisory_unlock_all()`.catch(() => undefined);
+      await barrier
+        .unsafe(`
+        drop trigger if exists ${triggerName} on workspace_memberships;
+        drop function if exists ${triggerFunction}();
+      `)
+        .catch(() => undefined);
+      await barrier.end().catch(() => undefined);
+      await Promise.allSettled([removalPromise].filter(Boolean));
+      await removalClient.close().catch(() => undefined);
+      await context.close().catch(() => undefined);
+    }
+  }, 60_000);
 });
 
 type BrowserSession = { id: string; pinned: boolean; pinVersion: number };

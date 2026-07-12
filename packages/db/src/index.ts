@@ -916,9 +916,44 @@ export async function removeWorkspaceMember(
 ): Promise<boolean> {
   // A removed principal must not regain stale organization preferences if the
   // same stable subject is invited again later. Set the target subject GUC so
-  // FORCE RLS permits deleting only that member's personal pin rows, and make
-  // the preference cleanup + membership removal one transaction.
+  // FORCE RLS permits deleting only that member's personal rows, and make the
+  // cleanup + membership removal one transaction.
   return await withWorkspaceSubjectRls(db, workspaceId, subjectId, async (scopedDb) => {
+    // Lock the membership before cleanup so concurrent removals preserve the
+    // previous one-winner/one-no-op behavior while snapshots are still visible
+    // to the subject-scoped FORCE-RLS policy.
+    const [membership] = await scopedDb
+      .select({ id: schema.workspaceMemberships.id })
+      .from(schema.workspaceMemberships)
+      .where(
+        and(
+          eq(schema.workspaceMemberships.workspaceId, workspaceId),
+          eq(schema.workspaceMemberships.subjectId, subjectId),
+        ),
+      )
+      .for("update")
+      .limit(1);
+    if (!membership) {
+      return false;
+    }
+
+    await scopedDb
+      .delete(schema.sessionListSnapshots)
+      .where(
+        and(
+          eq(schema.sessionListSnapshots.workspaceId, workspaceId),
+          eq(schema.sessionListSnapshots.subjectId, subjectId),
+        ),
+      );
+    await scopedDb
+      .delete(schema.sessionPins)
+      .where(
+        and(
+          eq(schema.sessionPins.workspaceId, workspaceId),
+          eq(schema.sessionPins.subjectId, subjectId),
+        ),
+      );
+
     const rows = await scopedDb
       .delete(schema.workspaceMemberships)
       .where(
@@ -928,18 +963,7 @@ export async function removeWorkspaceMember(
         ),
       )
       .returning({ id: schema.workspaceMemberships.id });
-    if (rows.length === 0) {
-      return false;
-    }
-    await scopedDb
-      .delete(schema.sessionPins)
-      .where(
-        and(
-          eq(schema.sessionPins.workspaceId, workspaceId),
-          eq(schema.sessionPins.subjectId, subjectId),
-        ),
-      );
-    return true;
+    return rows.length > 0;
   });
 }
 

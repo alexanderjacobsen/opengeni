@@ -373,16 +373,51 @@ describe("session pins (real PostgreSQL + FORCE RLS)", () => {
     ]);
   }, 60_000);
 
-  test("removing a workspace member atomically cleans that subject's pins", async () => {
+  test("removing a workspace member cleans only that subject's pins and snapshots", async () => {
     if (!available) return;
     const workspace = await freshWorkspace();
+    const foreign = await freshWorkspace();
     const subjectId = "user:removed-member";
+    const retainedSubjectId = "user:retained-member";
     await grantWorkspaceAccess(db, {
       ...workspace,
       subjectId,
       permissions: ["sessions:read"],
     });
+    await grantWorkspaceAccess(db, {
+      ...workspace,
+      subjectId: retainedSubjectId,
+      permissions: ["sessions:read"],
+    });
+    await grantWorkspaceAccess(db, {
+      ...foreign,
+      subjectId,
+      permissions: ["sessions:read"],
+    });
+
     const target = await session({ ...workspace, message: "removed member pin" });
+    await session({ ...workspace, message: "removed member snapshot" });
+    await session({ ...workspace, message: "retained member first" });
+    await session({ ...workspace, message: "retained member second" });
+    await session({ ...foreign, message: "foreign member first" });
+    await session({ ...foreign, message: "foreign member second" });
+
+    const removedPage = await listSessionsForSubject(db, workspace.workspaceId, {
+      subjectId,
+      limit: 1,
+    });
+    expect(removedPage.nextCursor).toBeTruthy();
+    const retainedPage = await listSessionsForSubject(db, workspace.workspaceId, {
+      subjectId: retainedSubjectId,
+      limit: 1,
+    });
+    expect(retainedPage.nextCursor).toBeTruthy();
+    const foreignPage = await listSessionsForSubject(db, foreign.workspaceId, {
+      subjectId,
+      limit: 1,
+    });
+    expect(foreignPage.nextCursor).toBeTruthy();
+
     await setSessionPin(db, {
       workspaceId: workspace.workspaceId,
       subjectId,
@@ -398,6 +433,35 @@ describe("session pins (real PostgreSQL + FORCE RLS)", () => {
         (select count(*)::int from session_pins
           where workspace_id = ${workspace.workspaceId} and subject_id = ${subjectId}) as pins`;
     expect(counts).toEqual({ memberships: 0, pins: 0 });
+
+    const [snapshotCounts] = await admin<
+      {
+        removedWorkspace: number;
+        retainedMember: number;
+        foreignWorkspace: number;
+        targetOrphans: number;
+      }[]
+    >`
+      select
+        (select count(*)::int from session_list_snapshots
+          where workspace_id = ${workspace.workspaceId} and subject_id = ${subjectId}) as "removedWorkspace",
+        (select count(*)::int from session_list_snapshots
+          where workspace_id = ${workspace.workspaceId} and subject_id = ${retainedSubjectId}) as "retainedMember",
+        (select count(*)::int from session_list_snapshots
+          where workspace_id = ${foreign.workspaceId} and subject_id = ${subjectId}) as "foreignWorkspace",
+        (select count(*)::int
+          from session_list_snapshots snapshot
+          left join workspace_memberships membership
+            on membership.workspace_id = snapshot.workspace_id
+           and membership.subject_id = snapshot.subject_id
+          where snapshot.workspace_id = ${workspace.workspaceId}
+            and membership.id is null) as "targetOrphans"`;
+    expect(snapshotCounts).toEqual({
+      removedWorkspace: 0,
+      retainedMember: 1,
+      foreignWorkspace: 1,
+      targetOrphans: 0,
+    });
   }, 60_000);
 
   test("returns no cross-workspace target and cascades a deleted session's pins", async () => {

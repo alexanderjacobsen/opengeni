@@ -30,6 +30,10 @@ describe("GitHub app manifest helpers", () => {
     });
     expect(local.hook_attributes).toBeUndefined();
     expect(local.request_oauth_on_install).toBe(true);
+    expect(local.callback_urls).toEqual([
+      "http://127.0.0.1:8000/v1/github/install/callback",
+      "http://127.0.0.1:8000/v1/github/oauth/callback",
+    ]);
 
     const hosted = buildGitHubAppManifest({
       appName: "Hosted",

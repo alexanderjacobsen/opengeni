@@ -1651,9 +1651,9 @@ function registerGitHubConnectTool(
         return json({ configured: false, appSlug: slug, installUrl: null, missing });
       }
       const base = (
-        settings.publicBaseUrl ??
         settings.githubAppManifestBaseUrl ??
         options.requestOrigin ??
+        settings.publicBaseUrl ??
         ""
       ).replace(/\/+$/, "");
       if (!base) {

@@ -65,6 +65,11 @@ export function buildGitHubAppManifest(input: {
     name: input.appName,
     url: base,
     redirect_url: `${base}/v1/github/app-manifest/callback`,
+    // GitHub requires a callback URL when request_oauth_on_install is set, and
+    // sends the post-install redirect (code + installation_id) to the FIRST
+    // one; the oauth callback must also be registered so the two-step
+    // setup-flow redirect_uri is accepted.
+    callback_urls: [`${base}/v1/github/install/callback`, `${base}/v1/github/oauth/callback`],
     public: input.public,
     request_oauth_on_install: true,
     default_permissions: permissions,
